@@ -43,6 +43,7 @@ static inline void RiscvEmulatorStore(uint32_t address, const void *source, uint
         memcpy(&memory[address - RAM_ORIGIN], source, length);
         return;
     }
+    fprintf(stderr, "runner: stray store addr=0x%08x len=%u\n", address, length);
     pleasestop = 1; g_exitcode = 1;  /* stray store -> fail */
 }
 
@@ -54,12 +55,16 @@ static inline void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) 
 #else
     (void)state;
 #endif
+    fprintf(stderr, "runner: illegal instruction 0x%08x at pc=0x%08x (mtvec.base=0)\n",
+            state->instruction.value, state->programcounter);
     pleasestop = 1; g_exitcode = 1;
 }
 
 #if (RVE_E_ZICSR == 1)
 /* Unimplemented CSR: raise illegal-instruction so it vectors like real HW. */
 static inline void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state) {
+    fprintf(stderr, "runner: unknown CSR 0x%03x at pc=0x%08x\n",
+            state->instruction.itypecsr.csr, state->programcounter);
     state->trapflag.illegalinstruction = 1;
 }
 #endif

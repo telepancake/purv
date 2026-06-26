@@ -25,6 +25,16 @@ One command from a fresh checkout: **`scripts/reproduce.sh [config]`**
 (default `spike-RVI20U32`). First run is heavy (downloads the GCC 16 toolchain
 ~550 MB + Sail 0.12, builds Spike, installs the framework).
 
+### Third-party emulator DUTs (see `conformance/dut/README.md`)
+
+The same suite runs on two external emulators via small C adapters. Genuine
+conformance findings, not harness artifacts:
+
+| Emulator | Scope | Result | Script |
+|----------|-------|--------|--------|
+| cnlohr/mini-rv32ima | RV32IM | **53/61** (I+M pass; 8 CSR gaps) | `scripts/run-mini-rv32ima.sh` |
+| atoomnetmarc/RISC-V-emulator | RV32IMC | **76/91** (I+M+C pass; CSR/Zicntr/fence.i/misalign gaps) | `scripts/run-atoomnetmarc.sh` |
+
 ## TL;DR / the big correction
 
 The RISC-V architectural test suite **deprecated RISCOF**. The current
