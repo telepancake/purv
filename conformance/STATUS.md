@@ -7,13 +7,19 @@ _Living document. Update as steps are verified so we don't re-derive next sessio
 The full ACT4 pipeline runs: **Sail 0.12 computes the golden expected results,
 they're baked into self-checking ELFs, and Spike executes them and self-checks.**
 
-- `scripts/run-spike.sh spike-rv32-max` → built **4245 ELFs**, ran **849 tests**:
-  **842 passed, 7 failed**. The 7 are bleeding-edge privileged/security corners
-  (`ExceptionsZicboS/U`, `Smstateen`, `Ssstrict*`) where Spike 1.1.1-dev and
-  Sail 0.12 legitimately disagree — **all outside purv's RV32IMC scope**.
+Counts below: "build actions" is the build-plan task count the framework prints
+as "N succeeded" (~5 actions per test: generate source, compile candidate, run
+Sail for the expected signature, link the self-checking ELF, symlink). The
+runnable ELF count is much smaller — and every generated ELF is run.
+
+- `scripts/run-spike.sh spike-rv32-max` → 4245 build actions → **849 self-checking
+  ELFs**, all 849 run: **842 passed, 7 failed**. The 7 are bleeding-edge
+  privileged/security corners (`ExceptionsZicboS/U`, `Smstateen`, `Ssstrict*`)
+  where Spike 1.1.1-dev and Sail 0.12 legitimately disagree — **all outside
+  purv's RV32IMC scope**.
 - `scripts/run-spike.sh spike-RVI20U32` (unprivileged IMAFDC, `include_priv_tests:
-  False`) → excludes the 7 privileged failures above; covers the I/M/C tests
-  purv cares about. (Pass counts to be filled in once a full run is recorded.)
+  False`) → 1485 build actions → **297 ELFs**, **all 297 passed** (clean green).
+  Covers the I/M/C unprivileged tests purv cares about.
 
 One command from a fresh checkout: **`scripts/reproduce.sh [config]`**
 (default `spike-RVI20U32`). First run is heavy (downloads the GCC 16 toolchain
