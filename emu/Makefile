@@ -52,7 +52,7 @@ test: purv examples/fn.elf examples/sigtest.elf
 # Regenerate the amalgamated header from the upstream submodule.
 regen:
 	python3 tools/flatten.py $(ATOOM_INC) $(OUTDIR)
-	@echo "regenerated purv.h + purv.c from $(ATOOM_INC)"
+	@echo "regenerated purv.c from $(ATOOM_INC) (purv.h is hand-written)"
 
 clean:
 	rm -f purv purv_clang examples/*.o examples/*.elf examples/out.sig

@@ -102,11 +102,11 @@ void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) {
     /* If the program installed a trap vector, RiscvEmulatorTrap already
      * redirected execution there; nothing for the host to do. Otherwise the
      * program cannot self-handle, so stop. */
-    if (state->csr.mtvec.base != 0) {
+    if (RiscvEmulatorGetTrapVectorBase(state) != 0) {
         return;
     }
     fprintf(stderr, "purv: illegal instruction 0x%08x at pc=0x%08x\n",
-            state->instruction.value, state->programcounter);
+            RiscvEmulatorGetInstruction(state), RiscvEmulatorGetProgramCounter(state));
     g_halt = 1;
     g_exit = 1;
 }
@@ -114,8 +114,8 @@ void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) {
 void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state) {
     /* Unimplemented CSR -> raise illegal-instruction, like real hardware. */
     fprintf(stderr, "purv: unknown CSR 0x%03x at pc=0x%08x\n",
-            state->instruction.itypecsr.csr, state->programcounter);
-    state->trapflag.illegalinstruction = 1;
+            RiscvEmulatorGetCsrNumber(state), RiscvEmulatorGetProgramCounter(state));
+    RiscvEmulatorRaiseIllegalInstruction(state);
 }
 
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) { (void)state; }
@@ -270,8 +270,8 @@ int main(int argc, char **argv) {
 
     uint32_t entry = load_elf(elf);
 
-    RiscvEmulatorState_t st;
-    RiscvEmulatorInit(&st, g_ram_size);
+    RiscvEmulatorState_t *st = RiscvEmulatorCreate(g_ram_size);
+    if (!st) { fprintf(stderr, "purv: cannot allocate emulator state\n"); return 2; }
 
     uint32_t start = entry;
     if (invoke) {
@@ -279,27 +279,28 @@ int main(int argc, char **argv) {
         if (!sym_lookup(invoke, &start)) {
             fprintf(stderr, "purv: symbol '%s' not found\n", invoke); return 2;
         }
-        st.reg.ra = MAGIC_RET;                  /* x1: where ret lands -> stop */
-        for (int i = 0; i < nargs; i++) st.reg.x[10 + i] = args[i];  /* a0.. */
+        RiscvEmulatorSetRegister(st, 1, MAGIC_RET);           /* ra: ret -> stop */
+        for (int i = 0; i < nargs; i++)
+            RiscvEmulatorSetRegister(st, 10 + i, args[i]);    /* a0.. */
     } else {
         g_have_tohost   = sym_lookup("tohost", &g_tohost);
         g_have_sig      = sym_lookup("begin_signature", &g_begin_sig) &
                           sym_lookup("end_signature", &g_end_sig);
     }
 
-    st.programcounter = start;
-    st.programcounternext = start;
+    RiscvEmulatorSetProgramCounter(st, start);
 
     uint64_t i = 0;
     for (; i < max_insns && !g_halt; i++) {
-        if (invoke && st.programcounternext == MAGIC_RET) break;  /* returned */
-        RiscvEmulatorLoop(&st);
+        if (invoke && RiscvEmulatorGetNextProgramCounter(st) == MAGIC_RET) break;
+        RiscvEmulatorLoop(st);
     }
 
     if (invoke) {
         if (i >= max_insns) { fprintf(stderr, "purv: instruction cap reached\n"); return 2; }
-        int32_t r = (int32_t)st.reg.a0;
-        printf("%d (0x%08x)\n", r, st.reg.a0);
+        uint32_t a0 = RiscvEmulatorGetRegister(st, 10);
+        printf("%d (0x%08x)\n", (int32_t)a0, a0);
+        RiscvEmulatorDestroy(st);
         return 0;
     }
 
@@ -308,5 +309,6 @@ int main(int argc, char **argv) {
         if (!g_have_sig) { fprintf(stderr, "purv: no begin/end_signature symbols\n"); return 2; }
         dump_signature(sigfile, gran);
     }
+    RiscvEmulatorDestroy(st);
     return g_exit;
 }
