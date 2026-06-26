@@ -9,6 +9,10 @@ riscof_work/
 /conformance/sail_cSim/
 /conformance/spike/
 
+# Downloaded tools (prebuilt Sail 0.12, etc.) and build logs
+/tools/
+/scratch_*.log
+
 # Build output
 __pycache__/
 *.pyc

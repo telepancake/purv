@@ -4,12 +4,20 @@ An RV32 RISC-V emulator (target featureset: **RV32IMC_Zicsr_Zifencei**).
 
 ## Conformance
 
-purv is conformance-tested with [RISCOF](https://github.com/riscv-software-src/riscof)
-against the [Sail RISC-V](https://github.com/riscv/sail-riscv) golden model,
-using the official [riscv-arch-test](https://github.com/riscv-non-isa/riscv-arch-test)
-suite. [Spike](https://github.com/riscv-software-src/riscv-isa-sim) is vendored
-as a second emulator so the harness can be validated (Spike-vs-Sail) before
-purv is wired in, and used as a differential-testing oracle during development.
+purv is conformance-tested against the official
+[riscv-arch-test](https://github.com/riscv-non-isa/riscv-arch-test) suite. The
+current suite uses the **ACT4 framework**, which uses the
+[Sail RISC-V](https://github.com/riscv/sail-riscv) model (release **0.12**) to
+generate self-checking ELFs that run on the device under test.
+[Spike](https://github.com/riscv-software-src/riscv-isa-sim) is vendored as the
+initial DUT (and a differential-testing oracle) before purv is wired in.
+
+> **Read [`conformance/STATUS.md`](conformance/STATUS.md) first.** It records
+> the verified setup steps and the key finding that **riscv-arch-test
+> deprecated RISCOF in favour of ACT4** — so the RISCOF scaffold under
+> `conformance/` (config*.ini, plugin-purv, sail_cSim) is kept for reference
+> only and is **not** the active path. `scripts/setup.sh` reproduces the
+> verified environment.
 
 These three live as git submodules under `third_party/`, pinned to specific
 commits. Bring the whole conformance environment up with:
