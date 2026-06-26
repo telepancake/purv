@@ -10,3 +10,11 @@
 	path = third_party/riscv-arch-test
 	url = https://github.com/riscv-non-isa/riscv-arch-test
 	ignore = dirty
+[submodule "third_party/mini-rv32ima"]
+	path = third_party/mini-rv32ima
+	url = https://github.com/cnlohr/mini-rv32ima
+	ignore = dirty
+[submodule "third_party/atoomnetmarc-rv"]
+	path = third_party/atoomnetmarc-rv
+	url = https://github.com/atoomnetmarc/RISC-V-emulator
+	ignore = dirty
