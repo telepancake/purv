@@ -1,0 +1,8 @@
+name: mini-rv32ima
+compiler_exe: riscv64-unknown-elf-gcc
+objdump_exe: riscv64-unknown-elf-objdump
+ref_model_exe: sail_riscv_sim
+udb_config: mini-rv32ima.yaml
+linker_script: link.ld
+dut_include_dir: .          # dir containing rvmodel_macros.h
+include_priv_tests: False   # mini-rv32ima has only partial supervisor support
