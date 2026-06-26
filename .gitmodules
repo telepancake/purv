@@ -1,9 +1,12 @@
 [submodule "third_party/riscv-isa-sim"]
 	path = third_party/riscv-isa-sim
 	url = https://github.com/riscv-software-src/riscv-isa-sim
+	ignore = dirty
 [submodule "third_party/sail-riscv"]
 	path = third_party/sail-riscv
 	url = https://github.com/riscv/sail-riscv
+	ignore = dirty
 [submodule "third_party/riscv-arch-test"]
 	path = third_party/riscv-arch-test
 	url = https://github.com/riscv-non-isa/riscv-arch-test
+	ignore = dirty
