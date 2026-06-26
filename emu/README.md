@@ -1,21 +1,24 @@
-# purv — single-header RISC-V emulator
+# purv — RISC-V emulator
 
-A two-file copy of [atoomnetmarc/RISC-V-emulator][atoom] flattened into one
-header plus one reference host, with the ISA flags baked in:
+A copy of [atoomnetmarc/RISC-V-emulator][atoom] flattened into a conventional
+header + implementation library, with a separate host, ISA flags baked in:
 **RV32IMC + Zicsr + Zifencei**.
 
 ```
 emu/
-  purv.h      the whole emulator engine, one header, flags baked, dead branches stripped
-  purv.c      the reference host: memory map + hooks + ELF loader + two run modes
+  purv.h      engine interface: config + types + memory-map origins + prototypes
+  purv.c      engine implementation: the instruction-execution bodies (generated)
+  main.c      the host/driver: memory map + hooks + ELF loader + two run modes
   runfn.sh    compile a bare function and run it, wasm style
-  tools/      flatten.py — regenerates purv.h from the upstream submodule
+  tools/      flatten.py — regenerates purv.h + purv.c from the upstream submodule
   examples/   fn.c (bare functions), sigtest.S (signature/tohost demo)
 ```
 
-atoom's appeal is that it has essentially *no API*: you `#include` the engine
-and define a handful of hook functions for your memory map. `purv.h` keeps that.
-The engine reaches the outside world only through these, all defined in `purv.c`:
+`purv.h` + `purv.c` are the engine; `main.c` is just one host that drives it —
+write your own instead and link against the engine. atoom's appeal is that it
+has essentially *no API*: you `#include "purv.h"` and define a handful of hook
+functions for your memory map. The engine reaches the outside world only through
+these (defined in `main.c` here):
 
 ```c
 void RiscvEmulatorLoad (uint32_t addr, void *dst, uint8_t len);
@@ -70,12 +73,13 @@ Sail reference model are available.
 | UART   | `0x10000000` | byte store → stdout; `+5` reads tx-ready   |
 | SYSCON | `0x11100000` | store `0x5555` → exit 0 (PASS)             |
 
-## Regenerating the header
+## Regenerating the engine
 
-`purv.h` is generated, not hand-edited. `tools/flatten.py` inlines atoom's ~45
-headers in dependency order, evaluating the baked `RVE_E_*` flags so disabled
-extensions and the `RVE_E_HOOK` instrumentation are stripped out entirely
-(8020 → ~4000 lines).
+`purv.h` and `purv.c` are generated, not hand-edited (`main.c` is hand-written).
+`tools/flatten.py` inlines atoom's ~45 headers in dependency order, evaluating
+the baked `RVE_E_*` flags so disabled extensions and the `RVE_E_HOOK`
+instrumentation are stripped out entirely (8020 → ~1450 header + ~2600 impl
+lines). The type closure routes to `purv.h`; the bodies route to `purv.c`.
 
 ```sh
 make regen      # reads ../third_party/atoomnetmarc-rv/include

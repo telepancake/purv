@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Flatten atoom headers into one baked, self-contained header (flag-aware).
+"""Generate the purv engine as a real header + implementation pair.
 
-Unlike a textual concat, this evaluates the baked RVE_E_* flags as it goes:
-dead #if branches (e.g. all the RVE_E_HOOK and disabled-extension code) are
-dropped, #include directives are only followed in live branches, and each
-engine header is inlined at most once (include-guard semantics). The result is
-emu/purv.h: RV32IMC + Zicsr + Zifencei, with everything else compiled out.
+atoom ships header-only (~45 self-guarded headers of static-inline code). This
+splits it into a conventional library:
+
+  purv.h   interface: baked config, all types, memory-map origins, and the
+           public prototypes (RiscvEmulatorInit/Loop + the hooks you provide).
+  purv.c   implementation: every instruction-execution body, #include "purv.h".
+
+Both are produced by flattening atoom in dependency order while evaluating the
+baked RVE_E_* flags, so disabled extensions (A, B/Zb*) and the RVE_E_HOOK
+instrumentation are stripped out entirely. The type closure routes to purv.h;
+everything else (decode macros, extensions, trap, Init/Loop) routes to purv.c.
+
+  usage: flatten.py <atoom/include> <out_dir>
 """
 import os, re, sys
 
 INC = sys.argv[1]
-OUT = sys.argv[2]
+OUTDIR = sys.argv[2]
 
 MACROS = {
     "RVE_E_M": 1, "RVE_E_C": 1, "RVE_E_ZICSR": 1, "RVE_E_ZIFENCEI": 1,
@@ -19,49 +27,43 @@ MACROS = {
     "RVE_E_HOOK": 0,
 }
 
-# Files we provide ourselves; never inline upstream copies.
-visited = {"RiscvEmulatorConfig.h", "RiscvEmulatorImplementationSpecific.h"}
+# Memory-map origins live in the public header (the host needs RAM_ORIGIN); the
+# implementation must not redefine them.
+ORIGIN_DEFINES = {"IALIGN", "IO_ORIGIN", "UART_ORIGIN", "ROM_ORIGIN", "RAM_ORIGIN"}
 
-inc_re   = re.compile(r'^\s*#\s*include\s+["<](RiscvEmulator[^">]+)[">]')
-sysinc_re= re.compile(r'^\s*#\s*include\s+<([^>]+)>')
-if_re    = re.compile(r'^\s*#\s*if\s+(.*)')
-ifdef_re = re.compile(r'^\s*#\s*ifdef\s+(\w+)')
-ifndef_re= re.compile(r'^\s*#\s*ifndef\s+(\w+)')
-elif_re  = re.compile(r'^\s*#\s*elif\s+(.*)')
-else_re  = re.compile(r'^\s*#\s*else\b')
-endif_re = re.compile(r'^\s*#\s*endif\b')
+inc_re    = re.compile(r'^\s*#\s*include\s+["<](RiscvEmulator[^">]+)[">]')
+sysinc_re = re.compile(r'^\s*#\s*include\s+<([^>]+)>')
+if_re     = re.compile(r'^\s*#\s*if\s+(.*)')
+ifdef_re  = re.compile(r'^\s*#\s*ifdef\s+(\w+)')
+ifndef_re = re.compile(r'^\s*#\s*ifndef\s+(\w+)')
+elif_re   = re.compile(r'^\s*#\s*elif\s+(.*)')
+else_re   = re.compile(r'^\s*#\s*else\b')
+endif_re  = re.compile(r'^\s*#\s*endif\b')
+define_re = re.compile(r'^\s*#\s*define\s+(\w+)(?:\s+(\S+))?')
 
 def evaluate(expr):
     expr = expr.split("//")[0].split("/*")[0]
     expr = expr.replace("&&", " and ").replace("||", " or ")
-    # substitute identifiers -> macro value or 0 (standard cpp behaviour)
-    def sub(m):
-        name = m.group(0)
-        if name in ("and", "or", "not"):
-            return name
-        return str(MACROS.get(name, 0))
-    expr = re.sub(r'[A-Za-z_]\w*', sub, expr)
+    expr = re.sub(r'[A-Za-z_]\w*',
+                  lambda m: m.group(0) if m.group(0) in ("and", "or", "not")
+                  else str(MACROS.get(m.group(0), 0)), expr)
     try:
         return bool(eval(expr, {"__builtins__": {}}, {}))
     except Exception as e:
-        raise SystemExit(f"cannot evaluate #if expr {expr!r}: {e}")
+        raise SystemExit(f"cannot evaluate #if {expr!r}: {e}")
 
-define_re = re.compile(r'^\s*#\s*define\s+(\w+)(?:\s+(\S+))?')
+def strip_copyright(text):
+    return re.sub(r'^\s*/\*.*?\*/\s*', '', text, count=1, flags=re.S)
 
-def strip_guard(text):
-    return re.sub(r'^\s*/\*.*?\*/\s*', '', text, count=1, flags=re.S)   # copyright only
-
-def inline(name, out):
+def inline(name, out, visited, drop_origin_defines=False):
     if name in visited:
         return
     visited.add(name)
     with open(os.path.join(INC, name)) as f:
-        text = strip_guard(f.read())
+        text = strip_copyright(f.read())
     out.append(f"/* ===== {name} ===== */")
-    stack = []          # list of bools: is this branch active?
-    taken = []          # has any branch in this if-group been taken?
-    def active():
-        return all(stack)
+    stack, taken = [], []
+    active = lambda: all(stack)
     for line in text.splitlines():
         m = if_re.match(line) or ifdef_re.match(line) or ifndef_re.match(line)
         if m:
@@ -71,48 +73,50 @@ def inline(name, out):
                 val = (ifdef_re.match(line).group(1) in MACROS) if active() else False
             else:
                 val = (ifndef_re.match(line).group(1) not in MACROS) if active() else False
-            taken.append(val)
-            stack.append(val)
-            continue
+            taken.append(val); stack.append(val); continue
         if elif_re.match(line):
             parent = all(stack[:-1])
-            val = (parent and not taken[-1] and evaluate(elif_re.match(line).group(1)))
-            stack[-1] = val
-            taken[-1] = taken[-1] or val
-            continue
+            val = parent and not taken[-1] and evaluate(elif_re.match(line).group(1))
+            stack[-1] = val; taken[-1] = taken[-1] or val; continue
         if else_re.match(line):
-            parent = all(stack[:-1])
-            stack[-1] = parent and not taken[-1]
-            continue
+            stack[-1] = all(stack[:-1]) and not taken[-1]; continue
         if endif_re.match(line):
-            if stack:
-                stack.pop(); taken.pop()
+            if stack: stack.pop(); taken.pop()
             continue
         if not active():
             continue
         mi = inc_re.match(line)
         if mi:
-            inline(mi.group(1), out)
-            continue
+            inline(mi.group(1), out, visited, drop_origin_defines); continue
         if sysinc_re.match(line):
             continue
         md = define_re.match(line)
         if md:
-            name, val = md.group(1), md.group(2)
+            name2, val = md.group(1), md.group(2)
             if val is not None:
-                try: MACROS[name] = int(val, 0)
+                try: MACROS[name2] = int(val, 0)
                 except ValueError: pass
-            # drop include-guard and baked-config defines; keep real constants
-            if name.endswith("_H_") or name.startswith("RVE_E_"):
+            if name2.endswith("_H_") or name2.startswith("RVE_E_"):
+                continue
+            if drop_origin_defines and name2 in ORIGIN_DEFINES:
                 continue
         out.append(line)
 
-BAKED = """\
-/* ---- Baked build configuration: RV32IMC + Zicsr + Zifencei ----------------
- * These flags are compiled in. Disabled-extension code (A, B/Zb*, the generic
- * RVE_E_HOOK instrumentation) has been stripped from this amalgamation, so
- * redefining them has no effect. To change the ISA, regenerate from upstream.
+BANNER_H = """\
+/*
+ * purv.h - RISC-V (RV32IMC + Zicsr/Zifencei) emulator: public interface.
+ *
+ * Amalgamated from atoomnetmarc/RISC-V-emulator (Apache-2.0, (c) Marc Ketel),
+ * pinned commit 633526d4. Types + config + prototypes; the bodies live in
+ * purv.c. The flags below are baked into both files (disabled-extension and
+ * RVE_E_HOOK code is stripped), so redefining them has no effect.
  */
+#ifndef PURV_H_
+#define PURV_H_
+
+#include <stdint.h>
+#include <string.h>
+
 #define RVE_E_M        1
 #define RVE_E_C        1
 #define RVE_E_ZICSR    1
@@ -124,11 +128,18 @@ BAKED = """\
 #define RVE_E_ZBC      0
 #define RVE_E_ZBS      0
 #define RVE_E_HOOK     0
+
+/* Architectural memory-map origins (resolved for RV32IMC). */
+#define IALIGN      16
+#define IO_ORIGIN   0x02000000
+#define UART_ORIGIN 0x10000000
+#define ROM_ORIGIN  0x20000000
+#define RAM_ORIGIN  0x80000000
 """
 
 HOOKS = """\
 /* ---- Implementation-specific hooks ----------------------------------------
- * Define these in your program (see purv.c). This is atoom's whole "API": the
+ * Define these in your host (see main.c). This is atoom's whole "API": the
  * engine reaches your memory map and trap policy only through these calls.
  */
 void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length);
@@ -137,50 +148,61 @@ void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state);
 void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state);
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state);
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *state);
+
+/* ---- Public API ---- */
+void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t ram_length);
+void RiscvEmulatorLoop(RiscvEmulatorState_t *state);
 """
 
-out = [
- "/*",
- " * purv.h - single-header RISC-V (RV32IMC + Zicsr/Zifencei) emulator core.",
- " *",
- " * Amalgamated from atoomnetmarc/RISC-V-emulator (Apache-2.0, (c) Marc Ketel),",
- " * pinned commit 633526d4, with the ISA flags baked in and dead branches",
- " * stripped. Define the implementation-specific hooks (see purv.c) then call",
- " * RiscvEmulatorInit() / RiscvEmulatorLoop().",
- " */",
- "#ifndef PURV_H_",
- "#define PURV_H_",
- "",
- "#include <stdint.h>",
- "#include <string.h>",
- "",
- BAKED,
- "",
- "/* The engine passes a hook-context pointer to many helpers; with RVE_E_HOOK",
- " * baked off it is unused. Scope the warning away for the vendored engine only",
- " * (mirrors upstream's own pragma around RiscvEmulatorHook). */",
- '#pragma GCC diagnostic push',
- '#pragma GCC diagnostic ignored "-Wunused-parameter"',
-]
-inline("RiscvEmulatorType.h", out)
-inline("RiscvEmulatorTypeHook.h", out)
-out.append("")
-out.append(HOOKS)
-inline("RiscvEmulatorDefine.h", out)
-inline("RiscvEmulatorHook.h", out)
-inline("RiscvEmulatorExtension.h", out)
-inline("RiscvEmulatorTrap.h", out)
-inline("RiscvEmulator.h", out)
-out.append("")
-out.append("#pragma GCC diagnostic pop")
-out.append("")
-out.append("#endif /* PURV_H_ */")
+# ---- purv.h : config + memory map + type closure + prototypes -------------
+h = [BANNER_H]
+hv = {"RiscvEmulatorConfig.h", "RiscvEmulatorImplementationSpecific.h"}
+inline("RiscvEmulatorType.h", h, hv)
+inline("RiscvEmulatorTypeHook.h", h, hv)
+h.append("")
+h.append(HOOKS)
+h.append("#endif /* PURV_H_ */")
 
-# collapse 3+ blank lines to 1 for readability
-text = "\n".join(out) + "\n"
-text = re.sub(r'\n{3,}', '\n\n', text)
-with open(OUT, "w") as f:
-    f.write(text)
-print("wrote", OUT, "lines:", text.count("\n"))
+# ---- purv.c : decode macros + extensions + trap + Init/Loop bodies ---------
+BANNER_C = """\
+/*
+ * purv.c - RISC-V (RV32IMC + Zicsr/Zifencei) emulator: implementation.
+ *
+ * Generated from atoomnetmarc/RISC-V-emulator (Apache-2.0, (c) Marc Ketel),
+ * pinned commit 633526d4. Instruction-execution bodies for purv.h. Build this
+ * together with your host (e.g. main.c). See tools/flatten.py.
+ */
+#include "purv.h"
+
+/* The engine threads a hook-context pointer through many helpers; with
+ * RVE_E_HOOK baked off it is unused. Scope the warning away for this generated
+ * file (mirrors upstream's own pragma around RiscvEmulatorHook). */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+"""
+c = [BANNER_C]
+# Pre-mark the header-provided files visited so the impl doesn't re-emit them.
+cv = {"RiscvEmulatorConfig.h", "RiscvEmulatorImplementationSpecific.h"}
+cv |= {f for f in os.listdir(INC) if f.startswith("RiscvEmulatorType")}
+inline("RiscvEmulator.h", c, cv, drop_origin_defines=True)
+c.append("")
+c.append("#pragma GCC diagnostic pop")
+
+def write(path, lines):
+    text = re.sub(r'\n{3,}', '\n\n', "\n".join(lines) + "\n")
+    with open(path, "w") as f:
+        f.write(text)
+    return text.count("\n")
+
+hlines = write(os.path.join(OUTDIR, "purv.h"), h)
+
+# Give Init/Loop external linkage so the host can call them across TUs.
+ctext = re.sub(r'\n{3,}', '\n\n', "\n".join(c) + "\n")
+ctext = ctext.replace("static inline void RiscvEmulatorInit(", "void RiscvEmulatorInit(")
+ctext = ctext.replace("static inline void RiscvEmulatorLoop(", "void RiscvEmulatorLoop(")
+with open(os.path.join(OUTDIR, "purv.c"), "w") as f:
+    f.write(ctext)
+
+print("wrote purv.h:", hlines, "lines; purv.c:", ctext.count("\n"), "lines")
 allh = {f for f in os.listdir(INC) if f.endswith(".h")}
-print("not inlined:", sorted(allh - visited))
+print("not inlined:", sorted(allh - (hv | cv)))

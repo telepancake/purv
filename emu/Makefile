@@ -21,12 +21,14 @@ RVLD     := ld.lld
 LDFLAGS  ?= -m elf32lriscv --image-base=0x80000000
 
 ATOOM_INC ?= ../third_party/atoomnetmarc-rv/include
+OUTDIR    ?= .
 
 .PHONY: all test regen clean
 all: purv
 
-purv: purv.c purv.h
-	$(CC) $(CFLAGS) $< -o $@
+# purv.c is the generated engine; main.c is the host/driver. Separate TUs.
+purv: purv.c main.c purv.h
+	$(CC) $(CFLAGS) purv.c main.c -o $@
 
 # Build any guest .c/.S into an ELF loadable at RAM_ORIGIN (0x80000000).
 # .c is library-style (called via --invoke, so no entry needed); .S is a full
@@ -49,8 +51,8 @@ test: purv examples/fn.elf examples/sigtest.elf
 
 # Regenerate the amalgamated header from the upstream submodule.
 regen:
-	python3 tools/flatten.py $(ATOOM_INC) purv.h
-	@echo "regenerated purv.h from $(ATOOM_INC)"
+	python3 tools/flatten.py $(ATOOM_INC) $(OUTDIR)
+	@echo "regenerated purv.h + purv.c from $(ATOOM_INC)"
 
 clean:
 	rm -f purv purv_clang examples/*.o examples/*.elf examples/out.sig
