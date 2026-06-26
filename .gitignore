@@ -1,0 +1,14 @@
+# RISCOF run artifacts
+/conformance/riscof_work/
+riscof_work/
+*.signature
+*.elf
+*.disass
+
+# Generated reference plugins (created by scripts/bootstrap.sh / riscof setup)
+/conformance/sail_cSim/
+/conformance/spike/
+
+# Build output
+__pycache__/
+*.pyc
