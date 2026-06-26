@@ -44,19 +44,20 @@ if [ ! -x third_party/riscv-isa-sim/build/spike ]; then
 fi
 third_party/riscv-isa-sim/build/spike --help >/dev/null 2>&1 && echo "spike OK"
 
-# --- 5. ACT4 framework  [TODO — not yet verified this session] -----------------
-# Recommended (handles uv/Python + Ruby + UDB gem automatically):
-#   curl https://mise.jdx.dev/install.sh | sh
-#   eval "$("$HOME/.local/bin/mise" activate bash)"
-#   ( cd third_party/riscv-arch-test && mise install )
-#
-# Or without mise (you supply Python 3.10+, Ruby, Bundler, riscv-unified-db):
-#   ( cd third_party/riscv-arch-test && \
-#       pip install -e ./framework -e ./generators/testgen -e ./generators/coverage )
-#
-# Then, from third_party/riscv-arch-test, generate self-checking ELFs with the
-# Sail 0.12 model and run them on Spike via the built-in targets:
-#   make spike-<ext>      # see `make help` / README for exact target names
-echo "==> ACT4 framework: see conformance/STATUS.md (step 5, TODO)"
+# --- 5. RISC-V GCC 15+  [VERIFIED required] ------------------------------------
+# ACT4 hard-requires GCC >= 15; Ubuntu 24.04's apt toolchain is 13.2.0. Use a
+# prebuilt riscv-collab toolchain (put tools/riscv-gcc/bin first on PATH).
+echo "==> prebuilt RISC-V GCC 15 toolchain"
+if [ ! -x tools/riscv-gcc/bin/riscv64-unknown-elf-gcc ]; then
+  mkdir -p tools/riscv-gcc
+  curl -sSL -o /tmp/rvgcc.tar.xz \
+    "https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2026.06.06/riscv64-elf-ubuntu-24.04-gcc.tar.xz"
+  tar xJf /tmp/rvgcc.tar.xz --directory=tools/riscv-gcc --strip-components=1
+fi
+tools/riscv-gcc/bin/riscv64-unknown-elf-gcc --version | head -1
 
-echo "Setup complete through step 4. ACT4 framework install is the next step."
+# --- 6. ACT4 framework + reference run -----------------------------------------
+echo "==> installing ACT4 framework + running Spike cross-check"
+echo "    scripts/install-act4.sh   # mise + uv (incl. the Python 3.12 pin fix)"
+echo "    scripts/run-spike.sh spike-rv32-max"
+echo "See conformance/STATUS.md for the full chain and what's verified."

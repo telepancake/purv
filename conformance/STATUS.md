@@ -36,28 +36,38 @@ generates the golden expectations, the DUT (Spike) executes and self-checks.
 
 - [x] HTTPS git egress works (the scoped git-credential proxy 403s, but plain
       HTTPS to github.com is open — that's how the submodules were fetched).
-- [x] `apt-get install gcc-riscv64-unknown-elf device-tree-compiler` →
-      `riscv64-unknown-elf-gcc 13.2.0`, rv32 ilp32 multilibs present
-      (rv32i, rv32im, rv32imac).
-- [x] Prebuilt **Sail 0.12** downloaded → `tools/sail-0.12/bin/sail_riscv_sim`,
-      `--version` prints `0.12`.
-- [~] **Spike** building from source (`third_party/riscv-isa-sim/build/spike`).
-- [x] `pip install riscof` works (riscof 1.25.3) — but RISCOF is the deprecated
-      path; not needed for ACT4.
+- [x] Prebuilt **Sail 0.12** → `tools/sail-0.12/bin/sail_riscv_sim` (`--version` = 0.12).
+- [x] **Spike** built from source → `third_party/riscv-isa-sim/build/spike` (1.1.1-dev).
+- [x] **ACT4 framework installed** via mise (`scripts/install-act4.sh`):
+      ruby 3.4.9, uv, the `act`/`testgen`/`covergroupgen` python packages.
+      UDB is pulled in through uv (no root Gemfile — the bundler step is a no-op).
+- [x] `make tests` → generates **165 test suites / 87 extensions**, exit 0.
+      Proves the generator + UDB + framework all work.
+- [x] Spike RV32 DUT config exists out of the box:
+      `config/spike/spike-rv32-max/` (link.ld, rvmodel_macros.h, run_cmd.txt,
+      sail.json, test_config.yaml). Ideal template for a purv config.
+
+## Fixes discovered (must apply — captured in scripts)
+
+1. **Python 3.12 pin.** This env injects an "exclude-newer" date that makes uv
+   resolve Python **3.14**, on which the pinned pydantic dies with
+   `_eval_type() got an unexpected keyword argument 'prefer_fwd_module'`.
+   Fix: `uv python pin 3.12` then `uv sync`. (In `install-act4.sh`.)
+2. **GCC 15+.** ACT4 hard-requires GCC ≥ 15; Ubuntu 24.04's
+   `gcc-riscv64-unknown-elf` is 13.2.0. Fix: use the prebuilt
+   `riscv64-elf-ubuntu-24.04-gcc.tar.xz` from riscv-collab release `2026.06.06`
+   → `tools/riscv-gcc/bin` (put first on PATH). (In `run-spike.sh`/`setup.sh`.)
 
 ## TODO (next session)
 
-1. Install the ACT4 framework toolchain. Two options:
-   - **mise** (recommended by ACT4): `curl https://mise.jdx.dev/install.sh | sh`
-     then `mise install` in the repo — handles uv/Python + Ruby + UDB gem.
-   - **without mise**: provide Python 3.10+, then
-     `pip install -e ./framework -e ./generators/testgen -e ./generators/coverage`,
-     and install Ruby + Bundler + riscv-unified-db separately.
-2. Write the DUT description for purv's target ISA (RV32IMC_Zicsr_Zifencei):
-   UDB config + `rvmodel_macros.h` + linker script.
-3. `make` (or `make spike-<ext>`) to generate self-checking ELFs via Sail 0.12.
-4. Run the ELFs on Spike (the built-in `make spike-*` targets) → first green
-   reference run.
-5. Swap Spike for `purv` once it can execute ELFs + self-check.
+1. Finish the Spike reference run: `scripts/run-spike.sh spike-rv32-max`
+   (generates self-checking ELFs via Sail 0.12, runs them on Spike). This was
+   one toolchain-version bump away from running when the session ended.
+2. Make a purv RV32IMC config by copying `config/spike/spike-rv32-max/` and
+   trimming the ISA to `rv32imc_zicsr_zifencei` (UDB yaml + sail.json +
+   run_cmd.txt + rvmodel_macros.h + link.ld).
+3. Swap Spike's `run_cmd.txt` for `purv` once purv can execute an ELF and honour
+   the `rvmodel_macros.h` halt/signature contract.
 
-Run `scripts/setup.sh` to reproduce steps 1–verified above.
+Reproduce everything: `scripts/setup.sh` → `scripts/install-act4.sh` →
+`scripts/run-spike.sh`.
