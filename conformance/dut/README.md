@@ -45,3 +45,36 @@ emulator gaps, classified by the runner's diagnostics:
 
 These are exactly the kind of findings conformance testing exists to surface; the
 adapters are faithfully reporting the emulators' real behavior, not masking it.
+
+### fernandotcl/TinyEMU — RV32IMC (+Zicsr), **87/91**
+
+Fabrice Bellard's full-system emulator. We load each self-checking ELF as the
+`bios` and use TinyEMU's HTIF device at `0x40008000` for console + termination
+(`tohost==1` → exit). Most conformant of the set — notably it **passes the Zicsr
+CSR tests that mini-rv32ima and atoomnetmarc fail**. The 4 failures are all
+**timeouts**, not wrong answers: `Zicntr-csrrc/csrrs` poll the `time` CSR in a
+loop that only exits when it increments, and in this minimal bare-metal config
+the timer doesn't advance, so the loop spins; `I-fence`/`Zifencei-fence.i`
+likewise hang. These are environment/timer-config interactions rather than core
+ISA bugs.
+
+### libriscv — incompatible (see `libriscv/NOTES.md`)
+
+Tested, but it **cannot run this suite**: libriscv is a *userspace* sandbox, not
+a bare-metal/system emulator. It rejects the RWX bare-metal ELFs outright, has no
+machine-mode CSRs (`mtvec`/`mstatus`/`mcause`), and treats `ecall` as a Linux
+syscall rather than a trap. That's a property of what libriscv is, so there is no
+adapter — only the documented finding and a reproducer (`scripts/run-libriscv.sh`).
+
+## Summary
+
+| Emulator | Scope | Result |
+|----------|-------|--------|
+| TinyEMU | RV32IMC | **87/91** (4 timer/fence timeouts) |
+| atoomnetmarc | RV32IMC | **76/91** (CSR/Zicntr/fence.i/misalign) |
+| mini-rv32ima | RV32IM | **53/61** (8 CSR) |
+| libriscv | — | incompatible (userspace sandbox) |
+
+All four pass every plain **I / M / C** instruction test they're scoped to; the
+differences are entirely in CSR/privileged/timer corners — a useful map of what
+an RV32IMC core like purv must get right.

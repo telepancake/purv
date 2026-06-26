@@ -32,8 +32,10 @@ conformance findings, not harness artifacts:
 
 | Emulator | Scope | Result | Script |
 |----------|-------|--------|--------|
-| cnlohr/mini-rv32ima | RV32IM | **53/61** (I+M pass; 8 CSR gaps) | `scripts/run-mini-rv32ima.sh` |
+| fernandotcl/TinyEMU | RV32IMC | **87/91** (most conformant; 4 timer/fence timeouts) | `scripts/run-tinyemu.sh` |
 | atoomnetmarc/RISC-V-emulator | RV32IMC | **76/91** (I+M+C pass; CSR/Zicntr/fence.i/misalign gaps) | `scripts/run-atoomnetmarc.sh` |
+| cnlohr/mini-rv32ima | RV32IM | **53/61** (I+M pass; 8 CSR gaps) | `scripts/run-mini-rv32ima.sh` |
+| libriscv/libriscv | — | incompatible (userspace sandbox; no M-mode) | `scripts/run-libriscv.sh` |
 
 ## TL;DR / the big correction
 
