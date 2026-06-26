@@ -1,0 +1,56 @@
+# purv — single-header RISC-V (RV32IMC + Zicsr/Zifencei) emulator.
+#
+#   make            build the host emulator binary `purv`
+#   make test       build + run the examples (wasm-style call + signature dump)
+#   make regen      regenerate purv.h from the atoom submodule (needs it checked out)
+#   make clean
+#
+# Host compiler (the emulator runs on your machine):
+CC      ?= gcc
+CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
+
+# Guest toolchain (compiles RISC-V code the emulator runs). clang needs no
+# cross-gcc: it targets riscv32 directly and lld links it.
+GUESTCC      ?= clang
+GUEST_ARCH   ?= --target=riscv32 -march=rv32imc -mabi=ilp32
+# "scary flags": strict, freestanding, no runtime assumptions.
+GUEST_CFLAGS ?= -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
+                -O2 -Wall -Wextra -Werror -Wpedantic
+# Named RVLD (not LD) so an inherited `LD=ld` in the environment can't shadow it.
+RVLD     := ld.lld
+LDFLAGS  ?= -m elf32lriscv --image-base=0x80000000
+
+ATOOM_INC ?= ../third_party/atoomnetmarc-rv/include
+
+.PHONY: all test regen clean
+all: purv
+
+purv: purv.c purv.h
+	$(CC) $(CFLAGS) $< -o $@
+
+# Build any guest .c/.S into an ELF loadable at RAM_ORIGIN (0x80000000).
+# .c is library-style (called via --invoke, so no entry needed); .S is a full
+# program with _start, run to halt.
+%.elf: %.c
+	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o $<.o
+	$(RVLD) $(LDFLAGS) --entry=0 $<.o -o $@
+%.elf: %.S
+	$(GUESTCC) $(GUEST_ARCH) -c $< -o $<.o
+	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
+
+test: purv examples/fn.elf examples/sigtest.elf
+	@echo "== wasm-style function calls =="
+	@printf "square(7)   = "; ./purv --invoke=square --arg=7   examples/fn.elf
+	@printf "sum_to(100) = "; ./purv --invoke=sum_to --arg=100 examples/fn.elf
+	@printf "fib(20)     = "; ./purv --invoke=fib    --arg=20  examples/fn.elf
+	@echo "== conformance signature dump =="
+	@./purv --signature=examples/out.sig examples/sigtest.elf && \
+	  echo "signature:" && sed 's/^/  /' examples/out.sig
+
+# Regenerate the amalgamated header from the upstream submodule.
+regen:
+	python3 tools/flatten.py $(ATOOM_INC) purv.h
+	@echo "regenerated purv.h from $(ATOOM_INC)"
+
+clean:
+	rm -f purv purv_clang examples/*.o examples/*.elf examples/out.sig
