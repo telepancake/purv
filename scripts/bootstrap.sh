@@ -21,25 +21,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
-# path => upstream url
-declare -A SUBMODULES=(
-  ["third_party/riscv-isa-sim"]="https://github.com/riscv-software-src/riscv-isa-sim.git"
-  ["third_party/sail-riscv"]="https://github.com/riscv/sail-riscv.git"
-  ["third_party/riscv-arch-test"]="https://github.com/riscv-non-isa/riscv-arch-test.git"
-)
-
-echo "==> Registering + fetching submodules"
-for path in "${!SUBMODULES[@]}"; do
-  url="${SUBMODULES[$path]}"
-  if git config --file .gitmodules --get "submodule.${path}.url" >/dev/null 2>&1; then
-    echo "    [skip] ${path} already registered"
-  else
-    echo "    [add]  ${path} <- ${url}"
-    git submodule add "${url}" "${path}"
-  fi
-done
-
-git submodule update --init --recursive
+# The three submodules are already committed (.gitmodules). This just clones
+# their contents. In most environments a plain `git submodule update --init`
+# works. Some managed sessions inject a git-credential proxy that rewrites
+# github.com URLs to a per-repo-scoped endpoint, which 403s on third-party
+# repos; in that case we retry with the injected global/system config disabled
+# so the clone goes straight over the normal HTTPS egress proxy.
+echo "==> Fetching submodules"
+if ! git submodule update --init --recursive; then
+  echo "    [retry] disabling injected git config and going over HTTPS"
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+  GIT_SSL_CAINFO="${GIT_SSL_CAINFO:-/root/.ccr/ca-bundle.crt}" \
+    git submodule update --init --recursive
+fi
 
 echo
 echo "==> Resolved submodule commits (pin these in git for reproducible runs):"
