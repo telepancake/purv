@@ -18,3 +18,11 @@
 	path = third_party/atoomnetmarc-rv
 	url = https://github.com/atoomnetmarc/RISC-V-emulator
 	ignore = dirty
+[submodule "third_party/tinyemu"]
+	path = third_party/tinyemu
+	url = https://github.com/fernandotcl/TinyEMU
+	ignore = dirty
+[submodule "third_party/libriscv"]
+	path = third_party/libriscv
+	url = https://github.com/libriscv/libriscv
+	ignore = dirty
