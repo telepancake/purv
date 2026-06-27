@@ -46,6 +46,9 @@ void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length);
 void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length);
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state);
 void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state);
+/* Supply backing storage for a CSR the engine does not implement (the engine
+ * reads/writes through the returned pointer); return NULL to raise illegal. */
+void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *state, uint16_t csrnum);
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state);
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *state);
 

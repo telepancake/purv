@@ -15,7 +15,7 @@ cd "$(dirname "$0")"
 make -s purv
 PURV=$PWD/purv
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
-SUITES=("${@:-rv32ui rv32um rv32uc}")
+SUITES="${*:-rv32ui rv32um rv32uc}"
 
 fetch() { # repo ref dest
   local out="$W/$3.tgz"

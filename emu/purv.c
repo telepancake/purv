@@ -1434,9 +1434,6 @@ static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *state, const uint1
     case 0x300:
         address = &state->csr.mstatus;
         break;
-    case 0x301:
-        address = &state->csr.misa;
-        break;
     case 0x302:
         address = &state->csr.medeleg;
         break;
@@ -1480,8 +1477,11 @@ static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *state, const uint1
         address = &state->csr.satp;
         break;
     default:
-        state->trapflag.illegalinstruction = 1;
-        RiscvEmulatorUnknownCSR(state);
+        address = RiscvEmulatorGetUnknownCSR(state, csr);
+        if (address == 0) {
+            state->trapflag.illegalinstruction = 1;
+            RiscvEmulatorUnknownCSR(state);
+        }
     }
     return address;
 }

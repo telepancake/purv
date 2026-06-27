@@ -122,6 +122,26 @@ void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state) {
     RiscvEmulatorRaiseIllegalInstruction(state);
 }
 
+/* Machine-information CSRs are implementation policy, so the host supplies them
+ * rather than the engine. misa advertises the configured ISA (RV32IMC); the
+ * vendor/arch/impl IDs read as zero ("not implemented", which is legal). */
+void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *state, uint16_t csrnum) {
+    static uint32_t misa = (1u << 30)            /* MXL = 1 -> XLEN 32 */
+                         | (1u << ('I' - 'A'))
+                         | (1u << ('M' - 'A'))
+                         | (1u << ('C' - 'A'));
+    static uint32_t zero;
+    (void)state;
+    switch (csrnum) {
+    case 0x301: return &misa;                    /* misa  */
+    case 0xF11:                                  /* mvendorid */
+    case 0xF12:                                  /* marchid   */
+    case 0xF13:                                  /* mimpid    */
+        zero = 0; return &zero;                  /* read-only zero */
+    default:    return NULL;                     /* genuinely unimplemented */
+    }
+}
+
 /* User-mode syscall emulation (Linux/RISC-V ABI subset): a7=number,
  * a0..a5=args, result in a0. Only what single-threaded console programs need;
  * everything else returns -ENOSYS. Enabled by --user; otherwise ecall traps
