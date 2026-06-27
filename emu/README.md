@@ -55,6 +55,27 @@ Under the hood: `clang --target=riscv32 -march=rv32imc` compiles the function,
 a sentinel, loads args into `a0..`, runs until the function returns, and prints
 `a0`.
 
+## Run userspace code (syscalls)
+
+```sh
+purv --user <elf>     # ecall -> Linux/RISC-V syscall, handled by the host
+```
+
+In `--user` mode an `ecall` is delivered to the host as a syscall (`a7`=number,
+`a0..`=args, result in `a0`) instead of trapping to `mtvec`. `main.c` implements
+a small subset (`write`, `exit`); everything else returns `-ENOSYS`. Example:
+
+```sh
+make examples/hello.elf && ./purv --user examples/hello.elf
+# hello from riscv userspace
+```
+
+This is the design pattern for purv: the engine stays minimal and the host owns
+policy. The engine exposes just one new primitive — `RiscvEmulatorClearTrap()` —
+which the host's `RiscvEmulatorHandleECALL` calls to consume the `ecall` and
+resume, rather than the engine baking in any syscall ABI. Without `--user`,
+`ecall` traps normally, so machine-mode conformance is unaffected.
+
 ## Run a conformance test (RISCOF DUT contract)
 
 ```sh

@@ -46,11 +46,18 @@ purv: purv.c main.c purv.h
 	$(GUESTCC) $(GUEST_ARCH) -c $< -o $<.o
 	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
 
-test: purv examples/fn.elf examples/sigtest.elf
+# Userspace program: needs _start as the ELF entry (--user runs from e_entry).
+examples/hello.elf: examples/hello.c
+	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o $<.o
+	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
+
+test: purv examples/fn.elf examples/sigtest.elf examples/hello.elf
 	@echo "== wasm-style function calls =="
 	@printf "square(7)   = "; ./purv --invoke=square --arg=7   examples/fn.elf
 	@printf "sum_to(100) = "; ./purv --invoke=sum_to --arg=100 examples/fn.elf
 	@printf "fib(20)     = "; ./purv --invoke=fib    --arg=20  examples/fn.elf
+	@echo "== userspace program (ecall syscalls) =="
+	@./purv --user examples/hello.elf
 	@echo "== conformance signature dump =="
 	@./purv --signature=examples/out.sig examples/sigtest.elf && \
 	  echo "signature:" && sed 's/^/  /' examples/out.sig

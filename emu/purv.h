@@ -38,6 +38,7 @@ uint32_t RiscvEmulatorGetInstruction(const RiscvEmulatorState_t *state);      /*
 uint16_t RiscvEmulatorGetCsrNumber(const RiscvEmulatorState_t *state);        /* CSR being accessed */
 uint32_t RiscvEmulatorGetTrapVectorBase(const RiscvEmulatorState_t *state);   /* mtvec.base */
 void     RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state);
+void     RiscvEmulatorClearTrap(RiscvEmulatorState_t *state);                 /* consume pending trap (e.g. host-handled ecall) */
 
 /* ---- Hooks YOU implement (atoom's whole "API"): the engine reaches your
  *      memory map and trap policy only through these. ---- */

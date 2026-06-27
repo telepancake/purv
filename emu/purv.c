@@ -2266,3 +2266,6 @@ uint32_t RiscvEmulatorGetTrapVectorBase(const RiscvEmulatorState_t *state) {
 void RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state) {
     state->trapflag.illegalinstruction = 1;
 }
+void RiscvEmulatorClearTrap(RiscvEmulatorState_t *state) {
+    state->trapflag.value = 0;
+}

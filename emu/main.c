@@ -44,6 +44,7 @@ static uint32_t g_ram_size;
 static int      g_halt;                  /* set by a hook to stop the loop    */
 static int      g_exit = 1;              /* process exit code; 0 == PASS      */
 static int      g_call_mode;             /* in --invoke mode, ignore SYSCON   */
+static int      g_user_mode;             /* --user: ecall -> Linux-ish syscall */
 
 /* Symbols resolved from the ELF (conformance contract). */
 static int      g_have_tohost, g_have_sig;
@@ -121,7 +122,42 @@ void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state) {
     RiscvEmulatorRaiseIllegalInstruction(state);
 }
 
-void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) { (void)state; }
+/* User-mode syscall emulation (Linux/RISC-V ABI subset): a7=number,
+ * a0..a5=args, result in a0. Only what single-threaded console programs need;
+ * everything else returns -ENOSYS. Enabled by --user; otherwise ecall traps
+ * normally (machine-mode conformance is unaffected). */
+void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
+    if (!g_user_mode) return;            /* let it vector to the test's handler */
+    uint32_t num = RiscvEmulatorGetRegister(state, 17);   /* a7 */
+    uint32_t a0  = RiscvEmulatorGetRegister(state, 10);
+    uint32_t a1  = RiscvEmulatorGetRegister(state, 11);
+    uint32_t a2  = RiscvEmulatorGetRegister(state, 12);
+    uint32_t ret;
+    switch (num) {
+    case 64:                              /* write(fd, buf, len) */
+        ret = 0;
+        for (uint32_t i = 0; i < a2; i++) {
+            uint8_t b = 0;
+            RiscvEmulatorLoad(a1 + i, &b, 1);
+            putchar(b);
+            ret++;
+        }
+        fflush(stdout);
+        (void)a0;                         /* fd ignored: 1/2 both -> stdout */
+        break;
+    case 93:                              /* exit */
+    case 94:                              /* exit_group */
+        g_exit = (int)a0;
+        g_halt = 1;
+        ret = 0;
+        break;
+    default:
+        ret = (uint32_t)-38;              /* -ENOSYS */
+        break;
+    }
+    RiscvEmulatorSetRegister(state, 10, ret);
+    RiscvEmulatorClearTrap(state);        /* consume the ecall; don't vector */
+}
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *state) { (void)state; }
 
 /* ------------------------------------------------------------- ELF32 loading */
@@ -239,6 +275,7 @@ static void usage(const char *argv0) {
         "  --signature-granularity=N     bytes per signature word (default 4)\n"
         "  --invoke=SYM                  call function SYM, print return (a0)\n"
         "  --arg=N                       integer argument for --invoke (repeatable)\n"
+        "  --user                        run as userspace program (ecall -> syscall)\n"
         "  --ram=BYTES                   RAM size (default 256 MiB)\n"
         "  --max-insns=N                 instruction cap (default 256M)\n",
         argv0);
@@ -260,6 +297,7 @@ int main(int argc, char **argv) {
             if (nargs < 8) args[nargs++] = (uint32_t)strtol(a + 6, 0, 0);
             else { fprintf(stderr, "purv: too many --arg (max 8)\n"); return 2; }
         }
+        else if (!strcmp(a, "--user")) g_user_mode = 1;
         else if (!strncmp(a, "--ram=", 6)) g_ram_size = (uint32_t)strtoul(a + 6, 0, 0);
         else if (!strncmp(a, "--max-insns=", 12)) max_insns = strtoull(a + 12, 0, 0);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -285,7 +323,7 @@ int main(int argc, char **argv) {
         RiscvEmulatorSetRegister(st, 1, MAGIC_RET);           /* ra: ret -> stop */
         for (int i = 0; i < nargs; i++)
             RiscvEmulatorSetRegister(st, 10 + i, args[i]);    /* a0.. */
-    } else {
+    } else if (!g_user_mode) {
         g_have_tohost   = sym_lookup("tohost", &g_tohost);
         g_have_sig      = sym_lookup("begin_signature", &g_begin_sig) &
                           sym_lookup("end_signature", &g_end_sig);
