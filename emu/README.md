@@ -58,16 +58,20 @@ a sentinel, loads args into `a0..`, runs until the function returns, and prints
 ## Run userspace code (syscalls)
 
 ```sh
-purv --user <elf>     # ecall -> Linux/RISC-V syscall, handled by the host
+purv --user <elf> [program args...]    # ecall -> Linux/RISC-V syscall
 ```
 
-In `--user` mode an `ecall` is delivered to the host as a syscall (`a7`=number,
-`a0..`=args, result in `a0`) instead of trapping to `mtvec`. `main.c` implements
-a small subset (`write`, `exit`); everything else returns `-ENOSYS`. Example:
+In `--user` mode the host sets up a real initial stack (`argc`, `argv`, an empty
+`envp`, and an `AT_NULL` auxv) from the trailing command-line args, then an
+`ecall` is delivered as a syscall (`a7`=number, `a0..`=args, result in `a0`)
+instead of trapping to `mtvec`. `main.c` implements `write`, `exit`, and `brk`;
+everything else returns `-ENOSYS`. Examples:
 
 ```sh
 make examples/hello.elf && ./purv --user examples/hello.elf
 # hello from riscv userspace
+make examples/args.elf  && ./purv --user examples/args.elf one two
+# argc=3 / args.elf / one / two
 ```
 
 This is the design pattern for purv: the engine stays minimal and the host owns

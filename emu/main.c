@@ -45,6 +45,7 @@ static int      g_halt;                  /* set by a hook to stop the loop    */
 static int      g_exit = 1;              /* process exit code; 0 == PASS      */
 static int      g_call_mode;             /* in --invoke mode, ignore SYSCON   */
 static int      g_user_mode;             /* --user: ecall -> Linux-ish syscall */
+static uint32_t g_brk;                    /* program break for the brk syscall  */
 
 /* Symbols resolved from the ELF (conformance contract). */
 static int      g_have_tohost, g_have_sig;
@@ -171,6 +172,10 @@ void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
         g_halt = 1;
         ret = 0;
         break;
+    case 214:                             /* brk(addr): grow/query the heap */
+        if (a0 >= g_brk && a0 < RAM_ORIGIN + g_ram_size) g_brk = a0;
+        ret = g_brk;
+        break;
     default:
         ret = (uint32_t)-38;              /* -ENOSYS */
         break;
@@ -236,6 +241,8 @@ static uint32_t load_elf(const char *path) {
         }
         if (ph.p_filesz)
             memcpy(&g_ram[ph.p_paddr - RAM_ORIGIN], g_elf + ph.p_offset, ph.p_filesz);
+        uint32_t end = ph.p_paddr + ph.p_memsz;
+        if (end > g_brk) g_brk = (end + 0xFFF) & ~0xFFFu;   /* heap starts past the image */
     }
     return eh.e_entry;
 }
@@ -288,14 +295,46 @@ static void dump_signature(const char *path, uint32_t gran) {
 
 #define MAGIC_RET 0xdeadbee0u            /* sentinel return address for --invoke */
 
+static void gpoke(uint32_t addr, uint32_t v) {
+    memcpy(&g_ram[addr - RAM_ORIGIN], &v, 4);
+}
+
+/* Build the initial process stack (RISC-V Linux ABI): sp points at argc,
+ * followed by the argv pointers, a NULL, an empty envp, and an AT_NULL auxv.
+ * Argument strings are copied just below the top of RAM. Returns the new sp. */
+static uint32_t setup_user_stack(int argc, char **argv) {
+    uint32_t sp = RAM_ORIGIN + g_ram_size;
+    uint32_t ptr[64];
+    if (argc > 64) argc = 64;
+    for (int i = argc - 1; i >= 0; i--) {
+        uint32_t len = (uint32_t)strlen(argv[i]) + 1;
+        sp -= len;
+        memcpy(&g_ram[sp - RAM_ORIGIN], argv[i], len);
+        ptr[i] = sp;
+    }
+    sp &= ~15u;
+    uint32_t words = 1 + (uint32_t)argc + 1 + 1 + 2;   /* argc, argv, NULL, envp NULL, auxv 0,0 */
+    sp -= words * 4;
+    sp &= ~15u;
+    uint32_t p = sp;
+    gpoke(p, (uint32_t)argc); p += 4;
+    for (int i = 0; i < argc; i++) { gpoke(p, ptr[i]); p += 4; }
+    gpoke(p, 0); p += 4;                                /* argv terminator */
+    gpoke(p, 0); p += 4;                                /* envp terminator */
+    gpoke(p, 0); p += 4;                                /* auxv: AT_NULL type */
+    gpoke(p, 0);                                        /* auxv: value       */
+    return sp;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [options] <elf>\n"
+        "usage: %s [options] <elf> [program args...]\n"
         "  --signature=FILE              dump signature region (RISCOF DUT)\n"
         "  --signature-granularity=N     bytes per signature word (default 4)\n"
         "  --invoke=SYM                  call function SYM, print return (a0)\n"
         "  --arg=N                       integer argument for --invoke (repeatable)\n"
-        "  --user                        run as userspace program (ecall -> syscall)\n"
+        "  --user                        run as userspace program (ecall -> syscall;\n"
+        "                                program args become argv on the stack)\n"
         "  --ram=BYTES                   RAM size (default 256 MiB)\n"
         "  --max-insns=N                 instruction cap (default 256M)\n",
         argv0);
@@ -306,6 +345,7 @@ int main(int argc, char **argv) {
     uint32_t gran = 4;
     uint64_t max_insns = 256ull * 1024 * 1024;
     uint32_t args[8]; int nargs = 0;
+    char *gargv[64]; int gargc = 0;       /* program argv (argv[0]=elf, then extras) */
     g_ram_size = PURV_RAM_DEFAULT;
 
     for (int i = 1; i < argc; i++) {
@@ -322,8 +362,9 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--max-insns=", 12)) max_insns = strtoull(a + 12, 0, 0);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else if (a[0] == '-') { fprintf(stderr, "purv: unknown option %s\n", a); return 2; }
-        else elf = a;
+        else if (gargc < 64) gargv[gargc++] = argv[i];   /* elf, then guest argv */
     }
+    if (gargc) elf = gargv[0];
     if (!elf) { usage(argv[0]); return 2; }
 
     g_ram = calloc(1, g_ram_size);
@@ -343,7 +384,9 @@ int main(int argc, char **argv) {
         RiscvEmulatorSetRegister(st, 1, MAGIC_RET);           /* ra: ret -> stop */
         for (int i = 0; i < nargs; i++)
             RiscvEmulatorSetRegister(st, 10 + i, args[i]);    /* a0.. */
-    } else if (!g_user_mode) {
+    } else if (g_user_mode) {
+        RiscvEmulatorSetRegister(st, 2, setup_user_stack(gargc, gargv));  /* sp */
+    } else {
         g_have_tohost   = sym_lookup("tohost", &g_tohost);
         g_have_sig      = sym_lookup("begin_signature", &g_begin_sig) &
                           sym_lookup("end_signature", &g_end_sig);
