@@ -48,6 +48,13 @@ typedef uint32_t tag_t;
 #define NOTAG  0u
 #define BADTAG 0xFFFFFFFFu
 
+/* A reserved high range of tags marks memory as executable code. Data object
+ * tags are small (1..); code tags are CODE_TAG_BASE.. (one per loaded executable
+ * segment). A fetch is valid only from a cell carrying a code tag. */
+#define CODE_TAG_BASE 0xC0000000u
+static int is_code_tag(tag_t t) { return t >= CODE_TAG_BASE && t != BADTAG; }
+static tag_t g_code_tag = CODE_TAG_BASE;   /* next code tag to hand out */
+
 static tag_t    g_reg_tag[32];            /* shadow registers (the driver's datapath) */
 static tag_t   *g_mem_tag;                /* tagged memory: one tag per word, owned by the
                                            * memory system -- touched ONLY in the load/store
@@ -157,8 +164,20 @@ static int tag_check(tag_t t, uint32_t addr, uint32_t len, int write) {
 
 /* ----------------------------------------------- implementation-specific hooks */
 
-/* Instruction fetch: bytes only, no provenance and no bounds check. */
+/* Instruction fetch: valid only from a cell tagged executable code. This is the
+ * same tagged memory data uses; here we require the cell's own tag to be a code
+ * tag, so jumping into data, the heap, or the stack faults. */
 void RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length) {
+    tag_t t = in_ram(address, 4) ? g_mem_tag[(address - RAM_ORIGIN) >> 2] : NOTAG;
+    if (!is_code_tag(t)) {
+        fprintf(stderr,
+            "\n*** purvs: control-flow violation ***\n"
+            "  fetch of non-executable memory at 0x%08x (pc=0x%08x)\n",
+            address, g_cur_pc);
+        g_halt = 1; g_exit = 134;
+        memset(destination, 0, length);
+        return;
+    }
     if (in_ram(address, length)) memcpy(destination, &g_ram[address - RAM_ORIGIN], length);
     else memset(destination, 0, length);
 }
@@ -171,7 +190,10 @@ void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length) {
     if (address == UART_LSR) { *(uint8_t *)destination = 0x60; return; }
     if (in_ram(address, length)) {
         memcpy(destination, &g_ram[address - RAM_ORIGIN], length);
-        if (length == 4) g_mem_val_tag = g_mem_tag[(address - RAM_ORIGIN) >> 2];
+        if (length == 4) {                /* recover a stored pointer's tag... */
+            tag_t cell = g_mem_tag[(address - RAM_ORIGIN) >> 2];
+            g_mem_val_tag = is_code_tag(cell) ? NOTAG : cell;  /* ...but code isn't data */
+        }
         return;
     }
     memset(destination, 0, length);       /* unmapped reads as zero (NOTAG) */
@@ -191,6 +213,7 @@ void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
     fprintf(stderr, "purvs: stray store 0x%08x\n", address); g_halt = 1; g_exit = 1;
 }
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) {
+    if (g_halt) return;                   /* already faulted (e.g. a bad fetch): don't double-report */
     fprintf(stderr, "purvs: illegal instruction 0x%08x at pc=0x%08x\n",
             RiscvEmulatorGetInstruction(state), RiscvEmulatorGetProgramCounter(state));
     g_halt = 1; g_exit = 1;
@@ -281,6 +304,11 @@ static uint32_t load_elf(const char *path) {
         if (!in_ram(ph.p_paddr, ph.p_memsz)) { fprintf(stderr, "purvs: segment outside RAM\n"); exit(2); }
         if (ph.p_filesz) memcpy(&g_ram[ph.p_paddr - RAM_ORIGIN], buf + ph.p_offset, ph.p_filesz);
         uint32_t end = ph.p_paddr + ph.p_memsz;
+        if (ph.p_flags & 1) {                          /* PF_X: executable -> tag cells as code */
+            for (uint32_t a = ph.p_paddr & ~3u; a < end; a += 4)
+                if (in_ram(a, 4)) g_mem_tag[(a - RAM_ORIGIN) >> 2] = g_code_tag;
+            g_code_tag++;                               /* next exec segment: distinct code tag */
+        }
         if (end > g_brk) g_brk = (end + 0xFFF) & ~0xFFFu;
     }
     free(buf);

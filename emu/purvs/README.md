@@ -18,6 +18,7 @@ purvs/
 |------------|---------------------------------------------------------------|
 | `NOTAG`    | value the CPU made up — immediates, `sp`, arithmetic of untagged |
 | object id  | a pointer into a specific allocation (handed out by `malloc`)  |
+| code tag   | a reserved high range (`CODE_TAG_BASE..`) marking a memory cell as executable; one per loaded executable segment |
 | `BAD`      | corrupted provenance (e.g. a pointer built from two objects)   |
 
 Propagation, decoded in parallel for each instruction:
@@ -70,6 +71,13 @@ passes it to the callback — the driver never recomputes it. So a pointer store
 to memory and loaded back recovers its tag, while bytes the program never wrote
 simply read as `NOTAG` (the memory system's initial state, not a guess).
 
+**Instruction fetch goes through the same tagged memory.** The loader marks the
+cells of each executable ELF segment with a *code tag*; `RiscvEmulatorFetch`
+validates that the cell it reads carries one. So executing data, the heap, or the
+stack — anything not marked executable — faults, and code can't be reached by
+jumping into a buffer. (A data load of a code-tagged cell reads as `NOTAG`: code
+is executable, not a data pointer.)
+
 ## Checks
 
 `malloc` is a syscall that allocates, records `[base,size)`, and returns a
@@ -101,6 +109,7 @@ make test
 == rsub ==     int - ptr -> bad -> caught                           exit=134
 == scale ==    shifted pointer (valid address) -> bad -> caught     exit=134
 == cross ==    pointer built from two objects -> bad -> caught      exit=134
+== xdata ==    calling into a data buffer -> non-executable -> caught exit=134
 ```
 
 ## Notes / limits

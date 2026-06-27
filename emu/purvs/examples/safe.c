@@ -1,9 +1,16 @@
-/* Freestanding RV32 codelet exercising purvs pointer safety.
- * Pick a case via argv[1]: ok | oob | uaf | cross.
- *   ok    - only in-bounds accesses (exits 0)
- *   oob   - write past the end of an allocation (caught)
- *   uaf   - write after free (caught)
- *   cross - mix two objects' pointers, then dereference (caught) */
+/* Freestanding RV32 codelet exercising purvs pointer safety. Pick a case via
+ * argv[1]:
+ *   ok      - only in-bounds accesses (exits 0)
+ *   diff    - same-object pointer difference used as a count (exits 0)
+ *   align   - p & ~15 keeps the tag (exits 0)
+ *   oob     - write past the end of an allocation (caught)
+ *   uaf     - write after free (caught)
+ *   subdiff - (b - a) across objects -> bad scalar -> caught
+ *   addp    - ptr + ptr -> bad -> caught
+ *   rsub    - int - ptr -> bad -> caught
+ *   scale   - shifted pointer -> bad -> caught
+ *   cross   - pointer built from two objects -> bad -> caught
+ *   xdata   - call into a data buffer -> non-executable fetch -> caught */
 static long sys(long n, long a, long b, long c) {
     register long a7 __asm__("a7") = n;
     register long x10 __asm__("a0") = a;
@@ -69,6 +76,12 @@ void cmain(unsigned long *sp) {
         volatile char *s = (volatile char *)((unsigned long)p << 1); /* shift, not offset */
         put("scale: dereferencing a shifted pointer...\n");
         *s = 'X';                                  /* shift poisons the tag -> caught */
+        put("BUG: not caught\n");
+    } else if (streq(mode, "xdata")) {
+        volatile unsigned *buf = (volatile unsigned *)xmalloc(16);
+        buf[0] = 0x00008067u;                          /* a 'ret', planted as data */
+        put("xdata: calling into a data buffer...\n");
+        ((void (*)(void))(unsigned long)buf)();        /* execute data -> fetch not code */
         put("BUG: not caught\n");
     } else if (streq(mode, "cross")) {
         volatile char *q = (volatile char *)xmalloc(16);
