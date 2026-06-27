@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -165,6 +166,62 @@ static void bp_del(uint32_t addr) {
         if (g_bp[i] == addr) { g_bp[i] = g_bp[--g_nbp]; return; }
 }
 
+/* ----------------------------------------------- reverse-execution history */
+
+/* A per-instruction undo record: the register file before the step (x0..x31 and
+ * the next-pc in slot 32) plus the memory writes the step made (a RISC-V
+ * instruction stores at most once, but a couple of slots cover split writes). To
+ * reverse a step we put the registers back and replay the old bytes. */
+#define HIST_FRAMES (1u << 16)               /* ring depth (~12 MB of history) */
+#define FRAME_WRITES 4
+
+typedef struct {
+    uint32_t reg[33];
+    struct { uint32_t addr; uint8_t len; uint8_t old[8]; } w[FRAME_WRITES];
+    int nw, overflow;
+} Frame;
+
+static Frame   *g_hist;                       /* allocated lazily (large) */
+static uint32_t g_head, g_count;              /* ring start and length */
+static Frame   *g_cur;                        /* frame being filled this step, or NULL */
+
+/* Called by the host's store hook with the pre-write bytes. */
+void RiscvEmulatorGdbRecordStore(uint32_t address, const void *old_bytes, uint8_t length) {
+    if (!g_cur) return;                       /* not inside a recorded step */
+    if (g_cur->nw >= FRAME_WRITES || length > sizeof g_cur->w[0].old) { g_cur->overflow = 1; return; }
+    int i = g_cur->nw++;
+    g_cur->w[i].addr = address;
+    g_cur->w[i].len = length;
+    memcpy(g_cur->w[i].old, old_bytes, length);
+}
+
+/* Step one instruction while recording it into the history ring. */
+static void step_record(RiscvEmulatorState_t *st) {
+    if (!g_hist) { RiscvEmulatorLoop(st); return; }   /* no history: just step */
+    Frame *f = &g_hist[(g_head + g_count) % HIST_FRAMES];
+    if (g_count == HIST_FRAMES) g_head = (g_head + 1) % HIST_FRAMES;
+    else g_count++;
+    for (int i = 0; i < 32; i++) f->reg[i] = RiscvEmulatorGetRegister(st, i);
+    f->reg[32] = RiscvEmulatorGetNextProgramCounter(st);
+    f->nw = 0; f->overflow = 0;
+    g_cur = f;
+    RiscvEmulatorLoop(st);
+    g_cur = NULL;
+}
+
+/* Undo the most recent recorded step. Returns 0 at the start of history. */
+static int step_reverse(RiscvEmulatorState_t *st) {
+    if (g_count == 0) return 0;
+    Frame *f = &g_hist[(g_head + g_count - 1) % HIST_FRAMES];
+    if (f->overflow) { g_count--; return -1; }   /* can't faithfully undo */
+    for (int i = f->nw - 1; i >= 0; i--)         /* restore memory (g_cur NULL: not re-recorded) */
+        RiscvEmulatorStore(f->w[i].addr, f->w[i].old, f->w[i].len);
+    for (int i = 1; i < 32; i++) RiscvEmulatorSetRegister(st, i, f->reg[i]);
+    RiscvEmulatorSetProgramCounter(st, f->reg[32]);
+    g_count--;
+    return 1;
+}
+
 /* --------------------------------------------------------- target description */
 
 /* A minimal target.xml so a stock riscv:rv32 gdb adopts exactly this register
@@ -203,7 +260,7 @@ enum { STOP_TRAP, STOP_INT, STOP_EXIT };
 static int gdb_run(RiscvEmulatorState_t *st, int fd, int cont, const int *halted) {
     unsigned tick = 0;
     for (;;) {
-        RiscvEmulatorLoop(st);
+        step_record(st);
         if (*halted) return STOP_EXIT;
         if (!cont) return STOP_TRAP;
         if (bp_hit(RiscvEmulatorGetNextProgramCounter(st))) return STOP_TRAP;
@@ -212,11 +269,21 @@ static int gdb_run(RiscvEmulatorState_t *st, int fd, int cont, const int *halted
     }
 }
 
+/* Reverse: undo one step, or (for reverse-continue) keep undoing until the pc
+ * about to execute is a breakpoint or history runs out. */
+static int gdb_reverse(RiscvEmulatorState_t *st, int cont) {
+    for (;;) {
+        if (step_reverse(st) == 0) return STOP_TRAP;   /* start of history */
+        if (!cont) return STOP_TRAP;
+        if (bp_hit(RiscvEmulatorGetNextProgramCounter(st))) return STOP_TRAP;
+    }
+}
+
 /* ----------------------------------------------------------------- q packets */
 
 static void handle_q(int fd, const char *buf) {
     if (!strncmp(buf, "qSupported", 10)) {
-        gdb_send(fd, "PacketSize=1000;qXfer:features:read+");
+        gdb_send(fd, "PacketSize=1000;qXfer:features:read+;ReverseStep+;ReverseContinue+");
     } else if (!strcmp(buf, "qAttached")) {
         gdb_send(fd, "1");
     } else if (!strcmp(buf, "qC")) {
@@ -256,6 +323,9 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
     char buf[GDB_BUF], out[GDB_BUF], wmsg[8] = "S05";
     int exited = 0;
     g_nbp = 0;
+    g_head = g_count = 0;
+    g_cur = NULL;
+    if (!g_hist) g_hist = malloc(sizeof *g_hist * HIST_FRAMES);   /* reverse-exec history */
 
     for (;;) {
         int n = gdb_recv(fd, buf, sizeof buf);
@@ -337,6 +407,14 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
             }
             break;
         }
+        case 'b':                            /* bs = reverse-step, bc = reverse-continue */
+            if (buf[1] == 's' || buf[1] == 'c') {
+                gdb_reverse(st, buf[1] == 'c');
+                gdb_send(fd, "S05");
+            } else {
+                gdb_send(fd, "");
+            }
+            break;
         case 'Z':                            /* insert breakpoint */
         case 'z': {                          /* remove breakpoint */
             if (buf[1] != '0' && buf[1] != '1') { gdb_send(fd, ""); break; }  /* sw/hw only */

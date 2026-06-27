@@ -13,7 +13,7 @@ emu/
   gdbstub.c   optional GDB Remote Serial Protocol server (build with GDB=1)
   gdbserve.py launcher that brokers a gdb connection and hands purv the fd
   tools/      flatten.py — regenerates purv.c from the upstream submodule
-  examples/   fn.c (bare functions), sigtest.S (signature/tohost demo)
+  examples/   fn.c (bare functions), sigtest.S (signature demo), loop.c (gdb reverse-exec)
 ```
 
 `purv.h` is the entire public surface: the VM state is an **opaque type**, so
@@ -118,6 +118,34 @@ reported back to gdb. It drives the engine purely through `purv.h` — stepping 
 `RiscvEmulatorLoop`, reaching guest memory through the same `RiscvEmulatorLoad`/
 `Store` hooks — so the generated engine is untouched. `--gdb=FD` composes with the
 other modes (`--user`, plain run-to-halt): gdb just takes over execution.
+
+### Reverse execution (time travel)
+
+```sh
+(gdb) reverse-stepi      # step one instruction backward
+(gdb) reverse-continue   # run backward to the previous breakpoint
+```
+
+gdb's own `record full` does **not** support riscv (`the current architecture
+doesn't support record function`), so a remote stub is the *only* way to reverse-
+debug riscv in gdb — and an emulator is the natural place for it. The stub keeps a
+per-instruction undo history: before each step it snapshots the register file, and
+the host feeds it the bytes each store overwrites (`RiscvEmulatorGdbRecordStore`,
+the one line added to the host's store hook). Reversing puts the registers back
+and replays those bytes, so **both registers and memory unwind exactly** — a
+forward run that fills an array and a reverse run that empties it land on
+identical state at every step. History is a bounded ring (~64k instructions); past
+the oldest recorded step, reverse is a safe no-op. The engine itself stays
+unmodified — it never knows it is being recorded.
+
+```sh
+make examples/loop.elf
+./gdbserve.py 1234 -- ./purv --user examples/loop.elf   # a loop that writes memory
+```
+
+Most other gdb features that aren't native here degrade gracefully: hardware
+watchpoints fall back to gdb's software watchpoints, `vCont` to plain `c`/`s`,
+conditional breakpoints are evaluated gdb-side, and ack-mode simply stays on.
 
 ## Run a conformance test (RISCOF DUT contract)
 

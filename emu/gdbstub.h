@@ -19,5 +19,11 @@
 void RiscvEmulatorGdbServe(RiscvEmulatorState_t *state, int fd,
                            const int *halted, const int *exitcode);
 
+/* Hook the host calls from RiscvEmulatorStore (for in-RAM writes) with the bytes
+ * about to be overwritten, so the stub can undo them for reverse execution. It
+ * records only while an instruction is being stepped under gdb; at all other
+ * times (gdb memory pokes, reverse restores) it is a no-op. */
+void RiscvEmulatorGdbRecordStore(uint32_t address, const void *old_bytes, uint8_t length);
+
 #endif /* PURV_GDBSTUB */
 #endif /* PURV_GDBSTUB_H_ */

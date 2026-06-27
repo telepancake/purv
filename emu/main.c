@@ -101,6 +101,9 @@ void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
         return;
     }
     if (in_ram(address, length)) {
+#ifdef PURV_GDBSTUB
+        RiscvEmulatorGdbRecordStore(address, &g_ram[address - RAM_ORIGIN], length); /* undo log */
+#endif
         memcpy(&g_ram[address - RAM_ORIGIN], source, length);
         return;
     }

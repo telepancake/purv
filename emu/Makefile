@@ -53,7 +53,7 @@ purv: purv.c main.c purv.h $(GDB_SRC) $(if $(GDB_SRC),gdbstub.h)
 	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
 
 # Userspace programs: need _start as the ELF entry (--user runs from e_entry).
-examples/hello.elf examples/args.elf: %.elf: %.c
+examples/hello.elf examples/args.elf examples/loop.elf: %.elf: %.c
 	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o $<.o
 	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
 
