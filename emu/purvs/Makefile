@@ -30,6 +30,7 @@ test: purvs examples/safe.elf
 	@echo "== oob =="                 ; ./purvs examples/safe.elf oob     ; echo "exit=$$?"
 	@echo "== uaf =="                 ; ./purvs examples/safe.elf uaf     ; echo "exit=$$?"
 	@echo "== subdiff (cross diff) =="; ./purvs examples/safe.elf subdiff ; echo "exit=$$?"
+	@echo "== scale (shift ptr) =="   ; ./purvs examples/safe.elf scale   ; echo "exit=$$?"
 	@echo "== cross-object =="        ; ./purvs examples/safe.elf cross   ; echo "exit=$$?"
 
 clean:

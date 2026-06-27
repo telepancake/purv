@@ -56,11 +56,26 @@ static tag_t   *g_mem_tag;                /* shadow memory, one tag per word */
 static struct { uint32_t base, size; int live; } g_obj[MAX_OBJ];
 static uint32_t g_nobj;
 
+/* add/sub: integer offsetting. tag +/- notag stays in-object; ptr - ptr is a
+ * scalar if same object, BAD across objects. */
 static tag_t tag_combine(tag_t a, tag_t b) {
     if (a == BADTAG || b == BADTAG) return BADTAG;
-    if (a == NOTAG) return b;             /* pointer +/- integer offset stays in-object */
+    if (a == NOTAG) return b;
     if (b == NOTAG) return a;
-    return (a == b) ? NOTAG : BADTAG;     /* two pointers: same -> scalar; different -> bad */
+    return (a == b) ? NOTAG : BADTAG;
+}
+/* slt/seq/etc.: the result is a boolean scalar. Comparing pointers into one
+ * object (or against a plain integer) is fine -> NOTAG; comparing across
+ * objects is meaningless -> BAD. */
+static tag_t tag_compare(tag_t a, tag_t b) {
+    if (a == BADTAG || b == BADTAG) return BADTAG;
+    if (a == NOTAG || b == NOTAG) return NOTAG;
+    return (a == b) ? NOTAG : BADTAG;
+}
+/* mul/div/rem/shift/and/or/xor: not pointer arithmetic. Any provenance flowing
+ * in poisons the result -- the output is not a valid pointer into the object. */
+static tag_t tag_poison(tag_t a, tag_t b) {
+    return (a == NOTAG && b == NOTAG) ? NOTAG : BADTAG;
 }
 
 static tag_t memtag_load(uint32_t addr) {
@@ -263,7 +278,7 @@ int main(int argc, char **argv) {
             continue;
         }
         uint8_t op = insn & 0x7f, rd = (insn >> 7) & 31, f3 = (insn >> 12) & 7;
-        uint8_t rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31;
+        uint8_t rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31, f7 = (insn >> 25) & 0x7f;
         tag_t t1 = g_reg_tag[rs1], t2 = g_reg_tag[rs2];
         uint32_t addr = 0, sz = 0;
         if (op == 0x03 || op == 0x23) {   /* load / store: bounds-check first */
@@ -279,8 +294,17 @@ int main(int argc, char **argv) {
         if (g_halt) break;
 
         switch (op) {                     /* propagate the shadow tag to rd / memory */
-        case 0x33: settag(rd, tag_combine(t1, t2)); break;       /* OP    */
-        case 0x13: settag(rd, t1); break;                        /* OP-IMM */
+        case 0x33:                                               /* OP (reg, reg) */
+            if (f7 == 0x01)            settag(rd, tag_poison(t1, t2));   /* M: mul/div/rem */
+            else if (f3 == 0)          settag(rd, tag_combine(t1, t2));  /* add/sub */
+            else if (f3 == 2 || f3 == 3) settag(rd, tag_compare(t1, t2)); /* slt/sltu */
+            else                       settag(rd, tag_poison(t1, t2));   /* sll/xor/srl/sra/or/and */
+            break;
+        case 0x13:                                               /* OP-IMM (reg, imm) */
+            if (f3 == 0)               settag(rd, t1);                   /* addi: offset */
+            else if (f3 == 2 || f3 == 3) settag(rd, tag_compare(t1, NOTAG)); /* slti/sltiu */
+            else                       settag(rd, tag_poison(t1, NOTAG)); /* slli/xori/.../andi */
+            break;
         case 0x03: settag(rd, sz == 4 ? memtag_load(addr) : NOTAG); break; /* LOAD */
         case 0x23: memtag_store(addr, sz == 4 ? t2 : NOTAG); break;         /* STORE */
         case 0x37: case 0x17:                                     /* LUI/AUIPC */

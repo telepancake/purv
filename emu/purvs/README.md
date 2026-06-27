@@ -22,16 +22,23 @@ purvs/
 
 Propagation, decoded in parallel for each instruction:
 
+Propagation is **operation-aware** — only additive offsetting keeps a pointer:
+
 ```
-tag  op  NOTAG      -> tag        (pointer +/- integer offset stays in-object)
-tag  op  same tag   -> NOTAG      (two pointers into one object -> a scalar)
-tag  op  other tag  -> BAD        (cross-object arithmetic)
-BAD  op  anything   -> BAD        (sticky)
+add / sub / addi   tag +/- notag -> tag     (offset stays in-object)
+                   ptr - ptr same -> NOTAG  (a difference is a scalar)
+                   ptr - ptr diff -> BAD    (cross-object)
+slt / sltu / slti  compare same/ptr-vs-int -> NOTAG ; cross-object -> BAD
+mul div rem        any operand tagged -> BAD
+sll srl sra        any operand tagged -> BAD
+and or xor         any operand tagged -> BAD
+BAD op anything    -> BAD                    (sticky)
 ```
 
-This applies uniformly to every binary op, so a same-object pointer difference
-(or comparison) is a plain number, while a cross-object difference is `BAD` and
-poisons whatever uses it.
+So multiplying, shifting, or masking a pointer yields `BAD` even though the
+address may still look valid: those aren't pointer arithmetic, so the result is
+not a usable pointer into the object. Only `add`/`sub` of an integer offset (and
+comparisons) keep provenance.
 
 Tags ride through memory too: storing a pointer tags that memory word; loading
 it back recovers the tag.
@@ -61,6 +68,7 @@ make test
 == oob ==      out of bounds store ... object 1: [..,..)           exit=134
 == uaf ==      use-after-free / dead object store ... (freed)      exit=134
 == subdiff ==  bad-provenance pointer store ... tag: BAD           exit=134
+== scale ==    bad-provenance store at the valid base ... tag: BAD  exit=134
 == cross ==    bad-provenance pointer store ... tag: BAD           exit=134
 ```
 

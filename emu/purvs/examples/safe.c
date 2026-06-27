@@ -49,6 +49,12 @@ void cmain(unsigned long *sp) {
         put("subdiff: using (b - a) as an index into c...\n");
         c[d & 15] = 'X';                           /* bad provenance poisons the access */
         put("BUG: not caught\n");
+    } else if (streq(mode, "scale")) {
+        unsigned long pi = (unsigned long)p;
+        volatile char *s = (volatile char *)((pi >> 2) << 2); /* shift, not add/sub */
+        put("scale: deref a pointer rebuilt by shifting (same address)...\n");
+        *s = 'X';                                  /* shift poisons the tag -> caught */
+        put("BUG: not caught\n");
     } else if (streq(mode, "cross")) {
         volatile char *q = (volatile char *)xmalloc(16);
         unsigned long pi = (unsigned long)p, qi = (unsigned long)q;
