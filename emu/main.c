@@ -82,10 +82,13 @@ void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
         return;
     }
     if (g_have_tohost && address == g_tohost) {
-        /* RISCOF halt: any non-zero tohost write ends the run; the signature
-         * is what's actually checked, so PASS the process and let the harness
-         * diff the signature against the reference model. */
-        g_exit = 0;
+        /* HTIF tohost: a write ends the run. Self-checking suites encode the
+         * result here (tohost==1 -> pass; odd value >1 -> (testnum<<1)|1 fail);
+         * signature-dump suites (RISCOF/arch-test) write 1 and rely on the
+         * signature, so the same rule reports PASS for them too. */
+        uint32_t v = 0;
+        memcpy(&v, source, length < 4 ? length : 4);
+        g_exit = (v == 1) ? 0 : 1;
         g_halt = 1;
         return;
     }
