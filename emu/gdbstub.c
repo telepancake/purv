@@ -29,6 +29,8 @@
 
 static const char hexd[] = "0123456789abcdef";
 
+static int g_noack;                          /* QStartNoAckMode: drop +/- acks once negotiated */
+
 static int hexval(int c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -78,11 +80,11 @@ static int gdb_recv(int fd, char *buf, size_t max) {
         int h1 = gdb_read_byte(fd), h2 = gdb_read_byte(fd);
         if (h1 < 0 || h2 < 0) return -1;
         buf[len] = '\0';
-        if ((uint8_t)((hexval(h1) << 4) | hexval(h2)) != sum) {
+        if (!g_noack && (uint8_t)((hexval(h1) << 4) | hexval(h2)) != sum) {
             gdb_write_all(fd, "-", 1);       /* bad checksum: ask for a resend */
             continue;
         }
-        gdb_write_all(fd, "+", 1);
+        if (!g_noack) gdb_write_all(fd, "+", 1);
         return (int)len;
     }
 }
@@ -102,6 +104,7 @@ static void gdb_send(int fd, const char *data) {
     frame[k++] = hexd[sum & 0xf];
     for (;;) {
         if (gdb_write_all(fd, frame, k) < 0) return;
+        if (g_noack) return;                 /* no-ack mode: don't wait for '+' */
         int a = gdb_read_byte(fd);
         if (a == '-') continue;              /* gdb wants a resend */
         return;                              /* '+' (or EOF): done */
@@ -255,6 +258,16 @@ static const char *target_xml(void) {
 
 enum { STOP_TRAP, STOP_INT, STOP_EXIT };
 
+/* Stop reply: signal plus a couple of expedited registers (pc=32, sp=2) and the
+ * thread, so gdb needn't immediately re-read the whole file with 'g'. */
+static void send_stop(int fd, RiscvEmulatorState_t *st, int sig) {
+    char pch[9], sph[9], s[64];
+    reg_to_hex(pch, reg_get(st, 32)); pch[8] = '\0';
+    reg_to_hex(sph, reg_get(st, 2));  sph[8] = '\0';
+    snprintf(s, sizeof s, "T%02x20:%s;02:%s;thread:1;", sig & 0xff, pch, sph);
+    gdb_send(fd, s);
+}
+
 /* Step the engine; for a continue, keep going until the next pc is a breakpoint,
  * gdb sends an interrupt (0x03), or the program ends. */
 static int gdb_run(RiscvEmulatorState_t *st, int fd, int cont, const int *halted) {
@@ -283,7 +296,8 @@ static int gdb_reverse(RiscvEmulatorState_t *st, int cont) {
 
 static void handle_q(int fd, const char *buf) {
     if (!strncmp(buf, "qSupported", 10)) {
-        gdb_send(fd, "PacketSize=1000;qXfer:features:read+;ReverseStep+;ReverseContinue+");
+        gdb_send(fd, "PacketSize=1000;qXfer:features:read+;ReverseStep+;ReverseContinue+;"
+                     "vContSupported+;QStartNoAckMode+");
     } else if (!strcmp(buf, "qAttached")) {
         gdb_send(fd, "1");
     } else if (!strcmp(buf, "qC")) {
@@ -323,6 +337,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
     char buf[GDB_BUF], out[GDB_BUF], wmsg[8] = "S05";
     int exited = 0;
     g_nbp = 0;
+    g_noack = 0;
     g_head = g_count = 0;
     g_cur = NULL;
     if (!g_hist) g_hist = malloc(sizeof *g_hist * HIST_FRAMES);   /* reverse-exec history */
@@ -334,7 +349,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
 
         switch (buf[0]) {
         case '?':
-            gdb_send(fd, exited ? wmsg : "S05");
+            if (exited) gdb_send(fd, wmsg); else send_stop(fd, st, 5);
             break;
         case 'g': {                          /* read all registers */
             for (uint32_t i = 0; i < GDB_NREG; i++) reg_to_hex(out + i * 8, reg_get(st, i));
@@ -403,17 +418,39 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
                 snprintf(wmsg, sizeof wmsg, "W%02x", (unsigned)(*exitcode) & 0xff);
                 gdb_send(fd, wmsg);
             } else {
-                gdb_send(fd, r == STOP_INT ? "S02" : "S05");
+                send_stop(fd, st, r == STOP_INT ? 2 : 5);
             }
             break;
         }
         case 'b':                            /* bs = reverse-step, bc = reverse-continue */
             if (buf[1] == 's' || buf[1] == 'c') {
                 gdb_reverse(st, buf[1] == 'c');
-                gdb_send(fd, "S05");
+                send_stop(fd, st, 5);
             } else {
                 gdb_send(fd, "");
             }
+            break;
+        case 'v':                            /* vCont (modern step/continue) */
+            if (!strcmp(buf, "vCont?")) {
+                gdb_send(fd, "vCont;c;C;s;S");
+            } else if (!strncmp(buf, "vCont;", 6)) {
+                if (exited) { gdb_send(fd, wmsg); break; }
+                char act = buf[6];           /* first action applies to our one thread */
+                int r = gdb_run(st, fd, act == 'c' || act == 'C', halted);
+                if (r == STOP_EXIT) {
+                    exited = 1;
+                    snprintf(wmsg, sizeof wmsg, "W%02x", (unsigned)(*exitcode) & 0xff);
+                    gdb_send(fd, wmsg);
+                } else {
+                    send_stop(fd, st, r == STOP_INT ? 2 : 5);
+                }
+            } else {
+                gdb_send(fd, "");            /* vMustReplyEmpty and unknown v packets */
+            }
+            break;
+        case 'Q':                            /* QStartNoAckMode etc. */
+            if (!strcmp(buf, "QStartNoAckMode")) { gdb_send(fd, "OK"); g_noack = 1; }
+            else gdb_send(fd, "");
             break;
         case 'Z':                            /* insert breakpoint */
         case 'z': {                          /* remove breakpoint */

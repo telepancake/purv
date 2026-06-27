@@ -143,9 +143,11 @@ make examples/loop.elf
 ./gdbserve.py 1234 -- ./purv --user examples/loop.elf   # a loop that writes memory
 ```
 
-Most other gdb features that aren't native here degrade gracefully: hardware
-watchpoints fall back to gdb's software watchpoints, `vCont` to plain `c`/`s`,
-conditional breakpoints are evaluated gdb-side, and ack-mode simply stays on.
+The stub also speaks `vCont` (gdb's modern step/continue), `QStartNoAckMode` (drops
+the `+`/`-` handshake once negotiated), and `T` stop replies that expedite `pc`/`sp`
+so gdb needn't re-read the whole register file on every stop. The remaining gdb
+features that aren't native here degrade gracefully: hardware watchpoints fall back
+to gdb's software watchpoints, and conditional breakpoints are evaluated gdb-side.
 
 ## Run a conformance test (RISCOF DUT contract)
 
