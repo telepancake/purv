@@ -23,8 +23,14 @@ LDFLAGS  ?= -m elf32lriscv --image-base=0x80000000
 ATOOM_INC ?= ../third_party/atoomnetmarc-rv/include
 OUTDIR    ?= .
 
-.PHONY: all test regen clean
+.PHONY: all test conformance regen clean
 all: purv
+
+# Real conformance: the self-checking riscv-tests ISA suite (needs network +
+# clang; uses spike only if present). See README "Running the real conformance
+# suite" and selfcheck.sh.
+conformance: purv
+	./selfcheck.sh
 
 # purv.c is the generated engine; main.c is the host/driver. Separate TUs.
 purv: purv.c main.c purv.h

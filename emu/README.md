@@ -70,6 +70,40 @@ This matches the CLI that `conformance/plugin-purv` already expects, so purv can
 drop straight into the RISCOF harness once a `riscv*-gcc` cross-compiler and the
 Sail reference model are available.
 
+## Running the real conformance suite
+
+```sh
+make conformance        # ./selfcheck.sh rv32ui rv32um rv32uc
+```
+
+`selfcheck.sh` fetches the classic **riscv-tests** ISA suite, builds each test
+for rv32imc with **clang** (`--target=riscv32` + `ld.lld` — no cross-gcc), and
+runs it on purv. These tests are **self-checking**: each embeds its expected
+results and writes pass/fail to the HTIF `tohost` word, so **no reference model
+is needed**. purv decodes that word (`tohost==1` -> pass) into its exit code.
+
+It only needs network egress (to fetch the suite) and clang. Last measured here:
+rv32ui 41/41, rv32um 8/8, rv32uc 1/1; `rv32ui/ma_data` is excluded and
+`rv32mi/mcsr` fails (machine-CSR gap — see below).
+
+**Optional reference (Spike).** If `spike` is on `PATH`, `selfcheck.sh` uses it
+only to skip tests Spike itself can't pass under this config (e.g. `ma_data`).
+Build it once from the pinned submodule (a C++ host program — no cross-toolchain):
+
+```sh
+apt-get install -y device-tree-compiler
+git submodule update --init third_party/riscv-isa-sim        # or fetch the tarball
+( cd third_party/riscv-isa-sim && mkdir -p build && cd build && ../configure && make -j )
+export PATH="$PWD/third_party/riscv-isa-sim/build:$PATH"
+```
+
+**Note on the pinned ACT4 suite.** `third_party/riscv-arch-test` is the newer
+ACT4 framework. Building *its* ELFs needs a UDB-generated `rvtest_config.h`
+(ruby/mise) and Sail to bake reference signatures — heavy, and this Spike build
+has no `+signature` flag to diff against. `selfcheck.sh` (riscv-tests,
+self-checking) is the lightweight path that runs anywhere with just clang; reach
+for the ACT4 framework only when you need its exhaustive coverage.
+
 ## Memory map
 
 | region | address      | behaviour                                  |
