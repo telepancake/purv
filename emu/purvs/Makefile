@@ -27,6 +27,7 @@ examples/safe.elf: examples/safe.c
 test: purvs examples/safe.elf
 	@echo "== ok (in-bounds) =="      ; ./purvs examples/safe.elf ok      ; echo "exit=$$?"
 	@echo "== diff (same-object) =="  ; ./purvs examples/safe.elf diff    ; echo "exit=$$?"
+	@echo "== align (p & ~15) =="     ; ./purvs examples/safe.elf align   ; echo "exit=$$?"
 	@echo "== oob =="                 ; ./purvs examples/safe.elf oob     ; echo "exit=$$?"
 	@echo "== uaf =="                 ; ./purvs examples/safe.elf uaf     ; echo "exit=$$?"
 	@echo "== subdiff (cross diff) =="; ./purvs examples/safe.elf subdiff ; echo "exit=$$?"

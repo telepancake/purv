@@ -95,8 +95,25 @@ static tag_t alu_cmp(tag_t a, tag_t b) {       /* result is a boolean scalar */
     if (is_ptr(a) && is_ptr(b) && a != b) return BADTAG; /* cross-object compare */
     return NOTAG;
 }
-static tag_t alu_other(tag_t a, tag_t b) {     /* mul/div/rem/shift/and/or/xor */
+static tag_t alu_other(tag_t a, tag_t b) {     /* mul/div/rem/shift */
     return (a == NOTAG && b == NOTAG) ? NOTAG : BADTAG;  /* any provenance -> bad */
+}
+/* and/or/xor: masking a pointer with a constant. Keep the tag when the constant
+ * only touches the low (page-local) bits -- i.e. alignment (and ~k), or setting/
+ * toggling low bits (or/xor k) -- since that just adjusts the address within the
+ * object and the eventual load/store is still bounds-checked. Touching high bits
+ * is forging, and mixing two pointers' bits is meaningless: both -> BAD.
+ * f3: 7=and, 6=or, 4=xor. va/vb are the operand values (for the constant). */
+#define PAGE_BITS 12
+static tag_t alu_bitwise(uint8_t f3, tag_t ta, uint32_t va, tag_t tb, uint32_t vb) {
+    if (ta == BADTAG || tb == BADTAG) return BADTAG;
+    int pa = is_ptr(ta), pb = is_ptr(tb);
+    if (pa && pb) return BADTAG;                /* two addresses mixed */
+    if (!pa && !pb) return NOTAG;               /* plain integers */
+    uint32_t k = pa ? vb : va;                  /* the non-pointer constant */
+    int page_local = (f3 == 7) ? ((~k >> PAGE_BITS) == 0)   /* and: clears only low bits */
+                               : (( k >> PAGE_BITS) == 0);   /* or/xor: sets only low bits */
+    return page_local ? (pa ? ta : tb) : BADTAG;
 }
 
 static tag_t memtag_load(uint32_t addr) {
@@ -301,6 +318,9 @@ int main(int argc, char **argv) {
         uint8_t op = insn & 0x7f, rd = (insn >> 7) & 31, f3 = (insn >> 12) & 7;
         uint8_t rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31, f7 = (insn >> 25) & 0x7f;
         tag_t t1 = g_reg_tag[rs1], t2 = g_reg_tag[rs2];
+        uint32_t v1 = RiscvEmulatorGetRegister(st, rs1);   /* operand values, for */
+        uint32_t v2 = RiscvEmulatorGetRegister(st, rs2);   /* and/or/xor constant checks */
+        uint32_t immI = (uint32_t)((int32_t)insn >> 20);   /* I-type sign-extended imm */
         uint32_t addr = 0, sz = 0;
         if (op == 0x03 || op == 0x23) {   /* load / store: bounds-check first */
             int32_t imm = (op == 0x03)
@@ -320,12 +340,16 @@ int main(int argc, char **argv) {
             else if (f3 == 0)            settag(rd, f7 == 0x20 ? alu_sub(t1, t2)
                                                               : alu_add(t1, t2)); /* sub / add */
             else if (f3 == 2 || f3 == 3) settag(rd, alu_cmp(t1, t2));    /* slt/sltu */
-            else                         settag(rd, alu_other(t1, t2));  /* sll/xor/srl/sra/or/and */
+            else if (f3 == 4 || f3 == 6 || f3 == 7)
+                                         settag(rd, alu_bitwise(f3, t1, v1, t2, v2)); /* xor/or/and */
+            else                         settag(rd, alu_other(t1, t2));  /* sll/srl/sra */
             break;
         case 0x13:                                               /* OP-IMM (reg, imm: imm is N) */
             if (f3 == 0)                 settag(rd, alu_add(t1, NOTAG)); /* addi: ptr+offset */
             else if (f3 == 2 || f3 == 3) settag(rd, alu_cmp(t1, NOTAG)); /* slti/sltiu */
-            else                         settag(rd, alu_other(t1, NOTAG)); /* slli/xori/.../andi */
+            else if (f3 == 4 || f3 == 6 || f3 == 7)
+                                         settag(rd, alu_bitwise(f3, t1, v1, NOTAG, immI)); /* xori/ori/andi */
+            else                         settag(rd, alu_other(t1, NOTAG)); /* slli/srli/srai */
             break;
         case 0x03: settag(rd, sz == 4 ? memtag_load(addr) : NOTAG); break; /* LOAD */
         case 0x23: memtag_store(addr, sz == 4 ? t2 : NOTAG); break;         /* STORE */

@@ -26,6 +26,10 @@ void cmain(unsigned long *sp) {
     if (streq(mode, "ok")) {
         p[0] = 'A'; p[15] = 'Z';
         put("ok: in-bounds writes succeeded\n");
+    } else if (streq(mode, "align")) {
+        volatile char *a = (volatile char *)((unsigned long)p & ~(unsigned long)15);
+        a[0] = 'A';                                /* p & ~15: alignment keeps the tag */
+        put("align: (p & ~15) keeps the tag; in-bounds write ok\n");
     } else if (streq(mode, "oob")) {
         put("oob: writing p[20] (past the 16-byte object)...\n");
         p[20] = 'X';
@@ -62,9 +66,8 @@ void cmain(unsigned long *sp) {
         *(volatile char *)s = 'X';
         put("BUG: not caught\n");
     } else if (streq(mode, "scale")) {
-        unsigned long pi = (unsigned long)p;
-        volatile char *s = (volatile char *)((pi >> 2) << 2); /* shift, not add/sub */
-        put("scale: deref a pointer rebuilt by shifting (same address)...\n");
+        volatile char *s = (volatile char *)((unsigned long)p << 1); /* shift, not offset */
+        put("scale: dereferencing a shifted pointer...\n");
         *s = 'X';                                  /* shift poisons the tag -> caught */
         put("BUG: not caught\n");
     } else if (streq(mode, "cross")) {
