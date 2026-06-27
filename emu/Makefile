@@ -32,9 +32,15 @@ all: purv
 conformance: purv
 	./selfcheck.sh
 
+# Optional GDB stub: `make GDB=1` compiles gdbstub.c (guarded by PURV_GDBSTUB)
+# into the binary, adding `--gdb=FD` so gdb can drive the emulator over a
+# launcher-provided fd. Without GDB=1 none of the stub is compiled.
+GDB_SRC := $(if $(filter 1,$(GDB)),gdbstub.c)
+GDB_DEF := $(if $(filter 1,$(GDB)),-DPURV_GDBSTUB)
+
 # purv.c is the generated engine; main.c is the host/driver. Separate TUs.
-purv: purv.c main.c purv.h
-	$(CC) $(CFLAGS) purv.c main.c -o $@
+purv: purv.c main.c purv.h $(GDB_SRC) $(if $(GDB_SRC),gdbstub.h)
+	$(CC) $(CFLAGS) $(GDB_DEF) purv.c main.c $(GDB_SRC) -o $@
 
 # Build any guest .c/.S into an ELF loadable at RAM_ORIGIN (0x80000000).
 # .c is library-style (called via --invoke, so no entry needed); .S is a full

@@ -27,6 +27,9 @@
 #include <errno.h>
 
 #include "purv.h"
+#ifdef PURV_GDBSTUB
+#include "gdbstub.h"
+#endif
 
 /* ------------------------------------------------------------------ memory */
 
@@ -46,6 +49,9 @@ static int      g_exit = 1;              /* process exit code; 0 == PASS      */
 static int      g_call_mode;             /* in --invoke mode, ignore SYSCON   */
 static int      g_user_mode;             /* --user: ecall -> Linux-ish syscall */
 static uint32_t g_brk;                    /* program break for the brk syscall  */
+#ifdef PURV_GDBSTUB
+static int      g_gdb_fd = -1;            /* --gdb=FD: serve gdb on this connected fd */
+#endif
 
 /* Symbols resolved from the ELF (conformance contract). */
 static int      g_have_tohost, g_have_sig;
@@ -335,6 +341,10 @@ static void usage(const char *argv0) {
         "  --arg=N                       integer argument for --invoke (repeatable)\n"
         "  --user                        run as userspace program (ecall -> syscall;\n"
         "                                program args become argv on the stack)\n"
+#ifdef PURV_GDBSTUB
+        "  --gdb=FD                      serve gdb on connected fd FD (no listening;\n"
+        "                                a launcher supplies the socket)\n"
+#endif
         "  --ram=BYTES                   RAM size (default 256 MiB)\n"
         "  --max-insns=N                 instruction cap (default 256M)\n",
         argv0);
@@ -358,6 +368,9 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "purv: too many --arg (max 8)\n"); return 2; }
         }
         else if (!strcmp(a, "--user")) g_user_mode = 1;
+#ifdef PURV_GDBSTUB
+        else if (!strncmp(a, "--gdb=", 6)) g_gdb_fd = (int)strtol(a + 6, 0, 0);
+#endif
         else if (!strncmp(a, "--ram=", 6)) g_ram_size = (uint32_t)strtoul(a + 6, 0, 0);
         else if (!strncmp(a, "--max-insns=", 12)) max_insns = strtoull(a + 12, 0, 0);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -393,6 +406,16 @@ int main(int argc, char **argv) {
     }
 
     RiscvEmulatorSetProgramCounter(st, start);
+
+#ifdef PURV_GDBSTUB
+    if (g_gdb_fd >= 0) {
+        /* Hand control to gdb: it steps/continues the engine over the RSP. The
+         * guest's console still goes to stdout; the RSP rides the provided fd. */
+        RiscvEmulatorGdbServe(st, g_gdb_fd, &g_halt, &g_exit);
+        RiscvEmulatorDestroy(st);
+        return g_exit;
+    }
+#endif
 
     uint64_t i = 0;
     for (; i < max_insns && !g_halt; i++) {
