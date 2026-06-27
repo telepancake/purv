@@ -125,14 +125,7 @@ static tag_t alu_bitwise(uint8_t f3, tag_t ta, uint32_t va, tag_t tb, uint32_t v
     return page_local ? (pa ? ta : tb) : BADTAG;
 }
 
-/* ---- tag side channel: the one handoff between the register shadow (kept by
- * the driver loop) and the memory system (these callbacks). The driver sets the
- * base-pointer tag and (for a store) the value tag before a step; a load reads
- * the cell's tag back out. The engine itself passes no tags -- it stays oblivious
- * and only ever moves bytes. */
-static tag_t    g_mem_ptr_tag;    /* tag of the base pointer being dereferenced  */
-static tag_t    g_mem_val_tag;    /* store: value tag in; load: cell tag out     */
-static uint32_t g_cur_pc;         /* instruction in flight, for the message      */
+static uint32_t g_cur_pc;         /* instruction in flight, for messages */
 
 /* Validate an access made through pointer-tag t against its object. */
 static int tag_check(tag_t t, uint32_t addr, uint32_t len, int write) {
@@ -162,66 +155,85 @@ static int tag_check(tag_t t, uint32_t addr, uint32_t len, int write) {
     return 0;
 }
 
-/* ----------------------------------------------- implementation-specific hooks */
+/* ===================== tagged memory system =====================
+ * The real interface: tags are explicit arguments/returns. All policy lives
+ * here -- bounds/provenance on data, executability on fetch, W^X on store. The
+ * engine never sees any of this; see the adapters below. */
 
-/* Instruction fetch: valid only from a cell tagged executable code. This is the
- * same tagged memory data uses; here we require the cell's own tag to be a code
- * tag, so jumping into data, the heap, or the stack faults. */
-void RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length) {
-    tag_t t = in_ram(address, 4) ? g_mem_tag[(address - RAM_ORIGIN) >> 2] : NOTAG;
-    if (!is_code_tag(t)) {
+/* Fetch: valid only from a cell tagged executable code, so jumping into data,
+ * the heap, or the stack faults. */
+static void mem_fetch(uint32_t addr, void *dst, uint8_t len) {
+    tag_t cell = in_ram(addr, 4) ? g_mem_tag[(addr - RAM_ORIGIN) >> 2] : NOTAG;
+    if (!is_code_tag(cell)) {
         fprintf(stderr,
             "\n*** purvs: control-flow violation ***\n"
-            "  fetch of non-executable memory at 0x%08x (pc=0x%08x)\n",
-            address, g_cur_pc);
+            "  fetch of non-executable memory at 0x%08x (pc=0x%08x)\n", addr, g_cur_pc);
         g_halt = 1; g_exit = 134;
-        memset(destination, 0, length);
+        memset(dst, 0, len);
         return;
     }
-    if (in_ram(address, length)) memcpy(destination, &g_ram[address - RAM_ORIGIN], length);
-    else memset(destination, 0, length);
+    if (in_ram(addr, len)) memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
+    else memset(dst, 0, len);
 }
 
-/* Data read: check the base pointer, then return the bytes AND the memory cell's
- * tag (a full-word read recovers a stored pointer's tag; sub-word reads data). */
-void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length) {
-    g_mem_val_tag = NOTAG;
-    if (!tag_check(g_mem_ptr_tag, address, length, 0)) { memset(destination, 0, length); return; }
-    if (address == UART_LSR) { *(uint8_t *)destination = 0x60; return; }
-    if (in_ram(address, length)) {
-        memcpy(destination, &g_ram[address - RAM_ORIGIN], length);
-        if (length == 4) {                /* recover a stored pointer's tag... */
-            tag_t cell = g_mem_tag[(address - RAM_ORIGIN) >> 2];
-            g_mem_val_tag = is_code_tag(cell) ? NOTAG : cell;  /* ...but code isn't data */
+/* Data read through a pointer tagged addr_tag: check it, return the bytes and
+ * the loaded value's tag (a full-word read recovers a stored pointer's tag;
+ * sub-word reads, and code read as data, are NOTAG). */
+static tag_t mem_load(uint32_t addr, tag_t addr_tag, void *dst, uint8_t len) {
+    if (!tag_check(addr_tag, addr, len, 0)) { memset(dst, 0, len); return NOTAG; }
+    if (addr == UART_LSR) { *(uint8_t *)dst = 0x60; return NOTAG; }
+    if (in_ram(addr, len)) {
+        memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
+        if (len == 4) {
+            tag_t cell = g_mem_tag[(addr - RAM_ORIGIN) >> 2];
+            return is_code_tag(cell) ? NOTAG : cell;
         }
-        return;
+        return NOTAG;
     }
-    memset(destination, 0, length);       /* unmapped reads as zero (NOTAG) */
+    memset(dst, 0, len);                   /* unmapped reads as zero */
+    return NOTAG;
 }
 
-/* Data write: check the base pointer, then store the bytes AND the value's tag
- * into the cell (a full-word store records the pointer; a sub-word store leaves
- * a value that can't be a clean pointer, so the cell's tag is cleared). */
-void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
-    if (!tag_check(g_mem_ptr_tag, address, length, 1)) return;
-    if (address == UART_THR) { putchar(*(const uint8_t *)source); fflush(stdout); return; }
-    /* W^X: refuse to write a cell tagged executable code. */
-    uint32_t lo = address, hi = address + length - 1;
+/* Data write through a pointer tagged addr_tag of a value tagged val_tag: check
+ * the pointer, enforce W^X, store the bytes, record the value's tag on the cell
+ * (a sub-word store leaves no clean pointer, so the cell's tag is cleared). */
+static void mem_store(uint32_t addr, tag_t addr_tag, const void *src, tag_t val_tag, uint8_t len) {
+    if (!tag_check(addr_tag, addr, len, 1)) return;
+    if (addr == UART_THR) { putchar(*(const uint8_t *)src); fflush(stdout); return; }
+    uint32_t lo = addr, hi = addr + len - 1;
     if ((in_ram(lo, 1) && is_code_tag(g_mem_tag[(lo - RAM_ORIGIN) >> 2])) ||
         (in_ram(hi, 1) && is_code_tag(g_mem_tag[(hi - RAM_ORIGIN) >> 2]))) {
         fprintf(stderr,
             "\n*** purvs: W^X violation ***\n"
             "  store of %u byte(s) into executable memory at 0x%08x (pc=0x%08x)\n",
-            length, address, g_cur_pc);
+            len, addr, g_cur_pc);
         g_halt = 1; g_exit = 134;
         return;
     }
-    if (in_ram(address, length)) {
-        memcpy(&g_ram[address - RAM_ORIGIN], source, length);
-        g_mem_tag[(address - RAM_ORIGIN) >> 2] = (length == 4) ? g_mem_val_tag : NOTAG;
+    if (in_ram(addr, len)) {
+        memcpy(&g_ram[addr - RAM_ORIGIN], src, len);
+        g_mem_tag[(addr - RAM_ORIGIN) >> 2] = (len == 4) ? val_tag : NOTAG;
         return;
     }
-    fprintf(stderr, "purvs: stray store 0x%08x\n", address); g_halt = 1; g_exit = 1;
+    fprintf(stderr, "purvs: stray store 0x%08x\n", addr); g_halt = 1; g_exit = 1;
+}
+
+/* ===== engine-facing adapters =====
+ * The engine calls these value-only hooks (it carries no tags). They bridge to
+ * the tagged memory system above using a side channel the driver fills in for
+ * the instruction in flight: the base-pointer tag, and (for a store) the value
+ * tag; a load hands the loaded value's tag back the same way. */
+static tag_t g_mem_ptr_tag;       /* base-pointer tag of the access in flight */
+static tag_t g_mem_val_tag;       /* store: value tag in; load: value tag out */
+
+void RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length) {
+    mem_fetch(address, destination, length);
+}
+void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length) {
+    g_mem_val_tag = mem_load(address, g_mem_ptr_tag, destination, length);
+}
+void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
+    mem_store(address, g_mem_ptr_tag, source, g_mem_val_tag, length);
 }
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) {
     if (g_halt) return;                   /* already faulted (e.g. a bad fetch): don't double-report */

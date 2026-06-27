@@ -56,28 +56,38 @@ Reasoning per op:
 
 ## Memory and the callbacks
 
-The engine has no memory; it reaches the memory system only through three hooks:
-`RiscvEmulatorFetch` (instruction read), `RiscvEmulatorLoad` (data read),
-`RiscvEmulatorStore` (data write). **The tag of a memory cell is the memory
-system's business, learned by asking on load and recorded on store — it is never
-maintained by the emulator.** Tagged memory (`g_mem_tag`, one tag per word) lives
-behind those callbacks and is touched only there.
+The engine has no memory and knows nothing of tags; it reaches the world only
+through three value-only hooks: `RiscvEmulatorFetch` (instruction read),
+`RiscvEmulatorLoad` (data read), `RiscvEmulatorStore` (data write). Those are
+thin **adapters** in `main.c` over the real tagged memory system, whose interface
+makes the tags explicit:
 
-The register tags are the driver's parallel datapath. At a load/store the driver
-hands the memory system the base-pointer's tag (for the check) and, on a store,
-the value's tag (to record on the cell); a load returns the cell's tag back into
-the destination register. The engine computes the real effective address and
-passes it to the callback — the driver never recomputes it. So a pointer stored
-to memory and loaded back recovers its tag, while bytes the program never wrote
-simply read as `NOTAG` (the memory system's initial state, not a guess).
+```c
+void  mem_fetch(uint32_t addr, void *dst, uint8_t len);
+tag_t mem_load (uint32_t addr, tag_t addr_tag, void *dst, uint8_t len);              /* -> value tag */
+void  mem_store(uint32_t addr, tag_t addr_tag, const void *src, tag_t val_tag, uint8_t len);
+```
+
+**The tag of a memory cell is the memory system's business** — checked against
+the pointer on access, recorded on store, returned on load. Tagged memory
+(`g_mem_tag`, one tag per word) lives entirely behind `mem_*`. All policy
+(bounds, executability, W^X) is there too; the engine sees none of it.
+
+The register tags are the driver's parallel datapath. For the access in flight
+the driver hands the adapter the base-pointer's tag and (for a store) the value's
+tag; the adapter forwards them as the explicit `addr_tag`/`val_tag` arguments,
+and a load's returned tag flows back into the destination register. The engine
+computes the real effective address and passes it down — never recomputed. So a
+pointer stored to memory and loaded back recovers its tag, while bytes the
+program never wrote read as `NOTAG` (the memory system's initial state).
 
 **Instruction fetch goes through the same tagged memory.** The loader marks the
-cells of each executable ELF segment with a *code tag*; `RiscvEmulatorFetch`
-validates that the cell it reads carries one. So executing data, the heap, or the
-stack — anything not marked executable — faults, and code can't be reached by
-jumping into a buffer. (A data load of a code-tagged cell reads as `NOTAG`: code
-is executable, not a data pointer.) Symmetrically, `RiscvEmulatorStore` refuses to
-write a code-tagged cell (**W^X**) — so the executable image can't be modified.
+cells of each executable ELF segment with a *code tag*; `mem_fetch` validates
+that the cell it reads carries one. So executing data, the heap, or the stack —
+anything not marked executable — faults, and code can't be reached by jumping
+into a buffer. (A data load of a code-tagged cell reads as `NOTAG`: code is
+executable, not a data pointer.) Symmetrically, `mem_store` refuses to write a
+code-tagged cell (**W^X**) — so the executable image can't be modified.
 
 ## Checks
 
