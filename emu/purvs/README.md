@@ -53,21 +53,36 @@ Reasoning per op:
   (`B`), even though the address may still look valid.
 - **B is sticky**: any bad operand gives `B`.
 
-Tags ride through memory too: storing a pointer tags that memory word; loading
-it back recovers the tag.
+## Memory and the callbacks
+
+The engine has no memory; it reaches the memory system only through three hooks:
+`RiscvEmulatorFetch` (instruction read), `RiscvEmulatorLoad` (data read),
+`RiscvEmulatorStore` (data write). **The tag of a memory cell is the memory
+system's business, learned by asking on load and recorded on store — it is never
+maintained by the emulator.** Tagged memory (`g_mem_tag`, one tag per word) lives
+behind those callbacks and is touched only there.
+
+The register tags are the driver's parallel datapath. At a load/store the driver
+hands the memory system the base-pointer's tag (for the check) and, on a store,
+the value's tag (to record on the cell); a load returns the cell's tag back into
+the destination register. The engine computes the real effective address and
+passes it to the callback — the driver never recomputes it. So a pointer stored
+to memory and loaded back recovers its tag, while bytes the program never wrote
+simply read as `NOTAG` (the memory system's initial state, not a guess).
 
 ## Checks
 
 `malloc` is a syscall that allocates, records `[base,size)`, and returns a
-pointer **with a fresh object tag**. `free` retires the object. On every
-load/store the host checks the base pointer's tag *before* the engine touches
-memory:
+pointer **with a fresh object tag**. `free` retires the object. Inside the
+load/store callback the memory system checks the base pointer's tag against the
+object *before* performing the access:
 
-- `NOTAG` → allowed (untracked memory: stack, globals)
+- `NOTAG` → allowed (untracked memory: stack, globals, MMIO)
 - object id → must be live and the access must fall within `[base,size)`
 - `BAD` → rejected
 
-So out-of-bounds, cross-object, and use-after-free accesses are all caught.
+So out-of-bounds, cross-object, and use-after-free accesses are all caught, and a
+violation refuses the access (the load fills zero / the store is dropped).
 
 ## Demo
 

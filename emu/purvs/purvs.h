@@ -42,8 +42,9 @@ void     RiscvEmulatorClearTrap(RiscvEmulatorState_t *state);                 /*
 
 /* ---- Hooks YOU implement (atoom's whole "API"): the engine reaches your
  *      memory map and trap policy only through these. ---- */
-void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length);
-void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length);
+void RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length); /* instruction read */
+void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length);  /* data read  */
+void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length); /* data write */
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state);
 void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state);
 /* Supply backing storage for a CSR the engine does not implement (the engine

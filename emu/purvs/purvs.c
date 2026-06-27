@@ -2157,7 +2157,7 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
 
     // Read 16 bits.
     state->instruction.H = 0;
-    RiscvEmulatorLoad(
+    RiscvEmulatorFetch(
         state->programcounter,
         &state->instruction.L,
         sizeof(state->instruction.L));
@@ -2165,7 +2165,7 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
 
     // Read another 16 bits when this is a 32-bit instruction.
     if (state->instruction.copcode.op == OPCODE16_QUADRANT_INVALID) {
-        RiscvEmulatorLoad(
+        RiscvEmulatorFetch(
             state->programcounternext,
             &state->instruction.H,
             sizeof(state->instruction.L));
