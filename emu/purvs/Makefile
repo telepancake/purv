@@ -36,6 +36,7 @@ test: purvs examples/safe.elf
 	@echo "== scale (shift ptr) =="   ; ./purvs examples/safe.elf scale   ; echo "exit=$$?"
 	@echo "== cross-object =="        ; ./purvs examples/safe.elf cross   ; echo "exit=$$?"
 	@echo "== xdata (exec data) =="   ; ./purvs examples/safe.elf xdata   ; echo "exit=$$?"
+	@echo "== wcode (write code) =="  ; ./purvs examples/safe.elf wcode   ; echo "exit=$$?"
 
 clean:
 	rm -f purvs examples/*.o examples/*.elf

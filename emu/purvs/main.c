@@ -205,6 +205,17 @@ void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length) {
 void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
     if (!tag_check(g_mem_ptr_tag, address, length, 1)) return;
     if (address == UART_THR) { putchar(*(const uint8_t *)source); fflush(stdout); return; }
+    /* W^X: refuse to write a cell tagged executable code. */
+    uint32_t lo = address, hi = address + length - 1;
+    if ((in_ram(lo, 1) && is_code_tag(g_mem_tag[(lo - RAM_ORIGIN) >> 2])) ||
+        (in_ram(hi, 1) && is_code_tag(g_mem_tag[(hi - RAM_ORIGIN) >> 2]))) {
+        fprintf(stderr,
+            "\n*** purvs: W^X violation ***\n"
+            "  store of %u byte(s) into executable memory at 0x%08x (pc=0x%08x)\n",
+            length, address, g_cur_pc);
+        g_halt = 1; g_exit = 134;
+        return;
+    }
     if (in_ram(address, length)) {
         memcpy(&g_ram[address - RAM_ORIGIN], source, length);
         g_mem_tag[(address - RAM_ORIGIN) >> 2] = (length == 4) ? g_mem_val_tag : NOTAG;

@@ -76,7 +76,8 @@ cells of each executable ELF segment with a *code tag*; `RiscvEmulatorFetch`
 validates that the cell it reads carries one. So executing data, the heap, or the
 stack — anything not marked executable — faults, and code can't be reached by
 jumping into a buffer. (A data load of a code-tagged cell reads as `NOTAG`: code
-is executable, not a data pointer.)
+is executable, not a data pointer.) Symmetrically, `RiscvEmulatorStore` refuses to
+write a code-tagged cell (**W^X**) — so the executable image can't be modified.
 
 ## Checks
 
@@ -110,6 +111,7 @@ make test
 == scale ==    shifted pointer (valid address) -> bad -> caught     exit=134
 == cross ==    pointer built from two objects -> bad -> caught      exit=134
 == xdata ==    calling into a data buffer -> non-executable -> caught exit=134
+== wcode ==    writing into the code segment -> W^X -> caught       exit=134
 ```
 
 ## Notes / limits
