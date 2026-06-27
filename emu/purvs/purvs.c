@@ -772,6 +772,8 @@ struct RiscvEmulatorState {
     RiscvInstruction_u instruction;
     RiscvRegister_u reg;
     uint32_t reg_tag[32];        /* parallel tag for each register (x0..x31) */
+    uint32_t pc_tag;             /* tag of the cell the current instruction was fetched from */
+    uint32_t transfer_tag;       /* tag of this instruction's branch target (set per-op) */
     RiscvCSR_t csr;
 };
 
@@ -1320,6 +1322,7 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
 
         if (state->instruction.crtype.funct4 == FUNCT4_MV) {
             if (rs2num == 0) {
+                state->transfer_tag = state->reg_tag[rdnum];   /* indirect: rs1 is in the rd field */
                 RiscvEmulatorC_JR(state, rd);
             } else {
                 RiscvEmulatorC_MV(rdnum, rd, rs2);
@@ -1328,6 +1331,7 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
             if (rdnum == 0 && rs2num == 0) {
                 RiscvEmulatorC_EBREAK(state);
             } else if (rs2num == 0) {
+                state->transfer_tag = state->reg_tag[rdnum];   /* indirect: rs1 is in the rd field */
                 RiscvEmulatorC_JALR(state, rd, ra);
             } else {
                 RiscvEmulatorC_ADD(rdnum, rd, rs2);
@@ -1551,6 +1555,7 @@ static void RiscvEmulatorJALR(RiscvEmulatorState_t *state) {
     void *rs1 = &state->reg.x[rs1num];
     int16_t imm = state->instruction.itype.imm;
     uint32_t jumptoprogramcounter = (*(uint32_t *)rs1 + imm) & (UINT32_MAX - 1);
+    state->transfer_tag = state->reg_tag[rs1num];   /* indirect: target carries rs1's provenance */
     if (rdnum != 0) {
         *(uint32_t *)rd = state->programcounternext;
     }
@@ -2236,7 +2241,7 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
 
     // Read 16 bits.
     state->instruction.H = 0;
-    RiscvEmulatorFetch(
+    state->pc_tag = RiscvEmulatorFetch(
         state->programcounter,
         &state->instruction.L,
         sizeof(state->instruction.L));
@@ -2262,6 +2267,11 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
         t1 = state->reg_tag[rs1]; t2 = state->reg_tag[rs2];
         v1 = state->reg.x[rs1];   v2 = state->reg.x[rs2];
     }
+
+    /* Default branch-target tag: a PC-relative transfer (JAL, branch) stays in
+     * the current code object. Register-indirect transfers (JALR, C.JR/C.JALR)
+     * overwrite this with the target register's tag in their handlers. */
+    state->transfer_tag = state->pc_tag;
 
     if (instructionlength == 16) {
         RiscvEmulatorOpcodeCompressed(state);
@@ -2312,6 +2322,17 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
      * tag handling at the memory boundary; skip if the instruction trapped). */
     if (instructionlength == 32 && state->trapflag.value == 0) {
         RiscvEmulatorPropagateTag(state, t1, t2, v1, v2);
+    }
+
+    /* Report every taken control transfer (jump/call/branch/return) to the host
+     * as a pair of tagged addresses, so it can police indirect targets. The
+     * transfer is "taken" when the next pc is not the sequential fall-through. */
+    if (state->trapflag.value == 0) {
+        uint32_t fallthrough = state->programcounter + (instructionlength == 32 ? 4u : 2u);
+        if (state->programcounternext != fallthrough) {
+            RiscvEmulatorControlTransfer(state->programcounter, state->pc_tag,
+                                         state->programcounternext, state->transfer_tag);
+        }
     }
 
     if (state->trapflag.value > 0) {

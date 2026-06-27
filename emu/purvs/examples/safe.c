@@ -10,7 +10,7 @@
  *   rsub    - int - ptr -> bad -> caught
  *   scale   - shifted pointer -> bad -> caught
  *   cross   - pointer built from two objects -> bad -> caught
- *   xdata   - call into a data buffer -> non-executable fetch -> caught
+ *   xdata   - call into a data buffer -> indirect jump through a data tag -> caught
  *   wcode   - write into the code segment -> W^X -> caught */
 static long sys(long n, long a, long b, long c) {
     register long a7 __asm__("a7") = n;
@@ -82,7 +82,7 @@ void cmain(unsigned long *sp) {
         volatile unsigned *buf = (volatile unsigned *)xmalloc(16);
         buf[0] = 0x00008067u;                          /* a 'ret', planted as data */
         put("xdata: calling into a data buffer...\n");
-        ((void (*)(void))(unsigned long)buf)();        /* execute data -> fetch not code */
+        ((void (*)(void))(unsigned long)buf)();        /* indirect call through a data pointer */
         put("BUG: not caught\n");
     } else if (streq(mode, "wcode")) {
         volatile unsigned *code = (volatile unsigned *)(unsigned long)&put;

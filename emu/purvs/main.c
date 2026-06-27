@@ -100,20 +100,32 @@ static int tag_check(tag_t t, uint32_t addr, uint32_t len, int write) {
  * it calls these with the tags as explicit arguments. All *memory* policy lives
  * here: bounds/provenance on data, executability on fetch, W^X on store. */
 
-/* Fetch: valid only from a cell tagged executable code, so jumping into data,
- * the heap, or the stack faults. */
-void RiscvEmulatorFetch(uint32_t addr, void *dst, uint8_t len) {
+/* Fetch: read the instruction bytes and return the cell's tag (its code tag, so
+ * the engine knows which code object it is executing in). Where execution may go
+ * is policed at the control-transfer hook below, not here. */
+uint32_t RiscvEmulatorFetch(uint32_t addr, void *dst, uint8_t len) {
     tag_t cell = in_ram(addr, 4) ? g_mem_tag[(addr - RAM_ORIGIN) >> 2] : NOTAG;
-    if (!is_code_tag(cell)) {
-        fprintf(stderr,
-            "\n*** purvs: control-flow violation ***\n"
-            "  fetch of non-executable memory at 0x%08x (pc=0x%08x)\n", addr, g_cur_pc);
-        g_halt = 1; g_exit = 134;
-        memset(dst, 0, len);
-        return;
-    }
     if (in_ram(addr, len)) memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
     else memset(dst, 0, len);
+    return cell;
+}
+
+/* Every taken jump/call/branch/return arrives here as a pair of tagged
+ * addresses. An indirect target is only allowed through a code pointer: NOTAG (a
+ * return address or PC-relative target) or a code tag (a function pointer). A
+ * data object tag or BADTAG means the program is about to execute data -- reject
+ * it. (Plain PC-relative flow within a code object carries the code tag and is
+ * always fine.) */
+void RiscvEmulatorControlTransfer(uint32_t from, uint32_t from_tag,
+                                  uint32_t to, uint32_t to_tag) {
+    (void)from_tag;
+    if (to_tag == NOTAG || is_code_tag(to_tag)) return;
+    fprintf(stderr,
+        "\n*** purvs: control-flow violation ***\n"
+        "  indirect transfer to 0x%08x through a non-code pointer (pc=0x%08x)\n", to, from);
+    fprintf(stderr, to_tag == BADTAG ? "  target tag: BAD\n"
+                                     : "  target tag: object %u\n", to_tag);
+    g_halt = 1; g_exit = 134;
 }
 
 /* Data read through a pointer tagged addr_tag: check it, return the bytes and

@@ -59,21 +59,20 @@ Reasoning per op:
 
 ## Memory and the callbacks
 
-The engine has no memory and knows nothing of tags; it reaches the world only
-through three value-only hooks: `RiscvEmulatorFetch` (instruction read),
-`RiscvEmulatorLoad` (data read), `RiscvEmulatorStore` (data write). Those are
-thin **adapters** in `main.c` over the real tagged memory system, whose interface
-makes the tags explicit:
+The engine has no memory; it reaches the world only through tagged hooks the
+host implements — `RiscvEmulatorFetch` (instruction read), `RiscvEmulatorLoad`
+(data read), `RiscvEmulatorStore` (data write), and `RiscvEmulatorControlTransfer`
+(every taken jump/call/branch/return). The memory hooks make the tags explicit:
 
 ```c
-void  mem_fetch(uint32_t addr, void *dst, uint8_t len);
-tag_t mem_load (uint32_t addr, tag_t addr_tag, void *dst, uint8_t len);              /* -> value tag */
-void  mem_store(uint32_t addr, tag_t addr_tag, const void *src, tag_t val_tag, uint8_t len);
+uint32_t RiscvEmulatorFetch(uint32_t addr,                 void *dst,       uint8_t len); /* -> cell tag */
+uint32_t RiscvEmulatorLoad (uint32_t addr, tag_t addr_tag, void *dst,       uint8_t len); /* -> value tag */
+void     RiscvEmulatorStore(uint32_t addr, tag_t addr_tag, const void *src, tag_t val_tag, uint8_t len);
 ```
 
 **The tag of a memory cell is the memory system's business** — checked against
 the pointer on access, recorded on store, returned on load. Tagged memory
-(`g_mem_tag`, one tag per word) lives entirely behind `mem_*`. All policy
+(`g_mem_tag`, one tag per word) lives entirely behind the hooks. All policy
 (bounds, executability, W^X) is there too; the engine sees none of it.
 
 The register tags live **in the emulator** (`reg_tag[32]`, propagated by every
@@ -85,13 +84,19 @@ and passes it down — never recomputed by the host. So a pointer stored to memo
 and loaded back recovers its tag, while bytes the program never wrote read as
 `NOTAG` (the memory system's initial state).
 
-**Instruction fetch goes through the same tagged memory.** The loader marks the
-cells of each executable ELF segment with a *code tag*; `mem_fetch` validates
-that the cell it reads carries one. So executing data, the heap, or the stack —
-anything not marked executable — faults, and code can't be reached by jumping
-into a buffer. (A data load of a code-tagged cell reads as `NOTAG`: code is
-executable, not a data pointer.) Symmetrically, `mem_store` refuses to write a
-code-tagged cell (**W^X**) — so the executable image can't be modified.
+**Control transfers are policed by tag, not by re-checking every fetch.** The
+engine carries the tag of the cell it is executing (`pc_tag`, from the fetch
+hook's return) and the tag of each branch target — a register's tag for an
+indirect jump (`JALR`, `C.JR/C.JALR`), the current code tag for a PC-relative
+one. On every taken jump/call/branch/return it calls `RiscvEmulatorControlTransfer`
+with both as tagged addresses. The host allows a target only through a *code
+pointer*: `NOTAG` (a return address or PC-relative target) or a code tag (a
+function pointer minted by the loader for each executable ELF segment). An
+indirect jump through a data object tag or a `BAD` pointer — calling into a heap
+buffer, say — is rejected. Symmetrically, `RiscvEmulatorStore` refuses to write a
+code-tagged cell (**W^X**), so the executable image can't be modified. (A data
+load of a code-tagged cell reads as `NOTAG`: code is executable, not a data
+pointer.)
 
 ## Checks
 
@@ -124,7 +129,7 @@ make test
 == rsub ==     int - ptr -> bad -> caught                           exit=134
 == scale ==    shifted pointer (valid address) -> bad -> caught     exit=134
 == cross ==    pointer built from two objects -> bad -> caught      exit=134
-== xdata ==    calling into a data buffer -> non-executable -> caught exit=134
+== xdata ==    calling into a data buffer -> non-code pointer -> caught exit=134
 == wcode ==    writing into the code segment -> W^X -> caught       exit=134
 ```
 

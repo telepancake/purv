@@ -46,11 +46,18 @@ void     RiscvEmulatorSetRegisterTag(RiscvEmulatorState_t *state, int index, uin
  *      memory map and trap policy only through these. ---- */
 /* The emulator carries a tag per register and propagates it across operations;
  * at a memory access it hands the memory system the address's tag (and, on a
- * store, the value's tag), and a load returns the loaded value's tag. */
-void     RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length);
+ * store, the value's tag), and a load returns the loaded value's tag. A fetch
+ * returns the tag of the cell the instruction came from. */
+uint32_t RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length);
 uint32_t RiscvEmulatorLoad(uint32_t address, uint32_t address_tag, void *destination, uint8_t length);
 void     RiscvEmulatorStore(uint32_t address, uint32_t address_tag,
                             const void *source, uint32_t value_tag, uint8_t length);
+/* Called on every taken control transfer (jump/call/branch/return), with the
+ * source and destination each as a tagged address: the engine has the target's
+ * provenance (a register tag for an indirect jump, the current code tag for a
+ * PC-relative one), so the host can police where execution may go. */
+void     RiscvEmulatorControlTransfer(uint32_t from, uint32_t from_tag,
+                                      uint32_t to, uint32_t to_tag);
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state);
 void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state);
 /* Supply backing storage for a CSR the engine does not implement (the engine
