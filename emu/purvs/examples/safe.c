@@ -49,6 +49,18 @@ void cmain(unsigned long *sp) {
         put("subdiff: using (b - a) as an index into c...\n");
         c[d & 15] = 'X';                           /* bad provenance poisons the access */
         put("BUG: not caught\n");
+    } else if (streq(mode, "addp")) {
+        volatile char *q = (volatile char *)xmalloc(16);
+        unsigned long s = (unsigned long)p + (unsigned long)q;  /* ptr + ptr -> bad */
+        put("addp: dereferencing (p + q)...\n");
+        *(volatile char *)s = 'X';
+        put("BUG: not caught\n");
+    } else if (streq(mode, "rsub")) {
+        unsigned long k = 0x80003000UL;                         /* a plain integer */
+        unsigned long s = k - (unsigned long)p;                 /* int - ptr -> bad */
+        put("rsub: dereferencing (K - p)...\n");
+        *(volatile char *)s = 'X';
+        put("BUG: not caught\n");
     } else if (streq(mode, "scale")) {
         unsigned long pi = (unsigned long)p;
         volatile char *s = (volatile char *)((pi >> 2) << 2); /* shift, not add/sub */

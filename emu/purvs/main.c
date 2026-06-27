@@ -56,26 +56,47 @@ static tag_t   *g_mem_tag;                /* shadow memory, one tag per word */
 static struct { uint32_t base, size; int live; } g_obj[MAX_OBJ];
 static uint32_t g_nobj;
 
-/* add/sub: integer offsetting. tag +/- notag stays in-object; ptr - ptr is a
- * scalar if same object, BAD across objects. */
-static tag_t tag_combine(tag_t a, tag_t b) {
+/* ----------------------------------------------------- per-operation tag rules
+ *
+ * A value's tag is N (plain integer), P (a pointer into a specific object), or
+ * B (corrupted provenance, sticky). For each ALU op we reason through every
+ * operand combination. P+P below means two *different* objects unless noted.
+ *
+ *   op          N,N | P,N        | N,P        | P,P same | P,P diff | any B
+ *   ----------- ----+------------+------------+----------+----------+------
+ *   add          N  | P          | P          | B        | B        | B
+ *   sub (a-b)    N  | P          | B          | N        | B        | B
+ *   slt/cmp      N  | N          | N          | N        | B        | B
+ *   and/or/xor   N  | B          | B          | B        | B        | B
+ *   sll/srl/sra  N  | B          | B          | B        | B        | B
+ *   mul/div/rem  N  | B          | B          | B        | B        | B
+ *
+ * Rationale: only adding/subtracting an integer offset keeps a pointer; adding
+ * two pointers, subtracting a pointer from an integer, or running a pointer
+ * through multiply/shift/bitwise yields something that is not a valid pointer
+ * into the object. A same-object difference is a scalar (N); a comparison is a
+ * boolean (N) unless it crosses objects (meaningless -> B).
+ */
+static int is_ptr(tag_t t) { return t != NOTAG && t != BADTAG; }
+
+static tag_t alu_add(tag_t a, tag_t b) {       /* commutative: ptr + offset */
     if (a == BADTAG || b == BADTAG) return BADTAG;
-    if (a == NOTAG) return b;
-    if (b == NOTAG) return a;
-    return (a == b) ? NOTAG : BADTAG;
+    if (is_ptr(a) && is_ptr(b)) return BADTAG;          /* ptr + ptr is meaningless */
+    return is_ptr(a) ? a : b;                            /* ptr+int->ptr ; int+int->N */
 }
-/* slt/seq/etc.: the result is a boolean scalar. Comparing pointers into one
- * object (or against a plain integer) is fine -> NOTAG; comparing across
- * objects is meaningless -> BAD. */
-static tag_t tag_compare(tag_t a, tag_t b) {
+static tag_t alu_sub(tag_t a, tag_t b) {       /* a - b, NOT commutative */
     if (a == BADTAG || b == BADTAG) return BADTAG;
-    if (a == NOTAG || b == NOTAG) return NOTAG;
-    return (a == b) ? NOTAG : BADTAG;
+    if (is_ptr(a) && is_ptr(b)) return (a == b) ? NOTAG : BADTAG; /* same->scalar, diff->bad */
+    if (is_ptr(b)) return BADTAG;                        /* int - ptr -> bad */
+    return a;                                            /* ptr-int->ptr ; int-int->N */
 }
-/* mul/div/rem/shift/and/or/xor: not pointer arithmetic. Any provenance flowing
- * in poisons the result -- the output is not a valid pointer into the object. */
-static tag_t tag_poison(tag_t a, tag_t b) {
-    return (a == NOTAG && b == NOTAG) ? NOTAG : BADTAG;
+static tag_t alu_cmp(tag_t a, tag_t b) {       /* result is a boolean scalar */
+    if (a == BADTAG || b == BADTAG) return BADTAG;
+    if (is_ptr(a) && is_ptr(b) && a != b) return BADTAG; /* cross-object compare */
+    return NOTAG;
+}
+static tag_t alu_other(tag_t a, tag_t b) {     /* mul/div/rem/shift/and/or/xor */
+    return (a == NOTAG && b == NOTAG) ? NOTAG : BADTAG;  /* any provenance -> bad */
 }
 
 static tag_t memtag_load(uint32_t addr) {
@@ -295,15 +316,16 @@ int main(int argc, char **argv) {
 
         switch (op) {                     /* propagate the shadow tag to rd / memory */
         case 0x33:                                               /* OP (reg, reg) */
-            if (f7 == 0x01)            settag(rd, tag_poison(t1, t2));   /* M: mul/div/rem */
-            else if (f3 == 0)          settag(rd, tag_combine(t1, t2));  /* add/sub */
-            else if (f3 == 2 || f3 == 3) settag(rd, tag_compare(t1, t2)); /* slt/sltu */
-            else                       settag(rd, tag_poison(t1, t2));   /* sll/xor/srl/sra/or/and */
+            if (f7 == 0x01)              settag(rd, alu_other(t1, t2));  /* M: mul/div/rem */
+            else if (f3 == 0)            settag(rd, f7 == 0x20 ? alu_sub(t1, t2)
+                                                              : alu_add(t1, t2)); /* sub / add */
+            else if (f3 == 2 || f3 == 3) settag(rd, alu_cmp(t1, t2));    /* slt/sltu */
+            else                         settag(rd, alu_other(t1, t2));  /* sll/xor/srl/sra/or/and */
             break;
-        case 0x13:                                               /* OP-IMM (reg, imm) */
-            if (f3 == 0)               settag(rd, t1);                   /* addi: offset */
-            else if (f3 == 2 || f3 == 3) settag(rd, tag_compare(t1, NOTAG)); /* slti/sltiu */
-            else                       settag(rd, tag_poison(t1, NOTAG)); /* slli/xori/.../andi */
+        case 0x13:                                               /* OP-IMM (reg, imm: imm is N) */
+            if (f3 == 0)                 settag(rd, alu_add(t1, NOTAG)); /* addi: ptr+offset */
+            else if (f3 == 2 || f3 == 3) settag(rd, alu_cmp(t1, NOTAG)); /* slti/sltiu */
+            else                         settag(rd, alu_other(t1, NOTAG)); /* slli/xori/.../andi */
             break;
         case 0x03: settag(rd, sz == 4 ? memtag_load(addr) : NOTAG); break; /* LOAD */
         case 0x23: memtag_store(addr, sz == 4 ? t2 : NOTAG); break;         /* STORE */

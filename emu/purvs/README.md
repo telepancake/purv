@@ -25,20 +25,29 @@ Propagation, decoded in parallel for each instruction:
 Propagation is **operation-aware** — only additive offsetting keeps a pointer:
 
 ```
-add / sub / addi   tag +/- notag -> tag     (offset stays in-object)
-                   ptr - ptr same -> NOTAG  (a difference is a scalar)
-                   ptr - ptr diff -> BAD    (cross-object)
-slt / sltu / slti  compare same/ptr-vs-int -> NOTAG ; cross-object -> BAD
-mul div rem        any operand tagged -> BAD
-sll srl sra        any operand tagged -> BAD
-and or xor         any operand tagged -> BAD
-BAD op anything    -> BAD                    (sticky)
+  result of rd, by op and operand provenance (N=int, P=pointer, B=bad):
+
+  op           N,N | P,N | N,P | P,P same | P,P diff | any B
+  ------------ ----+-----+-----+----------+----------+------
+  add           N  |  P  |  P  |    B     |    B     |   B
+  sub (a-b)     N  |  P  |  B  |    N     |    B     |   B
+  slt/sltu      N  |  N  |  N  |    N     |    B     |   B
+  and/or/xor    N  |  B  |  B  |    B     |    B     |   B
+  sll/srl/sra   N  |  B  |  B  |    B     |    B     |   B
+  mul/div/rem   N  |  B  |  B  |    B     |    B     |   B
 ```
 
-So multiplying, shifting, or masking a pointer yields `BAD` even though the
-address may still look valid: those aren't pointer arithmetic, so the result is
-not a usable pointer into the object. Only `add`/`sub` of an integer offset (and
-comparisons) keep provenance.
+Reasoning per op:
+- **add**: `ptr + int` is a valid offset (`P`); `ptr + ptr` is meaningless (`B`).
+- **sub** (non-commutative): `ptr - int` is an offset (`P`); `int - ptr` is
+  nonsense (`B`); `ptr - ptr` same object is a scalar difference (`N`), across
+  objects is `B`.
+- **slt/sltu**: the result is a boolean (`N`), unless it compares two different
+  objects, which is meaningless (`B`).
+- **mul/div/rem, shifts, and/or/xor**: not pointer arithmetic — any pointer in
+  poisons the result (`B`), even masking/aligning, even though the address may
+  still look valid.
+- **B is sticky**: any bad operand gives `B`.
 
 Tags ride through memory too: storing a pointer tags that memory word; loading
 it back recovers the tag.
@@ -67,18 +76,22 @@ make test
 == diff ==     same-object difference is a plain count; loop ok    exit=0
 == oob ==      out of bounds store ... object 1: [..,..)           exit=134
 == uaf ==      use-after-free / dead object store ... (freed)      exit=134
-== subdiff ==  bad-provenance pointer store ... tag: BAD           exit=134
-== scale ==    bad-provenance store at the valid base ... tag: BAD  exit=134
-== cross ==    bad-provenance pointer store ... tag: BAD           exit=134
+== subdiff ==  ptr - ptr across objects -> bad scalar -> caught     exit=134
+== addp ==     ptr + ptr -> bad -> caught                           exit=134
+== rsub ==     int - ptr -> bad -> caught                           exit=134
+== scale ==    shifted pointer (valid address) -> bad -> caught     exit=134
+== cross ==    pointer built from two objects -> bad -> caught      exit=134
 ```
 
 ## Notes / limits
 
 - The shadow datapath decodes 32-bit instructions, so codelets are built
   `-march=rv32im` (no compressed). The engine still executes RV32IMC.
-- A same-object pointer difference/comparison yields `NOTAG` (a scalar); a
-  different-object one yields `BAD`. A stricter "any two tags → BAD" (poisoning
-  even same-object differences) is a one-line change in `tag_combine`.
+- The per-op rules live in `alu_add` / `alu_sub` / `alu_cmp` / `alu_other` in
+  main.c, dispatched by funct3/funct7. The table above is the contract.
+- `and`/`or`/`xor` poison even alignment masking (`p & ~15`); a representability
+  aware relaxation (keep the tag when only low bits within alignment change) is
+  the natural refinement if real code needs it.
 - Tags are word-granular in memory; sub-word stores clear the word's tag.
 - This is a prototype: the safety is entirely host-side precisely because the
   engine is unmodified. Moving tags into the engine (tag-aware instructions,
