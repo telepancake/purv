@@ -58,9 +58,9 @@ static uint32_t g_nobj;
 
 static tag_t tag_combine(tag_t a, tag_t b) {
     if (a == BADTAG || b == BADTAG) return BADTAG;
-    if (a == NOTAG) return b;
+    if (a == NOTAG) return b;             /* pointer +/- integer offset stays in-object */
     if (b == NOTAG) return a;
-    return (a == b) ? a : BADTAG;         /* same object survives; different -> bad */
+    return (a == b) ? NOTAG : BADTAG;     /* two pointers: same -> scalar; different -> bad */
 }
 
 static tag_t memtag_load(uint32_t addr) {

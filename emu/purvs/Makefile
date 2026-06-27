@@ -25,10 +25,12 @@ examples/safe.elf: examples/safe.c
 	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
 
 test: purvs examples/safe.elf
-	@echo "== ok (in-bounds) =="    ; ./purvs examples/safe.elf ok    ; echo "exit=$$?"
-	@echo "== oob =="               ; ./purvs examples/safe.elf oob   ; echo "exit=$$?"
-	@echo "== uaf =="               ; ./purvs examples/safe.elf uaf   ; echo "exit=$$?"
-	@echo "== cross-object =="      ; ./purvs examples/safe.elf cross ; echo "exit=$$?"
+	@echo "== ok (in-bounds) =="      ; ./purvs examples/safe.elf ok      ; echo "exit=$$?"
+	@echo "== diff (same-object) =="  ; ./purvs examples/safe.elf diff    ; echo "exit=$$?"
+	@echo "== oob =="                 ; ./purvs examples/safe.elf oob     ; echo "exit=$$?"
+	@echo "== uaf =="                 ; ./purvs examples/safe.elf uaf     ; echo "exit=$$?"
+	@echo "== subdiff (cross diff) =="; ./purvs examples/safe.elf subdiff ; echo "exit=$$?"
+	@echo "== cross-object =="        ; ./purvs examples/safe.elf cross   ; echo "exit=$$?"
 
 clean:
 	rm -f purvs examples/*.o examples/*.elf

@@ -24,10 +24,14 @@ Propagation, decoded in parallel for each instruction:
 
 ```
 tag  op  NOTAG      -> tag        (pointer +/- integer offset stays in-object)
-tag  op  same tag   -> tag
+tag  op  same tag   -> NOTAG      (two pointers into one object -> a scalar)
 tag  op  other tag  -> BAD        (cross-object arithmetic)
 BAD  op  anything   -> BAD        (sticky)
 ```
+
+This applies uniformly to every binary op, so a same-object pointer difference
+(or comparison) is a plain number, while a cross-object difference is `BAD` and
+poisons whatever uses it.
 
 Tags ride through memory too: storing a pointer tags that memory word; loading
 it back recovers the tag.
@@ -52,19 +56,21 @@ make test
 ```
 
 ```
-== ok ==     ok: in-bounds writes succeeded                       exit=0
-== oob ==    out of bounds store ... object 1: [..,..)            exit=134
-== uaf ==    use-after-free / dead object store ... (freed)       exit=134
-== cross ==  bad-provenance pointer store ... pointer tag: BAD    exit=134
+== ok ==       in-bounds writes succeeded                         exit=0
+== diff ==     same-object difference is a plain count; loop ok    exit=0
+== oob ==      out of bounds store ... object 1: [..,..)           exit=134
+== uaf ==      use-after-free / dead object store ... (freed)      exit=134
+== subdiff ==  bad-provenance pointer store ... tag: BAD           exit=134
+== cross ==    bad-provenance pointer store ... tag: BAD           exit=134
 ```
 
 ## Notes / limits
 
 - The shadow datapath decodes 32-bit instructions, so codelets are built
   `-march=rv32im` (no compressed). The engine still executes RV32IMC.
-- Tag combine treats same-object arithmetic as valid and different-object as
-  `BAD` (provenance), which is what catches cross-object use; a stricter
-  "any two tags → BAD" is a one-line change in `tag_combine`.
+- A same-object pointer difference/comparison yields `NOTAG` (a scalar); a
+  different-object one yields `BAD`. A stricter "any two tags → BAD" (poisoning
+  even same-object differences) is a one-line change in `tag_combine`.
 - Tags are word-granular in memory; sub-word stores clear the word's tag.
 - This is a prototype: the safety is entirely host-side precisely because the
   engine is unmodified. Moving tags into the engine (tag-aware instructions,

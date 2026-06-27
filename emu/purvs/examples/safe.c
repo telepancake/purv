@@ -35,6 +35,20 @@ void cmain(unsigned long *sp) {
         put("uaf: writing through p after free...\n");
         p[0] = 'X';
         put("BUG: not caught\n");
+    } else if (streq(mode, "diff")) {
+        volatile char *a = (volatile char *)xmalloc(16);
+        volatile char *e = a + 12;                 /* same object */
+        long n = (char *)e - (char *)a;            /* same tag -> plain number (NOTAG) */
+        for (long i = 0; i < n; i++) a[i] = (char)i;
+        put("diff: same-object difference is a plain count; in-bounds loop ok\n");
+    } else if (streq(mode, "subdiff")) {
+        volatile char *a = (volatile char *)xmalloc(16);
+        volatile char *b = (volatile char *)xmalloc(16);  /* different object */
+        long d = (char *)b - (char *)a;            /* different tags -> bad scalar */
+        volatile char *c = (volatile char *)xmalloc(16);
+        put("subdiff: using (b - a) as an index into c...\n");
+        c[d & 15] = 'X';                           /* bad provenance poisons the access */
+        put("BUG: not caught\n");
     } else if (streq(mode, "cross")) {
         volatile char *q = (volatile char *)xmalloc(16);
         unsigned long pi = (unsigned long)p, qi = (unsigned long)q;
