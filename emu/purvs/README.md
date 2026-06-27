@@ -1,15 +1,18 @@
 # purvs — secure (tagged-memory) purv
 
-A pointer-safety variant of purv. The engine (`purvs.c`/`purvs.h`) is an
-unmodified copy of purv — **the CPU has no idea tags exist**. All the safety
-lives in a parallel *shadow datapath* in `main.c`: every register and every
-memory word carries a tag the program can't see or touch.
+A pointer-safety variant of purv. The emulator (`purvs.c`/`purvs.h`) carries a
+**tag per register** alongside the value and propagates it across every
+operation — values are computed exactly as before, but a parallel datapath the
+program can't see tracks provenance. Memory carries a tag per word too; the host
+(`main.c`) is the memory system and the policy (object table, bounds, W^X).
 
 ```
 purvs/
-  purvs.h, purvs.c   the engine (a copy of purv; tag-oblivious)
-  main.c             the secure host: shadow tags + object table + checks
-  examples/safe.c    demo: ok / oob / uaf / cross
+  purvs.c, purvs.h   the emulator: forked from purv, with the tag register file
+                     and per-operation tag propagation added
+  main.c             the memory system + policy: object table, bounds/W^X checks,
+                     malloc/free syscalls. The run loop just steps the emulator.
+  examples/safe.c    demo: ok / oob / uaf / cross / addp / ... / xdata / wcode
 ```
 
 ## Tags
@@ -73,13 +76,14 @@ the pointer on access, recorded on store, returned on load. Tagged memory
 (`g_mem_tag`, one tag per word) lives entirely behind `mem_*`. All policy
 (bounds, executability, W^X) is there too; the engine sees none of it.
 
-The register tags are the driver's parallel datapath. For the access in flight
-the driver hands the adapter the base-pointer's tag and (for a store) the value's
-tag; the adapter forwards them as the explicit `addr_tag`/`val_tag` arguments,
-and a load's returned tag flows back into the destination register. The engine
-computes the real effective address and passes it down — never recomputed. So a
-pointer stored to memory and loaded back recovers its tag, while bytes the
-program never wrote read as `NOTAG` (the memory system's initial state).
+The register tags live **in the emulator** (`reg_tag[32]`, propagated by every
+instruction — see above). For the access in flight the engine hands the hook the
+base-pointer's tag and (for a store) the value's tag as the explicit
+`addr_tag`/`val_tag` arguments, and a load's returned tag flows straight back
+into the destination register. The engine computes the real effective address
+and passes it down — never recomputed by the host. So a pointer stored to memory
+and loaded back recovers its tag, while bytes the program never wrote read as
+`NOTAG` (the memory system's initial state).
 
 **Instruction fetch goes through the same tagged memory.** The loader marks the
 cells of each executable ELF segment with a *code tag*; `mem_fetch` validates
@@ -126,13 +130,15 @@ make test
 
 ## Notes / limits
 
-- The shadow datapath decodes 32-bit instructions, so codelets are built
-  `-march=rv32im` (no compressed). The engine still executes RV32IMC.
-- The per-op rules live in `alu_add` / `alu_sub` / `alu_cmp` / `alu_bitwise` /
-  `alu_other` in main.c, dispatched by funct3/funct7. The table is the contract.
+- Tag propagation decodes 32-bit instructions, so codelets are built
+  `-march=rv32im` (no compressed). The engine still executes RV32IMC; a
+  compressed instruction just leaves the destination tag at `NOTAG`.
+- The per-op rules live in `tag_add` / `tag_sub` / `tag_cmp` / `tag_bitwise` /
+  `tag_other` in purvs.c, dispatched by funct3/funct7 from
+  `RiscvEmulatorPropagateTag`. The table is the contract.
 - "Page-local" for and/or/xor is the low `PAGE_BITS` (12 -> 4 KB) bits, which
   covers any realistic alignment; a larger alignment would need a bigger bound.
 - Tags are word-granular in memory; sub-word stores clear the word's tag.
-- This is a prototype: the safety is entirely host-side precisely because the
-  engine is unmodified. Moving tags into the engine (tag-aware instructions,
-  hardware "bad tag" faults) is the natural next step.
+- The engine carries and propagates the tags; the host owns the memory tags and
+  the policy (object table, bounds, W^X). Hardware-style "bad tag" faults raised
+  by the engine itself (rather than at the access) are the natural next step.

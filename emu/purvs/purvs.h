@@ -39,12 +39,18 @@ uint16_t RiscvEmulatorGetCsrNumber(const RiscvEmulatorState_t *state);        /*
 uint32_t RiscvEmulatorGetTrapVectorBase(const RiscvEmulatorState_t *state);   /* mtvec.base */
 void     RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state);
 void     RiscvEmulatorClearTrap(RiscvEmulatorState_t *state);                 /* consume pending trap (e.g. host-handled ecall) */
+uint32_t RiscvEmulatorGetRegisterTag(const RiscvEmulatorState_t *state, int index);
+void     RiscvEmulatorSetRegisterTag(RiscvEmulatorState_t *state, int index, uint32_t tag);
 
 /* ---- Hooks YOU implement (atoom's whole "API"): the engine reaches your
  *      memory map and trap policy only through these. ---- */
-void RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length); /* instruction read */
-void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length);  /* data read  */
-void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length); /* data write */
+/* The emulator carries a tag per register and propagates it across operations;
+ * at a memory access it hands the memory system the address's tag (and, on a
+ * store, the value's tag), and a load returns the loaded value's tag. */
+void     RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length);
+uint32_t RiscvEmulatorLoad(uint32_t address, uint32_t address_tag, void *destination, uint8_t length);
+void     RiscvEmulatorStore(uint32_t address, uint32_t address_tag,
+                            const void *source, uint32_t value_tag, uint8_t length);
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state);
 void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state);
 /* Supply backing storage for a CSR the engine does not implement (the engine

@@ -55,75 +55,15 @@ typedef uint32_t tag_t;
 static int is_code_tag(tag_t t) { return t >= CODE_TAG_BASE && t != BADTAG; }
 static tag_t g_code_tag = CODE_TAG_BASE;   /* next code tag to hand out */
 
-static tag_t    g_reg_tag[32];            /* shadow registers (the driver's datapath) */
-static tag_t   *g_mem_tag;                /* tagged memory: one tag per word, owned by the
-                                           * memory system -- touched ONLY in the load/store
-                                           * callbacks, never by the driver loop */
+static tag_t   *g_mem_tag;                /* tagged memory: one tag per word; the memory
+                                           * system's, touched only in the hooks below */
 
-/* Object table: tag <id> (1-based) describes the allocation it points into. */
+/* Object table: tag <id> (1-based) describes the allocation it points into. The
+ * per-operation tag rules now live in the emulator (purvs.c); main.c is only the
+ * memory system + policy. */
 #define MAX_OBJ 4096
 static struct { uint32_t base, size; int live; } g_obj[MAX_OBJ];
 static uint32_t g_nobj;
-
-/* ----------------------------------------------------- per-operation tag rules
- *
- * A value's tag is N (plain integer), P (a pointer into a specific object), or
- * B (corrupted provenance, sticky). For each ALU op we reason through every
- * operand combination. P+P below means two *different* objects unless noted.
- *
- *   op          N,N | P,N        | N,P        | P,P same | P,P diff | any B
- *   ----------- ----+------------+------------+----------+----------+------
- *   add          N  | P          | P          | B        | B        | B
- *   sub (a-b)    N  | P          | B          | N        | B        | B
- *   slt/cmp      N  | N          | N          | N        | B        | B
- *   and/or/xor   N  | B          | B          | B        | B        | B
- *   sll/srl/sra  N  | B          | B          | B        | B        | B
- *   mul/div/rem  N  | B          | B          | B        | B        | B
- *
- * Rationale: only adding/subtracting an integer offset keeps a pointer; adding
- * two pointers, subtracting a pointer from an integer, or running a pointer
- * through multiply/shift/bitwise yields something that is not a valid pointer
- * into the object. A same-object difference is a scalar (N); a comparison is a
- * boolean (N) unless it crosses objects (meaningless -> B).
- */
-static int is_ptr(tag_t t) { return t != NOTAG && t != BADTAG; }
-
-static tag_t alu_add(tag_t a, tag_t b) {       /* commutative: ptr + offset */
-    if (a == BADTAG || b == BADTAG) return BADTAG;
-    if (is_ptr(a) && is_ptr(b)) return BADTAG;          /* ptr + ptr is meaningless */
-    return is_ptr(a) ? a : b;                            /* ptr+int->ptr ; int+int->N */
-}
-static tag_t alu_sub(tag_t a, tag_t b) {       /* a - b, NOT commutative */
-    if (a == BADTAG || b == BADTAG) return BADTAG;
-    if (is_ptr(a) && is_ptr(b)) return (a == b) ? NOTAG : BADTAG; /* same->scalar, diff->bad */
-    if (is_ptr(b)) return BADTAG;                        /* int - ptr -> bad */
-    return a;                                            /* ptr-int->ptr ; int-int->N */
-}
-static tag_t alu_cmp(tag_t a, tag_t b) {       /* result is a boolean scalar */
-    if (a == BADTAG || b == BADTAG) return BADTAG;
-    if (is_ptr(a) && is_ptr(b) && a != b) return BADTAG; /* cross-object compare */
-    return NOTAG;
-}
-static tag_t alu_other(tag_t a, tag_t b) {     /* mul/div/rem/shift */
-    return (a == NOTAG && b == NOTAG) ? NOTAG : BADTAG;  /* any provenance -> bad */
-}
-/* and/or/xor: masking a pointer with a constant. Keep the tag when the constant
- * only touches the low (page-local) bits -- i.e. alignment (and ~k), or setting/
- * toggling low bits (or/xor k) -- since that just adjusts the address within the
- * object and the eventual load/store is still bounds-checked. Touching high bits
- * is forging, and mixing two pointers' bits is meaningless: both -> BAD.
- * f3: 7=and, 6=or, 4=xor. va/vb are the operand values (for the constant). */
-#define PAGE_BITS 12
-static tag_t alu_bitwise(uint8_t f3, tag_t ta, uint32_t va, tag_t tb, uint32_t vb) {
-    if (ta == BADTAG || tb == BADTAG) return BADTAG;
-    int pa = is_ptr(ta), pb = is_ptr(tb);
-    if (pa && pb) return BADTAG;                /* two addresses mixed */
-    if (!pa && !pb) return NOTAG;               /* plain integers */
-    uint32_t k = pa ? vb : va;                  /* the non-pointer constant */
-    int page_local = (f3 == 7) ? ((~k >> PAGE_BITS) == 0)   /* and: clears only low bits */
-                               : (( k >> PAGE_BITS) == 0);   /* or/xor: sets only low bits */
-    return page_local ? (pa ? ta : tb) : BADTAG;
-}
 
 static uint32_t g_cur_pc;         /* instruction in flight, for messages */
 
@@ -155,14 +95,14 @@ static int tag_check(tag_t t, uint32_t addr, uint32_t len, int write) {
     return 0;
 }
 
-/* ===================== tagged memory system =====================
- * The real interface: tags are explicit arguments/returns. All policy lives
- * here -- bounds/provenance on data, executability on fetch, W^X on store. The
- * engine never sees any of this; see the adapters below. */
+/* ===================== the memory system (the engine's hooks) =====================
+ * The emulator carries the register tags and propagates them; at a memory access
+ * it calls these with the tags as explicit arguments. All *memory* policy lives
+ * here: bounds/provenance on data, executability on fetch, W^X on store. */
 
 /* Fetch: valid only from a cell tagged executable code, so jumping into data,
  * the heap, or the stack faults. */
-static void mem_fetch(uint32_t addr, void *dst, uint8_t len) {
+void RiscvEmulatorFetch(uint32_t addr, void *dst, uint8_t len) {
     tag_t cell = in_ram(addr, 4) ? g_mem_tag[(addr - RAM_ORIGIN) >> 2] : NOTAG;
     if (!is_code_tag(cell)) {
         fprintf(stderr,
@@ -179,7 +119,7 @@ static void mem_fetch(uint32_t addr, void *dst, uint8_t len) {
 /* Data read through a pointer tagged addr_tag: check it, return the bytes and
  * the loaded value's tag (a full-word read recovers a stored pointer's tag;
  * sub-word reads, and code read as data, are NOTAG). */
-static tag_t mem_load(uint32_t addr, tag_t addr_tag, void *dst, uint8_t len) {
+uint32_t RiscvEmulatorLoad(uint32_t addr, uint32_t addr_tag, void *dst, uint8_t len) {
     if (!tag_check(addr_tag, addr, len, 0)) { memset(dst, 0, len); return NOTAG; }
     if (addr == UART_LSR) { *(uint8_t *)dst = 0x60; return NOTAG; }
     if (in_ram(addr, len)) {
@@ -197,7 +137,7 @@ static tag_t mem_load(uint32_t addr, tag_t addr_tag, void *dst, uint8_t len) {
 /* Data write through a pointer tagged addr_tag of a value tagged val_tag: check
  * the pointer, enforce W^X, store the bytes, record the value's tag on the cell
  * (a sub-word store leaves no clean pointer, so the cell's tag is cleared). */
-static void mem_store(uint32_t addr, tag_t addr_tag, const void *src, tag_t val_tag, uint8_t len) {
+void RiscvEmulatorStore(uint32_t addr, uint32_t addr_tag, const void *src, uint32_t val_tag, uint8_t len) {
     if (!tag_check(addr_tag, addr, len, 1)) return;
     if (addr == UART_THR) { putchar(*(const uint8_t *)src); fflush(stdout); return; }
     uint32_t lo = addr, hi = addr + len - 1;
@@ -216,24 +156,6 @@ static void mem_store(uint32_t addr, tag_t addr_tag, const void *src, tag_t val_
         return;
     }
     fprintf(stderr, "purvs: stray store 0x%08x\n", addr); g_halt = 1; g_exit = 1;
-}
-
-/* ===== engine-facing adapters =====
- * The engine calls these value-only hooks (it carries no tags). They bridge to
- * the tagged memory system above using a side channel the driver fills in for
- * the instruction in flight: the base-pointer tag, and (for a store) the value
- * tag; a load hands the loaded value's tag back the same way. */
-static tag_t g_mem_ptr_tag;       /* base-pointer tag of the access in flight */
-static tag_t g_mem_val_tag;       /* store: value tag in; load: value tag out */
-
-void RiscvEmulatorFetch(uint32_t address, void *destination, uint8_t length) {
-    mem_fetch(address, destination, length);
-}
-void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length) {
-    g_mem_val_tag = mem_load(address, g_mem_ptr_tag, destination, length);
-}
-void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
-    mem_store(address, g_mem_ptr_tag, source, g_mem_val_tag, length);
 }
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) {
     if (g_halt) return;                   /* already faulted (e.g. a bad fetch): don't double-report */
@@ -264,12 +186,17 @@ void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
     uint32_t a0 = RiscvEmulatorGetRegister(state, 10);
     uint32_t a1 = RiscvEmulatorGetRegister(state, 11);
     uint32_t a2 = RiscvEmulatorGetRegister(state, 12);
+    uint32_t a1_tag = RiscvEmulatorGetRegisterTag(state, 11);   /* buffer pointer's tag */
     uint32_t ret = (uint32_t)-38;         /* -ENOSYS */
     tag_t ret_tag = NOTAG;
     switch (num) {
     case 64:                              /* write(fd, buf, len) */
         ret = 0;
-        for (uint32_t i = 0; i < a2; i++) { uint8_t b = 0; RiscvEmulatorLoad(a1 + i, &b, 1); putchar(b); ret++; }
+        for (uint32_t i = 0; i < a2; i++) {
+            uint8_t b = 0;
+            RiscvEmulatorLoad(a1 + i, a1_tag, &b, 1);   /* checked through the buffer's tag */
+            putchar(b); ret++;
+        }
         fflush(stdout);
         break;
     case 93: case 94:                     /* exit */
@@ -290,14 +217,15 @@ void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
             } else ret = 0;
         } else ret = 0;
         break;
-    case 1001:                            /* free(ptr): retire ptr's object */
+    case 1001:                            /* free(ptr): retire the object ptr's tag names */
         ret = 0;
-        { tag_t t = g_reg_tag[10]; if (t && t != BADTAG && t <= g_nobj) g_obj[t - 1].live = 0; }
+        { uint32_t t = RiscvEmulatorGetRegisterTag(state, 10);
+          if (t && t != BADTAG && t <= g_nobj) g_obj[t - 1].live = 0; }
         break;
     default: break;
     }
     RiscvEmulatorSetRegister(state, 10, ret);
-    g_reg_tag[10] = ret_tag;              /* shadow result tag (malloc hands out the id) */
+    RiscvEmulatorSetRegisterTag(state, 10, ret_tag);   /* malloc hands out the object's tag */
     RiscvEmulatorClearTrap(state);
 }
 
@@ -356,13 +284,6 @@ static uint32_t setup_stack(int argc, char **argv) {
     return sp;
 }
 
-/* ------------------------------------------------- the parallel tag datapath */
-
-static uint32_t mem_read32(uint32_t addr) {   /* driver peek, to decode the instruction */
-    uint32_t v = 0; if (in_ram(addr, 4)) memcpy(&v, &g_ram[addr - RAM_ORIGIN], 4); return v;
-}
-static void settag(uint8_t rd, tag_t t) { if (rd) g_reg_tag[rd] = t; }
-
 int main(int argc, char **argv) {
     char *gargv[64]; int gargc = 0;
     uint64_t max_insns = 256ull * 1024 * 1024;
@@ -384,57 +305,11 @@ int main(int argc, char **argv) {
     RiscvEmulatorSetRegister(st, 2, setup_stack(gargc, gargv));   /* sp (NOTAG) */
     RiscvEmulatorSetProgramCounter(st, entry);
 
+    /* The emulator does all the work -- executing instructions and propagating
+     * register tags. The host just steps it and records the pc for messages. */
     for (uint64_t i = 0; i < max_insns && !g_halt; i++) {
-        uint32_t pc = RiscvEmulatorGetNextProgramCounter(st);
-        uint32_t insn = mem_read32(pc);
-        g_cur_pc = pc;
-        if ((insn & 3) != 3) {            /* compressed: 32-bit tag datapath only */
-            g_mem_ptr_tag = NOTAG;        /* don't check/forge tags for these */
-            RiscvEmulatorLoop(st);
-            continue;
-        }
-        uint8_t op = insn & 0x7f, rd = (insn >> 7) & 31, f3 = (insn >> 12) & 7;
-        uint8_t rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31, f7 = (insn >> 25) & 0x7f;
-        tag_t t1 = g_reg_tag[rs1], t2 = g_reg_tag[rs2];
-        uint32_t v1 = RiscvEmulatorGetRegister(st, rs1);   /* operand values, for */
-        uint32_t v2 = RiscvEmulatorGetRegister(st, rs2);   /* and/or/xor constant checks */
-        uint32_t immI = (uint32_t)((int32_t)insn >> 20);   /* I-type sign-extended imm */
-
-        /* Hand the memory system the base-pointer tag (it checks bounds against
-         * it) and, for a store, the value's tag (it records it on the cell). A
-         * load reads the cell's tag back into g_mem_val_tag. The engine computes
-         * the real effective address itself; we never recompute it here. */
-        g_mem_ptr_tag = t1;
-        g_mem_val_tag = t2;
-
+        g_cur_pc = RiscvEmulatorGetNextProgramCounter(st);
         RiscvEmulatorLoop(st);
-        if (g_halt) break;
-
-        switch (op) {                     /* propagate the shadow tag to rd */
-        case 0x33:                                               /* OP (reg, reg) */
-            if (f7 == 0x01)              settag(rd, alu_other(t1, t2));  /* M: mul/div/rem */
-            else if (f3 == 0)            settag(rd, f7 == 0x20 ? alu_sub(t1, t2)
-                                                              : alu_add(t1, t2)); /* sub / add */
-            else if (f3 == 2 || f3 == 3) settag(rd, alu_cmp(t1, t2));    /* slt/sltu */
-            else if (f3 == 4 || f3 == 6 || f3 == 7)
-                                         settag(rd, alu_bitwise(f3, t1, v1, t2, v2)); /* xor/or/and */
-            else                         settag(rd, alu_other(t1, t2));  /* sll/srl/sra */
-            break;
-        case 0x13:                                               /* OP-IMM (reg, imm: imm is N) */
-            if (f3 == 0)                 settag(rd, alu_add(t1, NOTAG)); /* addi: ptr+offset */
-            else if (f3 == 2 || f3 == 3) settag(rd, alu_cmp(t1, NOTAG)); /* slti/sltiu */
-            else if (f3 == 4 || f3 == 6 || f3 == 7)
-                                         settag(rd, alu_bitwise(f3, t1, v1, NOTAG, immI)); /* xori/ori/andi */
-            else                         settag(rd, alu_other(t1, NOTAG)); /* slli/srli/srai */
-            break;
-        case 0x03: settag(rd, g_mem_val_tag); break;  /* LOAD: tag the memory cell returned */
-        case 0x23: break;                             /* STORE: cell tag set in the callback */
-        case 0x37: case 0x17:                                     /* LUI/AUIPC */
-        case 0x6f: case 0x67: settag(rd, NOTAG); break;          /* JAL/JALR  */
-        case 0x73: if (f3 != 0) settag(rd, NOTAG); break;        /* CSR (not ecall) */
-        default: break;                                          /* BRANCH/FENCE: no rd */
-        }
-        g_reg_tag[0] = NOTAG;
     }
 
     RiscvEmulatorDestroy(st);

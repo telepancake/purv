@@ -10,6 +10,10 @@
 
 #include "purvs.h"
 
+/* Register/memory tag values (see the propagation block lower down). */
+#define NOTAG  0u
+#define BADTAG 0xFFFFFFFFu
+
 typedef struct __attribute__((packed)) {
     uint32_t hartid : 32;
 } RiscvCSRmhartid_t;
@@ -767,6 +771,7 @@ struct RiscvEmulatorState {
     uint32_t programcounternext;
     RiscvInstruction_u instruction;
     RiscvRegister_u reg;
+    uint32_t reg_tag[32];        /* parallel tag for each register (x0..x31) */
     RiscvCSR_t csr;
 };
 
@@ -924,7 +929,7 @@ static void RiscvEmulatorC_LW(RiscvEmulatorState_t *state, void *rd, void *rs1, 
     if (state->trapflag.storeaddressmisaligned == 1) {
         return;
     }
-    RiscvEmulatorLoad(memorylocation, rd, sizeof(uint32_t));
+    RiscvEmulatorLoad(memorylocation, NOTAG, rd, sizeof(uint32_t)); /* compressed: untracked */
 }
 
 static void RiscvEmulatorC_SW(RiscvEmulatorState_t *state, void *rs1, void *rs2, const uint8_t offset) {
@@ -932,7 +937,7 @@ static void RiscvEmulatorC_SW(RiscvEmulatorState_t *state, void *rs1, void *rs2,
     if (state->trapflag.storeaddressmisaligned == 1) {
         return;
     }
-    RiscvEmulatorStore(memorylocation, rs2, sizeof(uint32_t));
+    RiscvEmulatorStore(memorylocation, NOTAG, rs2, NOTAG, sizeof(uint32_t)); /* compressed: untracked */
 }
 
 static void RiscvEmulatorC_ADDI(const uint8_t rdnum, void *rd, const int8_t nzimm) {
@@ -1067,7 +1072,7 @@ static void RiscvEmulatorC_LWSP(const uint8_t rdnum, void *rd, void *sp, const u
     if (rdnum == 0) {
         return;
     }
-    RiscvEmulatorLoad(memorylocation, rd, sizeof(uint32_t));
+    RiscvEmulatorLoad(memorylocation, NOTAG, rd, sizeof(uint32_t)); /* compressed: untracked */
 }
 
 static void RiscvEmulatorC_MV(const uint8_t rdnum, void *rd, void *rs2) {
@@ -1092,7 +1097,7 @@ static void RiscvEmulatorC_ADD(const uint8_t rdnum, void *rd, void *rs2) {
 
 static void RiscvEmulatorC_SWSP(void *rs2, void *sp, const uint8_t offset) {
     uint32_t memorylocation = *(int32_t *)sp + offset;
-    RiscvEmulatorStore(memorylocation, rs2, sizeof(uint32_t));
+    RiscvEmulatorStore(memorylocation, NOTAG, rs2, NOTAG, sizeof(uint32_t)); /* compressed: untracked */
 }
 
 static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
@@ -1860,7 +1865,8 @@ static void RiscvEmulatorOpcodeLoad(RiscvEmulatorState_t *state) {
     }
 
     uint32_t value = 0;
-    RiscvEmulatorLoad(memorylocation, &value, length);
+    state->reg_tag[rdnum] =                                  /* the value's tag, from memory */
+        RiscvEmulatorLoad(memorylocation, state->reg_tag[rs1num], &value, length);
 
     switch (state->instruction.itype.funct3) {
     case FUNCT3_LOAD_LB:
@@ -1919,7 +1925,8 @@ static void RiscvEmulatorOpcodeStore(RiscvEmulatorState_t *state) {
         return;
     }
 
-    RiscvEmulatorStore(memorylocation, rs2, length);
+    RiscvEmulatorStore(memorylocation, state->reg_tag[rs1num],
+                       rs2, state->reg_tag[rs2num], length);
 }
 
 static void RiscvEmulatorOpcodeBranch(RiscvEmulatorState_t *state) {
@@ -2147,8 +2154,80 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t ram_length) {
     // Initialize CSR.
     memset(&state->csr, 0, sizeof(state->csr));
 
+    // Initialize register tags (all NOTAG).
+    memset(state->reg_tag, 0, sizeof(state->reg_tag));
+
     // Initialize trap flags.
     state->trapflag.value = 0;
+}
+
+/* ===================== tag propagation (the emulator's parallel datapath) =====
+ * Each register has a tag the values never see. A tag is NOTAG (plain integer),
+ * an object id (a pointer), or BADTAG (corrupted provenance). After an operation
+ * the emulator sets the destination register's tag from its sources, by the rule
+ * for that operation -- this is where tagged data is actually handled. */
+#define PAGE_BITS 12
+
+static int tag_is_ptr(uint32_t t) { return t != NOTAG && t != BADTAG; }
+
+static uint32_t tag_add(uint32_t a, uint32_t b) {            /* ptr + offset */
+    if (a == BADTAG || b == BADTAG) return BADTAG;
+    if (tag_is_ptr(a) && tag_is_ptr(b)) return BADTAG;       /* ptr + ptr */
+    return tag_is_ptr(a) ? a : b;
+}
+static uint32_t tag_sub(uint32_t a, uint32_t b) {            /* a - b, asymmetric */
+    if (a == BADTAG || b == BADTAG) return BADTAG;
+    if (tag_is_ptr(a) && tag_is_ptr(b)) return (a == b) ? NOTAG : BADTAG;
+    if (tag_is_ptr(b)) return BADTAG;                        /* int - ptr */
+    return a;
+}
+static uint32_t tag_cmp(uint32_t a, uint32_t b) {            /* boolean result */
+    if (a == BADTAG || b == BADTAG) return BADTAG;
+    if (tag_is_ptr(a) && tag_is_ptr(b) && a != b) return BADTAG;
+    return NOTAG;
+}
+static uint32_t tag_other(uint32_t a, uint32_t b) {          /* mul/div/rem/shift */
+    return (a == NOTAG && b == NOTAG) ? NOTAG : BADTAG;
+}
+static uint32_t tag_bitwise(uint8_t f3, uint32_t ta, uint32_t va, uint32_t tb, uint32_t vb) {
+    if (ta == BADTAG || tb == BADTAG) return BADTAG;
+    int pa = tag_is_ptr(ta), pb = tag_is_ptr(tb);
+    if (pa && pb) return BADTAG;
+    if (!pa && !pb) return NOTAG;
+    uint32_t k = pa ? vb : va;                               /* the constant operand */
+    int page_local = (f3 == 7) ? ((~k >> PAGE_BITS) == 0)    /* and: clear low bits */
+                               : (( k >> PAGE_BITS) == 0);   /* or/xor: set low bits */
+    return page_local ? (pa ? ta : tb) : BADTAG;
+}
+
+/* Set rd's tag from the just-executed instruction's sources. Loads/stores are
+ * handled in their own handlers (the tag crosses the memory boundary there). */
+static void RiscvEmulatorPropagateTag(RiscvEmulatorState_t *state,
+                                      uint32_t t1, uint32_t t2, uint32_t v1, uint32_t v2) {
+    uint32_t insn = state->instruction.value;
+    uint8_t op = insn & 0x7f, rd = (insn >> 7) & 31, f3 = (insn >> 12) & 7, f7 = (insn >> 25) & 0x7f;
+    if (rd == 0) return;
+    uint32_t imm = (uint32_t)((int32_t)insn >> 20), r;
+    switch (op) {
+    case 0x33:                                               /* OP reg,reg */
+        if (f7 == 0x01)                   r = tag_other(t1, t2);            /* mul/div/rem */
+        else if (f3 == 0)                 r = (f7 == 0x20) ? tag_sub(t1, t2) : tag_add(t1, t2);
+        else if (f3 == 2 || f3 == 3)      r = tag_cmp(t1, t2);             /* slt/sltu */
+        else if (f3 == 4 || f3 == 6 || f3 == 7) r = tag_bitwise(f3, t1, v1, t2, v2);
+        else                              r = tag_other(t1, t2);           /* shifts */
+        break;
+    case 0x13:                                               /* OP-IMM reg,imm */
+        if (f3 == 0)                      r = tag_add(t1, NOTAG);          /* addi */
+        else if (f3 == 2 || f3 == 3)      r = tag_cmp(t1, NOTAG);
+        else if (f3 == 4 || f3 == 6 || f3 == 7) r = tag_bitwise(f3, t1, v1, NOTAG, imm);
+        else                              r = tag_other(t1, NOTAG);        /* shift-imm */
+        break;
+    case 0x37: case 0x17:                                     /* LUI/AUIPC */
+    case 0x6f: case 0x67:                                     /* JAL/JALR (link) */
+    case 0x73: r = NOTAG; break;                             /* CSR read */
+    default: return;                                         /* LOAD/STORE/BRANCH/FENCE */
+    }
+    state->reg_tag[rd] = r;
 }
 
 void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
@@ -2172,6 +2251,16 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
         state->programcounternext += sizeof(state->instruction.L);
     } else {
         instructionlength = 16;
+    }
+
+    /* Snapshot the source tags and values before the operation overwrites them
+     * (rd may alias rs1/rs2), so the tag can be propagated afterwards. */
+    uint32_t t1 = NOTAG, t2 = NOTAG, v1 = 0, v2 = 0;
+    if (instructionlength == 32) {
+        uint32_t insn = state->instruction.value;
+        uint8_t rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31;
+        t1 = state->reg_tag[rs1]; t2 = state->reg_tag[rs2];
+        v1 = state->reg.x[rs1];   v2 = state->reg.x[rs2];
     }
 
     if (instructionlength == 16) {
@@ -2217,6 +2306,12 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
             state->trapflag.illegalinstruction = 1;
             break;
         }
+    }
+
+    /* Propagate the tag to the destination register (loads/stores did their own
+     * tag handling at the memory boundary; skip if the instruction trapped). */
+    if (instructionlength == 32 && state->trapflag.value == 0) {
+        RiscvEmulatorPropagateTag(state, t1, t2, v1, v2);
     }
 
     if (state->trapflag.value > 0) {
@@ -2268,4 +2363,11 @@ void RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state) {
 }
 void RiscvEmulatorClearTrap(RiscvEmulatorState_t *state) {
     state->trapflag.value = 0;
+}
+uint32_t RiscvEmulatorGetRegisterTag(const RiscvEmulatorState_t *state, int index) {
+    return state->reg_tag[index & 31];
+}
+void RiscvEmulatorSetRegisterTag(RiscvEmulatorState_t *state, int index, uint32_t tag) {
+    index &= 31;
+    if (index) state->reg_tag[index] = tag;   /* x0 stays NOTAG */
 }
