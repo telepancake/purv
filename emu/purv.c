@@ -175,8 +175,9 @@ uint32_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint32_t pc) {
             a = s->x[rs1]; imm = (uint32_t)((int32_t)w >> 20); goto jalr;
         case LUI:   imm = w & 0xfffff000; goto lui;
         case AUIPC: imm = w & 0xfffff000; goto auipc;
-        case MISCMEM:                                     /* FENCE / FENCE.I -> nop */
+        case MISCMEM:                                     /* FENCE -> nop; FENCE.I -> sync */
             if (rd || rs1 || (f3 != 0 && f3 != 1)) goto illegal;
+            if (f3 == 1) s->fptr = 0;     /* FENCE.I: drop the cached fetch window (Zifencei) */
             goto done;
         case SYSTEM:
             a = s->x[rs1]; imm = (w >> 20) & 0xfff; goto system;
@@ -340,7 +341,9 @@ system:
     } else {                                                       /* CSR access */
         uint32_t *csr = RiscvEmulatorGetCSRAddress(s, imm);
         if (s->trap) goto done;            /* unknown CSR already raised illegal */
-        uint32_t old = *csr, src = f3 & 4 ? rs1 : a;   /* zimm (rs1 field) vs register */
+        uint32_t src = f3 & 4 ? rs1 : a;   /* zimm (rs1 field) vs register */
+        if ((imm & 0xC00) == 0xC00 && ((f3 & 3) == 1 || src)) goto illegal;  /* write to read-only CSR */
+        uint32_t old = *csr;
         if (rd) wr(s, rd, old);
         switch (f3 & 3) {
         case 1: *csr = src; break;                                 /* CSRRW[I]  */
@@ -362,7 +365,7 @@ done:
         s->mstatus &= ~(1u << 3);                                  /* mie = 0 */
         s->mepc = s->pc;
         s->mcause = code;
-        s->npc = (s->mtvec & 3) == 1 ? 4 * code : s->mtvec & ~3u;  /* vectored vs direct */
+        s->npc = s->mtvec & ~3u;          /* mtvec.BASE (every trap here is an exception) */
         if (s->trap & T_ILL) RiscvEmulatorIllegalInstruction(s);
         s->trap = 0;
     }
