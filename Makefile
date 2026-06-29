@@ -5,6 +5,7 @@
 #   make emu-test     build + run the emulator examples
 #   make secure       tagged-memory pointer-safety demo (emu/purvs)
 #   make sqlite       freestanding SQLite running on purv (fetch + build + run)
+#   make compact      447-byte no-runtime demo: fixed-point Mandelbrot
 #
 # Conformance harness (RISCOF vs the Sail reference model):
 #   make bootstrap    fetch submodules + install riscof  (needs open git egress)
@@ -40,10 +41,10 @@ SAIL_BIN       ?= $(SAIL_DL_BIN)
 # Built artifact Spike's plugin invokes.
 SPIKE_BIN   := $(SPIKE_DIR)/build/spike
 
-.PHONY: help emu emu-test secure sqlite bootstrap spike sail sail-dl sail-build validate conformance clean distclean
+.PHONY: help emu emu-test secure sqlite compact bootstrap spike sail sail-dl sail-build validate conformance clean distclean
 
 help:
-	@sed -n '1,14p' $(MAKEFILE_LIST)
+	@sed -n '1,16p' $(MAKEFILE_LIST)
 
 # --- The emulator and demos (the actual purv work) ------------------------
 
@@ -58,6 +59,9 @@ secure:
 
 sqlite:
 	$(MAKE) -C emu sqlite
+
+compact:
+	$(MAKE) -C emu compact
 
 # --- Reference emulators --------------------------------------------------
 
