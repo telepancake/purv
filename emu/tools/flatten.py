@@ -25,8 +25,13 @@ import os, re, sys
 INC = sys.argv[1]
 OUTDIR = sys.argv[2]
 
+# purv/purg are userspace RV32IMC engines: a program runner, not a machine.
+# Zicsr is the privileged surface here -- CSRs, mret, and the whole mtvec/mepc/
+# mcause trap-vectoring epilogue all live behind RVE_E_ZICSR upstream, so baking
+# it off yields a user-level engine where ecall/ebreak still dispatch to the host
+# hooks (syscall + debug) but nothing traps to machine mode.
 MACROS = {
-    "RVE_E_M": 1, "RVE_E_C": 1, "RVE_E_ZICSR": 1, "RVE_E_ZIFENCEI": 1,
+    "RVE_E_M": 1, "RVE_E_C": 1, "RVE_E_ZICSR": 0, "RVE_E_ZIFENCEI": 1,
     "RVE_E_A": 0, "RVE_E_B": 0,
     "RVE_E_ZBA": 0, "RVE_E_ZBB": 0, "RVE_E_ZBC": 0, "RVE_E_ZBS": 0,
     "RVE_E_HOOK": 0,
@@ -158,12 +163,6 @@ void RiscvEmulatorSetProgramCounter(RiscvEmulatorState_t *state, uint32_t pc) {
 }
 uint32_t RiscvEmulatorGetInstruction(const RiscvEmulatorState_t *state) {
     return state->instruction.value;
-}
-uint16_t RiscvEmulatorGetCsrNumber(const RiscvEmulatorState_t *state) {
-    return state->instruction.itypecsr.csr;
-}
-uint32_t RiscvEmulatorGetTrapVectorBase(const RiscvEmulatorState_t *state) {
-    return state->csr.mtvec.base;
 }
 void RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state) {
     state->trapflag.illegalinstruction = 1;

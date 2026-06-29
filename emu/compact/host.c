@@ -86,12 +86,8 @@ void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *st) {
             RiscvEmulatorGetInstruction(st), RiscvEmulatorGetProgramCounter(st));
     g_halt = 1; g_exit = 1;
 }
-void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *st) { RiscvEmulatorRaiseIllegalInstruction(st); }
-void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *st, uint16_t csr) {
-    static uint32_t z; (void)st; (void)csr; z = 0; return &z;
-}
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *st) { (void)st; }
-void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *st) { g_ecall = 1; RiscvEmulatorClearTrap(st); }
+void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *st) { (void)st; g_ecall = 1; }
 
 static void service(RiscvEmulatorState_t *st) {
     uint32_t fn = RiscvEmulatorGetRegister(st, 17);

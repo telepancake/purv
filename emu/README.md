@@ -3,12 +3,16 @@
 A small, hand-written RISC-V emulator in the spirit of
 [atoomnetmarc/RISC-V-emulator][atoom] — same hook-based premise, a conventional
 header + implementation library, a separate host, ISA flags baked in:
-**RV32IMC + Zicsr + Zifencei**.
+**RV32IMC + Zifencei**. It is a *userspace* engine — a program runner, not a
+machine: no CSRs, no privileged modes, no trap-to-`mtvec`. `ecall` (a syscall),
+`ebreak` (a debugger trap), and an illegal instruction are handed straight to
+the host hooks; nothing vectors anywhere.
 
 ```
 emu/
-  purv.h      public interface — opaque state + the calls you need (~60 lines)
-  purv.c      the whole engine, hidden behind purv.h (hand-written, ~420 lines)
+  purv.h      public interface — opaque state + the calls you need (~65 lines)
+  purv.c      the whole engine, hidden behind purv.h (hand-written, ~330 lines)
+  act/        userspace ACT conformance vs Spike golden signatures (make act)
   purg.c/.h   the earlier engine, mechanically generated from atoom (g = generated;
               kept for reference, not built — see "How the engine is organized")
   main.c      the host/driver: memory map + hooks + ELF loader + two run modes
@@ -34,7 +38,6 @@ functions and the engine reaches your memory map only through them (defined in
 void RiscvEmulatorLoad (uint32_t addr, void *dst, uint8_t len);
 void RiscvEmulatorStore(uint32_t addr, const void *src, uint8_t len);
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *);
-void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *);
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *);
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *);
 ```
@@ -68,9 +71,9 @@ purv --user <elf> [program args...]    # ecall -> Linux/RISC-V syscall
 
 In `--user` mode the host sets up a real initial stack (`argc`, `argv`, an empty
 `envp`, and an `AT_NULL` auxv) from the trailing command-line args, then an
-`ecall` is delivered as a syscall (`a7`=number, `a0..`=args, result in `a0`)
-instead of trapping to `mtvec`. `main.c` implements `write`, `exit`, and `brk`;
-everything else returns `-ENOSYS`. Examples:
+`ecall` is delivered as a syscall (`a7`=number, `a0..`=args, result in `a0`).
+`main.c` implements `write`, `exit`, and `brk`; everything else returns
+`-ENOSYS`. Examples:
 
 ```sh
 make examples/hello.elf && ./purv --user examples/hello.elf
@@ -80,10 +83,10 @@ make examples/args.elf  && ./purv --user examples/args.elf one two
 ```
 
 This is the design pattern for purv: the engine stays minimal and the host owns
-policy. The engine exposes just one new primitive — `RiscvEmulatorClearTrap()` —
-which the host's `RiscvEmulatorHandleECALL` calls to consume the `ecall` and
-resume, rather than the engine baking in any syscall ABI. Without `--user`,
-`ecall` traps normally, so machine-mode conformance is unaffected.
+policy. The engine bakes in no syscall ABI — an `ecall` simply calls the host's
+`RiscvEmulatorHandleECALL` and resumes at the next instruction (it is a service
+request to the execution environment, so it returns straight to the caller).
+Without `--user` the host's hook ignores it.
 
 ## Debug with gdb
 
@@ -164,42 +167,34 @@ at `0x11100000` (mini-rv32ima / ACT4) — then dumps `[begin_signature,
 end_signature)` as one hex word per line. Exit status is `0` on PASS.
 
 This matches the CLI that `conformance/plugin-purv` already expects, so purv can
-drop straight into the RISCOF harness once a `riscv*-gcc` cross-compiler and the
-Sail reference model are available.
+drop straight into the RISCOF harness given a `riscv*-gcc` cross-compiler.
 
 ## Running the real conformance suite
 
 ```sh
-make conformance        # ./selfcheck.sh rv32ui rv32um rv32uc
+make act        # ./act/run.sh — userspace RV32IMC vs Spike golden signatures
 ```
 
-`selfcheck.sh` fetches the classic **riscv-tests** ISA suite, builds each test
-for rv32imc with **clang** (`--target=riscv32` + `ld.lld` — no cross-gcc), and
-runs it on purv. These tests are **self-checking**: each embeds its expected
-results and writes pass/fail to the HTIF `tohost` word, so **no reference model
-is needed**. purv decodes that word (`tohost==1` -> pass) into its exit code.
+The real correctness check is the **RISC-V Architecture Compatibility Test**
+(riscv-arch-test): each test is assembled, run on purv, and its result signature
+diffed against a golden signature **cooked from an independent reference model**
+([Spike], the official `riscv-isa-sim`). The 76 in-scope goldens are vendored
+under `act/golden/`, so verifying needs only a RISC-V cross-assembler — Spike is
+needed only to regenerate them. This is *not* purv-graded-by-purv: the reference
+is a different implementation, so a match is evidence of correctness.
 
-It only needs network egress (to fetch the suite) and clang. Last measured here:
-rv32ui 41/41, rv32um 8/8, rv32uc 1/1; `rv32ui/ma_data` is excluded and
-`rv32mi/mcsr` fails (machine-CSR gap — see below).
-
-**Optional reference (Spike).** If `spike` is on `PATH`, `selfcheck.sh` uses it
-only to skip tests Spike itself can't pass under this config (e.g. `ma_data`).
-Build it once from the pinned submodule (a C++ host program — no cross-toolchain):
-
-```sh
-apt-get install -y device-tree-compiler
-git submodule update --init third_party/riscv-isa-sim        # or fetch the tarball
-( cd third_party/riscv-isa-sim && mkdir -p build && cd build && ../configure && make -j )
-export PATH="$PWD/third_party/riscv-isa-sim/build:$PATH"
+```
+ACT RV32IMC userspace: PASS=76 FAIL=0 SKIP=12
 ```
 
-**Note on the pinned ACT4 suite.** `third_party/riscv-arch-test` is the newer
-ACT4 framework. Building *its* ELFs needs a UDB-generated `rvtest_config.h`
-(ruby/mise) and Sail to bake reference signatures — heavy, and this Spike build
-has no `+signature` flag to diff against. `selfcheck.sh` (riscv-tests,
-self-checking) is the lightweight path that runs anywhere with just clang; reach
-for the ACT4 framework only when you need its exhaustive coverage.
+The 12 skips are out of scope, not failures: `cebreak-01` needs a machine-mode
+trap routine (Zicsr/`mtvec`/`mret`), and 11 `Zcb` tests (`c.mul`/`c.lbu`/
+`c.sext.b`/…) are a separate extension that does not assemble under `rv32ic`.
+See `act/README.md` for provenance, scope, and how the goldens were cooked.
+
+Because purv is userspace-only, the classic machine-mode **riscv-tests** path
+(`selfcheck.sh`, which relies on `mtvec`/`mret`/HTIF trap setup) no longer
+applies; ACT is the conformance path.
 
 ## Memory map
 
@@ -212,33 +207,36 @@ for the ACT4 framework only when you need its exhaustive coverage.
 ## How the engine is organized
 
 `purv.c` is hand-written (so are `purv.h` and `main.c`). It keeps atoom's premise
-— the host owns the memory map and trap policy; the engine reaches the world only
-through the hooks above — but trims the redundancy of the original, in ~420 lines.
-Two ideas do most of that:
+— the host owns the memory map; the engine reaches the world only through the
+hooks above — but trims the redundancy of the original, in ~330 lines. Two ideas
+do most of that:
 
 - **Registers are indices into `x[32]`, not pointers.** `x0` is never written, so
   it reads as a hard zero and `wr()` simply drops writes to it. No `void *rd`
   juggling, no per-instruction `x0` guard.
-- **Compressed instructions are decompressed, not separately executed.** A 16-bit
-  instruction is decoded into the *same* `Decoded` form a 32-bit instruction
-  produces (`decode16` / `decode32`), so `execute()` never sees "C" — there is a
-  single executor for both encodings. All the per-encoding bit-shuffling lives in
-  the two decoders; reserved/illegal compressed encodings come back as `op == 0`,
-  which `execute()` rejects like any other illegal opcode.
+- **One executor for both encodings, no intermediate decoded form.** Each opcode
+  arm — 32-bit or compressed — decodes only the operands it needs straight from
+  the instruction into a few locals, then `goto`s a shared action body
+  (`alu`/`load`/`store`/`branch`/…). So the compressed and base encodings reuse
+  the *same* execution code without decompressing into a struct first, and no
+  instruction decodes a field it won't use. Reserved/illegal encodings `goto
+  illegal`, which calls the host's illegal hook.
 
-`RiscvEmulatorLoop(state, pc)` is one fetch → decode → execute → trap-epilogue
-step: it takes the `pc` to run and returns the next `pc`.
+`RiscvEmulatorLoop(state, pc)` is one fetch → decode → execute step: it takes the
+`pc` to run and returns the next `pc`.
 
-Correctness is **verified by the riscv-tests conformance suite** (`make
-conformance` / `./selfcheck.sh`, 50/51 — the one skip is the misaligned-access
-`ma_data` test).
+Correctness is **verified against an independent reference** — the ACT suite
+diffed against Spike golden signatures (`make act`, 76/76 in scope; see above and
+`act/README.md`).
 
-The earlier engine — `purg.c` / `purg.h` (purg = "generated") — is kept for
-reference but is no longer built. The `tools/` pipeline (`flatten.py` /
+The earlier engine — `purg.c` / `purg.h` (purg = "generated") — is kept as a
+reference and is not part of the build. The `tools/` pipeline (`flatten.py` /
 `inline.py` / `compact.py`) and the `atoomnetmarc-rv` submodule (pinned to commit
-`633526d4`) mechanically distilled the upstream engine into it; `make regen`
-rebuilds `purg.c` from the submodule (it never touches the hand-written
+`633526d4`) mechanically distil the upstream engine into it with the privileged
+`Zicsr` surface baked off (`RVE_E_ZICSR=0`), so it too is userspace-only; `make
+regen` rebuilds `purg.c` from the submodule (it never touches the hand-written
 `purv.c` / `purv.h`). `purg`'s public API predates this rewrite — its
 `RiscvEmulatorLoop(state)` steps an internal pc rather than taking/returning one.
 
 [atoom]: https://github.com/atoomnetmarc/RISC-V-emulator
+[Spike]: https://github.com/riscv-software-src/riscv-isa-sim

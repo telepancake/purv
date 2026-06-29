@@ -2,9 +2,9 @@
  * host.c - host/driver that runs the freestanding SQLite guest on the purv engine.
  *
  * The host-call ABI is deliberately split the way the task describes:
- *   - the engine's ECALL hook does almost nothing: it just raises a flag and
- *     consumes the trap (RiscvEmulatorClearTrap), so the engine resumes after
- *     the ecall;
+ *   - the engine's ECALL hook does almost nothing: it just raises a flag, and
+ *     the engine resumes after the ecall (ecall is a userspace service request,
+ *     so it returns straight to the caller -- nothing vectors anywhere);
  *   - the run loop, after each stepped instruction, checks the flag and *that*
  *     is where host functions are actually serviced (reading a7/a0.. and writing
  *     the result back into a0).
@@ -163,21 +163,13 @@ void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *st) {
             RiscvEmulatorGetInstruction(st), RiscvEmulatorGetProgramCounter(st));
     g_halt = 1; g_exit = 1;
 }
-void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *st) { RiscvEmulatorRaiseIllegalInstruction(st); }
-void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *st, uint16_t csr) {
-    static uint32_t misa = (1u << 30) | (1u << ('I' - 'A')) | (1u << ('M' - 'A')) | (1u << ('C' - 'A'));
-    static uint32_t zero;
-    (void)st;
-    if (csr == 0x301) return &misa;
-    zero = 0; return &zero;
-}
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *st) { (void)st; }
 
 /* The whole hook: mark that an ecall happened and let the engine continue. The
  * actual work is done by the run loop below. */
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *st) {
+    (void)st;
     g_ecall_pending = 1;
-    RiscvEmulatorClearTrap(st);
 }
 
 /* ------------------------------------------------ host-function service loop */

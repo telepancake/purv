@@ -1,9 +1,15 @@
 /*
- * purv.c - RISC-V (RV32IMC + Zicsr/Zifencei) emulator: implementation.
+ * purv.c - RISC-V (RV32IMC + Zifencei) userspace emulator: implementation.
  *
  * A small, hand-written engine. The premise is atoom's: the host owns the memory
- * map and trap policy and the engine reaches the world only through the hooks in
- * purv.h. The whole thing is one fetch/decode/execute step in RiscvEmulatorLoop.
+ * map and the engine reaches the world only through the hooks in purv.h. The
+ * whole thing is one fetch/decode/execute step in RiscvEmulatorLoop.
+ *
+ * This is a user-level program runner, not a machine. There are no CSRs, no
+ * privileged modes, and no trap-to-mtvec: ecall and ebreak are the userspace
+ * ABI -- a service request to the host (a syscall) and a debugger breakpoint --
+ * so they call straight out to the host hooks, and an illegal instruction calls
+ * its hook too. Nothing vectors anywhere; the host decides what each means.
  *
  * Structure: each opcode -- 32-bit or compressed -- decodes only the operands it
  * needs straight from the instruction, into a handful of locals, then `goto`s a
@@ -18,25 +24,18 @@
 
 #include "purv.h"
 
-#define ROM_ORIGIN 0x20000000u
+#define ROM_ORIGIN 0x20000000u            /* reset vector if the host sets no pc */
 
 /* Base opcodes (instruction[6:0]). */
 enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
        OP = 0x33, LUI = 0x37, BRANCH = 0x63, JALR = 0x67, JAL = 0x6f, SYSTEM = 0x73 };
 
-/* Pending-trap flags (a small bitmask; the host can clear it). */
-enum { T_ILL = 1, T_EBRK = 4, T_LMIS = 8, T_SMIS = 16, T_ECALL = 32 };
-
 struct RiscvEmulatorState {
     uint32_t pc;        /* instruction currently executing */
-    uint32_t npc;       /* next instruction (jumps/branches/traps rewrite this) */
+    uint32_t npc;       /* next instruction (jumps/branches rewrite this) */
     uint32_t inst;      /* raw fetched word (16-bit zero-extended when compressed) */
     uint32_t x[32];     /* x0..x31; x0 stays zero */
-    uint8_t  trap;      /* T_* bitmask of pending exceptions */
-    /* CSRs the engine implements, as plain 32-bit words. Bit-fields are just a
-     * view the trap logic applies with masks; reads/writes are raw words. */
-    uint32_t mhartid, mstatus, medeleg, mideleg, mie, mtvec, mstatush, mscratch,
-             mepc, mcause, mtval, mip, pmpcfg0, pmpaddr0, mnstatus, satp;
+    uint8_t  trap;      /* set when the step decoded an illegal instruction */
     /* Cached fetch window (see RiscvEmulatorGetFetchWindow). While pc stays in
      * [fbase_lo, fbase_hi) the engine reads instruction half-words straight from
      * host memory at fptr instead of calling the load hook; on a miss it re-asks
@@ -49,32 +48,6 @@ struct RiscvEmulatorState {
  * so the engine simply keeps fetching through RiscvEmulatorLoad. Declared here
  * (not in purv.h's required-hook block) because it is an optional accelerator. */
 __attribute__((weak)) const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t address, uint32_t *available);
-
-static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *s, uint16_t csr) {
-    switch (csr) {
-    case 0xF14: return &s->mhartid;
-    case 0x300: return &s->mstatus;
-    case 0x302: return &s->medeleg;
-    case 0x303: return &s->mideleg;
-    case 0x304: return &s->mie;
-    case 0x305: return &s->mtvec;
-    case 0x310: return &s->mstatush;
-    case 0x340: return &s->mscratch;
-    case 0x341: return &s->mepc;
-    case 0x342: return &s->mcause;
-    case 0x343: return &s->mtval;
-    case 0x344: return &s->mip;
-    case 0x3A0: return &s->pmpcfg0;
-    case 0x3B0: return &s->pmpaddr0;
-    case 0x744: return &s->mnstatus;
-    case 0x180: return &s->satp;
-    default: {
-        void *a = RiscvEmulatorGetUnknownCSR(s, csr);
-        if (!a) { s->trap |= T_ILL; RiscvEmulatorUnknownCSR(s); }
-        return a;
-    }
-    }
-}
 
 /* Sign-extend the low `bits` of v. */
 static int32_t sext(uint32_t v, int bits) {
@@ -180,7 +153,7 @@ uint32_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint32_t pc) {
             if (f3 == 1) s->fptr = 0;     /* FENCE.I: drop the cached fetch window (Zifencei) */
             goto done;
         case SYSTEM:
-            a = s->x[rs1]; imm = (w >> 20) & 0xfff; goto system;
+            imm = (w >> 20) & 0xfff; goto system;
         default: goto illegal;
         }
     } else {                                              /* ---- compressed ---- */
@@ -288,8 +261,7 @@ mul:
 load:
     if (f3 == 3 || f3 > 5) goto illegal;
     addr = a + imm; n = 1u << (f3 & 3);
-    if (addr & (n - 1)) { s->trap |= T_LMIS; s->mtval = addr; }
-    else if (rd) {
+    if (rd) {                             /* a load into x0 has no effect */
         uint32_t v = memload(addr, n);
         wr(s, rd, f3 & 4 ? v : (uint32_t)sext(v, 8 << (f3 & 3)));  /* sign-ext unless LBU/LHU */
     }
@@ -297,8 +269,7 @@ load:
 store:
     if (f3 > 2) goto illegal;
     addr = a + imm; n = 1u << f3;
-    if (addr & (n - 1)) { s->trap |= T_SMIS; s->mtval = addr; }
-    else RiscvEmulatorStore(addr, &b, n);
+    RiscvEmulatorStore(addr, &b, n);
     goto done;
 branch: {
     int take;
@@ -323,50 +294,18 @@ lui:
 auipc:
     wr(s, rd, s->pc + imm); goto done;
 ebreak:
-    s->trap |= T_EBRK; s->mtval = s->pc; RiscvEmulatorHandleEBREAK(s); goto done;
+    RiscvEmulatorHandleEBREAK(s); goto done;       /* debugger breakpoint -> host */
 system:
-    if (f3 == 0 && rd == 0 && rs1 == 0) {                          /* ECALL/EBREAK/MRET */
-        switch (imm) {
-        case 0x000: s->trap |= T_ECALL; RiscvEmulatorHandleECALL(s); break;
-        case 0x001: goto ebreak;
-        case 0x302:                                                /* MRET */
-            s->mstatush &= ~(1u << 7);                             /* mpv = 0 */
-            s->mstatus &= ~(3u << 11);                             /* mpp = 0 */
-            s->mstatus = (s->mstatus & ~(1u << 3)) | ((s->mstatus >> 7 & 1) << 3); /* mie=mpie */
-            s->mstatus |= 1u << 7;                                 /* mpie = 1 */
-            s->npc = s->mepc; break;
-        default: goto illegal;
-        }
-        goto done;
-    } else {                                                       /* CSR access */
-        uint32_t *csr = RiscvEmulatorGetCSRAddress(s, imm);
-        if (s->trap) goto done;            /* unknown CSR already raised illegal */
-        uint32_t src = f3 & 4 ? rs1 : a;   /* zimm (rs1 field) vs register */
-        if ((imm & 0xC00) == 0xC00 && ((f3 & 3) == 1 || src)) goto illegal;  /* write to read-only CSR */
-        uint32_t old = *csr;
-        if (rd) wr(s, rd, old);
-        switch (f3 & 3) {
-        case 1: *csr = src; break;                                 /* CSRRW[I]  */
-        case 2: if (src) *csr = old | src; break;                  /* CSRRS[I]  */
-        case 3: if (src) *csr = old & ~src; break;                 /* CSRRC[I]  */
-        default: goto illegal;
-        }
-        goto done;
+    if (f3 == 0 && rd == 0 && rs1 == 0) {
+        if (imm == 0x000) { RiscvEmulatorHandleECALL(s); goto done; }   /* ECALL -> host (syscall) */
+        if (imm == 0x001) goto ebreak;                                  /* EBREAK */
     }
+    goto illegal;                                  /* CSR / MRET / WFI: not a userspace engine */
 illegal:
-    s->trap |= T_ILL;
+    s->trap = 1;
 done:
-    if (s->trap) {
-        uint32_t code = s->trap & T_EBRK ? 3 : s->trap & T_LMIS ? 4
-                      : s->trap & T_SMIS ? 6 : s->trap & T_ECALL ? 11 : 0;
-        if (s->trap & T_ILL) { code = 2; s->mtval = s->inst; }
-        s->mstatus = (s->mstatus & ~(3u << 11)) | (3u << 11);      /* mpp = M */
-        s->mstatus = (s->mstatus & ~(1u << 7)) | ((s->mstatus >> 3 & 1) << 7); /* mpie=mie */
-        s->mstatus &= ~(1u << 3);                                  /* mie = 0 */
-        s->mepc = s->pc;
-        s->mcause = code;
-        s->npc = s->mtvec & ~3u;          /* mtvec.BASE (every trap here is an exception) */
-        if (s->trap & T_ILL) RiscvEmulatorIllegalInstruction(s);
+    if (s->trap) {                                 /* the only trap left is illegal-instruction */
+        RiscvEmulatorIllegalInstruction(s);
         s->trap = 0;
     }
     return s->npc;
@@ -380,9 +319,6 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *s, uint32_t initial_sp) {
     s->pc = s->npc = ROM_ORIGIN;
     s->inst = 0;
     s->trap = 0;
-    s->mhartid = s->mstatus = s->medeleg = s->mideleg = s->mie = s->mtvec = 0;
-    s->mstatush = s->mscratch = s->mepc = s->mcause = s->mtval = s->mip = 0;
-    s->pmpcfg0 = s->pmpaddr0 = s->mnstatus = s->satp = 0;
     s->fptr = 0;                          /* no fetch window cached yet */
     s->fbase_lo = s->fbase_hi = 0;
 }
@@ -404,7 +340,4 @@ uint32_t RiscvEmulatorGetProgramCounter(const RiscvEmulatorState_t *s) { return 
 uint32_t RiscvEmulatorGetNextProgramCounter(const RiscvEmulatorState_t *s) { return s->npc; }
 void RiscvEmulatorSetProgramCounter(RiscvEmulatorState_t *s, uint32_t pc) { s->pc = s->npc = pc; }
 uint32_t RiscvEmulatorGetInstruction(const RiscvEmulatorState_t *s) { return s->inst; }
-uint16_t RiscvEmulatorGetCsrNumber(const RiscvEmulatorState_t *s) { return (s->inst >> 20) & 0xfff; }
-uint32_t RiscvEmulatorGetTrapVectorBase(const RiscvEmulatorState_t *s) { return s->mtvec >> 2; }
-void RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *s) { s->trap |= T_ILL; }
-void RiscvEmulatorClearTrap(RiscvEmulatorState_t *s) { s->trap = 0; }
+void RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *s) { s->trap = 1; }

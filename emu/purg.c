@@ -1,8 +1,10 @@
 /*
  * purg.c - RISC-V (RV32IMC + Zicsr/Zifencei) emulator: implementation (generated).
  *
- * Derived from atoomnetmarc/RISC-V-emulator (Apache-2.0, (c) Marc Ketel).
- * The only public surface is purg.h.
+ * Generated from atoomnetmarc/RISC-V-emulator (Apache-2.0, (c) Marc Ketel),
+ * pinned commit 633526d4, by tools/flatten.py. Everything below is internal:
+ * the only public surface is purg.h. Do not edit by hand; run `make regen`.
+ * (The hand-written engine the build uses is purv.c/purv.h, not this file.)
  */
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,174 +12,25 @@
 
 #include "purg.h"
 
-typedef struct __attribute__((packed)) { uint32_t hartid : 32; } RiscvCSRmhartid_t;
+/* The engine threads a hook-context pointer through many helpers; with
+ * RVE_E_HOOK baked off it is unused. Scope the warning away for this generated
+ * file (mirrors upstream's own pragma around RiscvEmulatorHook). */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 
-typedef struct __attribute__((packed)) {
-    uint8_t pmp0cfg;
-    uint8_t pmp1cfg;
-    uint8_t pmp2cfg;
-    uint8_t pmp3cfg;
-} RiscvCSRpmpcfg0_t;
+/* ===== RiscvEmulatorType.h ===== */
 
-typedef struct __attribute__((packed)) { uint32_t address; } RiscvCSRpmpaddr0_t;
+/* ===== RiscvEmulatorTypeEmulator.h ===== */
 
-typedef struct __attribute__((packed)) {
-    uint8_t : 3;
-    uint8_t nmie : 1;
-    uint8_t : 3;
-    uint8_t mnpv : 1;
-    uint8_t : 3;
-    uint8_t mnpp : 2;
-    uint32_t : 19;
-} RiscvCSRmnstatus_t;
+/* ===== RiscvEmulatorTypeCSR.h ===== */
 
-typedef struct __attribute__((packed)) { uint32_t mscratch; } RiscvCSRmscratch_t;
+/* ===== RiscvEmulatorTypeInstruction.h ===== */
 
-typedef struct __attribute__((packed)) {
-    uint32_t exceptioncode : 31;
-    uint8_t interrupt : 1;
-} RiscvCSRmcause_t;
+/* ===== RiscvEmulatorTypeB.h ===== */
 
-typedef struct __attribute__((packed)) { uint32_t mip; } RiscvCSRmip_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t : 1;
-    uint8_t sie : 1;
-    uint8_t : 1;
-    uint8_t mie : 1;
-    uint8_t : 1;
-    uint8_t spie : 1;
-    uint8_t ube : 1;
-    uint8_t mpie : 1;
-    uint8_t spp : 1;
-    uint8_t vs : 2;
-    uint8_t mpp : 2;
-    uint8_t fs : 2;
-    uint8_t xs : 2;
-    uint8_t mprv : 1;
-    uint8_t sum : 1;
-    uint8_t mxr : 1;
-    uint8_t tvm : 1;
-    uint8_t tw : 1;
-    uint8_t tsr : 1;
-    uint8_t : 8;
-    uint8_t sd : 1;
-} RiscvCSRmstatus_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t : 4;
-    uint8_t sbe : 1;
-    uint8_t mbe : 1;
-    uint8_t gva : 1;
-    uint8_t mpv : 1;
-    uint32_t : 24;
-} RiscvCSRmstatush_t;
-
-typedef union {
-    struct __attribute__((packed)) {
-        uint32_t extensions : 26;
-        uint8_t mxlen : 4;
-        uint8_t mxl : 2;
-    };
-
-    struct __attribute__((packed)) {
-        uint8_t a : 1;
-        uint8_t b : 1;
-        uint8_t c : 1;
-        uint8_t d : 1;
-        uint8_t e : 1;
-        uint8_t f : 1;
-        uint8_t g : 1;
-        uint8_t h : 1;
-        uint8_t i : 1;
-        uint8_t j : 1;
-        uint8_t k : 1;
-        uint8_t l : 1;
-        uint8_t m : 1;
-        uint8_t n : 1;
-        uint8_t o : 1;
-        uint8_t p : 1;
-        uint8_t q : 1;
-        uint8_t r : 1;
-        uint8_t s : 1;
-        uint8_t t : 1;
-        uint8_t u : 1;
-        uint8_t v : 1;
-        uint8_t w : 1;
-        uint8_t x : 1;
-        uint8_t y : 1;
-        uint8_t z : 1;
-    };
-} RiscvCSRmisa_u;
-
-typedef struct __attribute__((packed)) { uint32_t synchronousexceptions; } RiscvCSRmedeleg_t;
-typedef struct __attribute__((packed)) { uint32_t interrupts; } RiscvCSRmideleg_t;
-
-typedef union {
-    struct __attribute__((packed)) {
-        uint32_t mie;
-    };
-
-    struct __attribute__((packed)) {
-        uint8_t : 1;
-        uint8_t ssie : 1;
-        uint8_t : 1;
-        uint8_t msie : 1;
-        uint8_t : 1;
-        uint8_t stie : 1;
-        uint8_t : 1;
-        uint8_t mtie : 1;
-        uint8_t : 1;
-        uint8_t seie : 1;
-        uint8_t : 1;
-        uint8_t meie : 1;
-        uint8_t : 4;
-        uint16_t : 16;
-    };
-} RiscvCSRmie_u;
-
-typedef struct __attribute__((packed)) {
-    uint8_t mode : 2;
-    uint32_t base : 30;
-} RiscvCSRmtvec_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t ppn : 22;
-    uint16_t asid : 9;
-    uint8_t mode : 1;
-} RiscvCSRsatp_t;
-
-typedef struct __attribute__((packed)) {
-    // Machine Information Registers
-    RiscvCSRmhartid_t mhartid;
-
-    // Machine Trap Setup
-    RiscvCSRmstatus_t mstatus;
-    RiscvCSRmisa_u misa;
-    RiscvCSRmedeleg_t medeleg;
-    RiscvCSRmideleg_t mideleg;
-    RiscvCSRmie_u mie;
-    RiscvCSRmtvec_t mtvec;
-    RiscvCSRmstatush_t mstatush;
-
-    // Machine Trap Handling
-    RiscvCSRmscratch_t mscratch;
-    uint32_t mepc; // Machine exception program counter.
-    RiscvCSRmcause_t mcause;
-    uint32_t mtval; // Machine bad address or instruction.
-    RiscvCSRmip_t mip;
-
-    // Machine Memory Protection
-    RiscvCSRpmpcfg0_t pmpcfg0;
-    RiscvCSRpmpaddr0_t pmpaddr0;
-
-    // Machine Non-Maskable Interrupt Handling
-    RiscvCSRmnstatus_t mnstatus;
-
-    // Supervisor Protection and Translation
-    RiscvCSRsatp_t satp;
-} RiscvCSR_t;
-
+/**
+ * B-type instruction.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
     uint8_t imm11 : 1;
@@ -189,6 +42,9 @@ typedef struct __attribute__((packed)) {
     uint8_t imm12 : 1;
 } RiscvInstructionTypeB_t;
 
+/**
+ * Union for decoding imm field of a B-type instruction.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t imm0 : 1;
@@ -203,6 +59,13 @@ typedef union {
     };
 } RiscvInstructionTypeBDecoderImm_u;
 
+/* ===== RiscvEmulatorTypeC.h ===== */
+
+/**
+ * Compressed Register instruction format.
+ *
+ * Valid for jr, mv, ebreak, jalr and add.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t rs2 : 5;
@@ -210,6 +73,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct4 : 4;
 } RiscvInstructionTypeCR_t;
 
+/**
+ * Compressed Immediate instruction format.
+ *
+ * Valid for addi, li and slli.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t imm4_0 : 5;
@@ -218,6 +86,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCI_t;
 
+/**
+ * Compressed Immediate instruction format.
+ *
+ * Valid for addi16sp.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t imm5 : 1;
@@ -229,6 +102,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCIAddi16sp_t;
 
+/**
+ * Compressed Immediate instruction format.
+ *
+ * Valid for lui.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t imm16_12 : 5;
@@ -237,6 +115,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCILui_t;
 
+/**
+ * Compressed Immediate instruction format.
+ *
+ * Valid for lwsp and flwsp.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t imm7_6 : 2;
@@ -246,6 +129,24 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCILwsp_t;
 
+/**
+ * Compressed Stack-relative Store instruction format.
+ *
+ * Valid for fsdsp.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t op : 2;
+    uint8_t rs2 : 5;
+    uint8_t imm8_6 : 3;
+    uint8_t imm5_3 : 3;
+    uint8_t funct3 : 3;
+} RiscvInstructionTypeCSSFsdsp_t;
+
+/**
+ * Compressed Stack-relative Store instruction format.
+ *
+ * Valid for swsp and fswsp.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t rs2 : 5;
@@ -254,6 +155,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCSS_t;
 
+/**
+ * Compressed Wide Immediate instruction format.
+ *
+ * Valid for addi4spn.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t rdp : 3;
@@ -264,6 +170,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCIW_t;
 
+/**
+ * Compressed Load instruction format.
+ *
+ * Valid for lw, flw.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t rdp : 3;
@@ -274,6 +185,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCL_t;
 
+/**
+ * Compressed Store instruction format.
+ *
+ * Valid for sw, fsw.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t rs2p : 3;
@@ -284,6 +200,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCS_t;
 
+/**
+ * Compressed Arithmetic instruction format.
+ *
+ * Valid for sub, xor, or, and.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t rs2p : 3;
@@ -292,6 +213,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct6 : 6;
 } RiscvInstructionTypeCA_t;
 
+/**
+ * Compressed Branch instruction format.
+ *
+ * Valid for beqz, bnez.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t imm5 : 1;
@@ -303,6 +229,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCB_t;
 
+/**
+ * Compressed Branch instruction format.
+ *
+ * Valid for srli, srai, andi.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t imm4_0 : 5;
@@ -312,6 +243,11 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCBImm_t;
 
+/**
+ * Compressed Jump instruction format.
+ *
+ * Valid for jal, j.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint8_t imm5 : 1;
@@ -325,6 +261,9 @@ typedef struct __attribute__((packed)) {
     uint8_t funct3 : 3;
 } RiscvInstructionTypeCJ_t;
 
+/**
+ * Union for decoding imm of TypeCI.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t imm4_0 : 5;
@@ -336,6 +275,9 @@ typedef union {
     };
 } RiscvInstructionTypeCIDecoderImm_u;
 
+/**
+ * Union for decoding imm of addi16sp.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t : 4;
@@ -351,6 +293,9 @@ typedef union {
     };
 } RiscvInstructionTypeCIAddi16spDecoderImm_u;
 
+/**
+ * Union for decoding imm of lui.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint16_t : 12;
@@ -363,6 +308,9 @@ typedef union {
     };
 } RiscvInstructionTypeCILuiDecoderImm_u;
 
+/**
+ * Union for decoding imm of lwsp and flwsp.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t : 2;
@@ -376,6 +324,9 @@ typedef union {
     };
 } RiscvInstructionTypeCILwspDecoderImm_u;
 
+/**
+ * Union for decoding imm of TypeCSS.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t imm1_0 : 2;
@@ -388,6 +339,9 @@ typedef union {
     };
 } RiscvInstructionTypeCSSDecoderImm_u;
 
+/**
+ * Union for decoding imm of TypeCIW.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t imm1_0 : 2;
@@ -402,6 +356,9 @@ typedef union {
     };
 } RiscvInstructionTypeCIWDecoderImm_u;
 
+/**
+ * Union for decoding imm of TypeCL.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t : 2;
@@ -415,6 +372,9 @@ typedef union {
     };
 } RiscvInstructionTypeCLDecoderImm_u;
 
+/**
+ * Union for decoding imm of TypeCS.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t : 2;
@@ -428,6 +388,9 @@ typedef union {
     };
 } RiscvInstructionTypeCSDecoderImm_u;
 
+/**
+ * Union for decoding funct6_funct2 of TypeCA.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t funct2 : 2;
@@ -439,6 +402,9 @@ typedef union {
     };
 } RiscvInstructionTypeCADecoderFunct6Funct2_u;
 
+/**
+ * Union for decoding imm of TypeCB.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t : 1;
@@ -454,6 +420,9 @@ typedef union {
     };
 } RiscvInstructionTypeCBDecoderImm_u;
 
+/**
+ * Union for decoding imm of TypeCB.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t imm4_0 : 5;
@@ -465,6 +434,9 @@ typedef union {
     };
 } RiscvInstructionTypeCBImmDecoderImm_u;
 
+/**
+ * Union for decoding funct3_funct2 of TypeCB.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t funct2 : 2;
@@ -476,6 +448,9 @@ typedef union {
     };
 } RiscvInstructionTypeCBDecoderFunct3Funct2_u;
 
+/**
+ * Union for decoding imm of TypeCJ.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t : 1;
@@ -494,12 +469,18 @@ typedef union {
     };
 } RiscvInstructionTypeCJDecoderImm_u;
 
+/**
+ * Easier access to the opcode of an 16-bit instruction when you do not know the instruction yet.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t op : 2;
     uint16_t : 11;
     uint8_t funct3 : 3;
 } RiscvInstructionOpcodeC_t;
 
+/**
+ * Union for decoding opcode of a compressed instruction.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t op : 2;
@@ -511,6 +492,11 @@ typedef union {
     };
 } RiscvInstructionTypeCDecoderOpcode_u;
 
+/* ===== RiscvEmulatorTypeI.h ===== */
+
+/**
+ * I-type instruction.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
     uint8_t rd : 5;
@@ -529,19 +515,11 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
-    uint8_t rd : 5;
+    uint8_t custom5 : 5;
     uint8_t funct3 : 3;
-    uint8_t rs1 : 5;
-    uint16_t csr : 12;
-} RiscvInstructionTypeICSR_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t opcode : 7;
-    uint8_t rd : 5;
-    uint8_t funct3 : 3;
-    uint8_t imm : 5;
-    uint16_t csr : 12;
-} RiscvInstructionTypeICSRImm_t;
+    uint16_t custom11 : 11;
+    uint16_t funct6 : 6;
+} RiscvInstructionTypeIStystemCustom_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
@@ -568,6 +546,9 @@ typedef struct __attribute__((packed)) {
     uint8_t fm : 4;
 } RiscvInstructionTypeIMiscMemt_t;
 
+/**
+ * Union for combining imm11_5 and funct3 field of R-type instruction.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t funct3 : 3;
@@ -579,6 +560,11 @@ typedef union {
     };
 } RiscvInstructionTypeIDecoderImm11_7Funct3Imm11_7Funct3_u;
 
+/* ===== RiscvEmulatorTypeJ.h ===== */
+
+/**
+ * J-type instruction.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
     uint8_t rd : 5;
@@ -588,6 +574,9 @@ typedef struct __attribute__((packed)) {
     uint8_t imm20 : 1;
 } RiscvInstructionTypeJ_t;
 
+/**
+ * Union for decoding imm field of a J-type instruction.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t : 1;
@@ -602,6 +591,11 @@ typedef union {
     };
 } RiscvInstructionTypeJDecoderImm_u;
 
+/* ===== RiscvEmulatorTypeR.h ===== */
+
+/**
+ * R-type instruction.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
     uint8_t rd : 5;
@@ -611,6 +605,9 @@ typedef struct __attribute__((packed)) {
     uint8_t funct7 : 7;
 } RiscvInstructionTypeR_t;
 
+/**
+ * Union for combining funct3 and funct7 field of R-type instruction.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t funct3 : 3;
@@ -622,6 +619,11 @@ typedef union {
     };
 } RiscvInstructionTypeRDecoderFunct7Funct3_u;
 
+/* ===== RiscvEmulatorTypeS.h ===== */
+
+/**
+ * S-type instruction.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
     uint8_t imm4_0 : 5;
@@ -631,6 +633,9 @@ typedef struct __attribute__((packed)) {
     uint8_t imm11_5 : 7;
 } RiscvInstructionTypeS_t;
 
+/**
+ * Union for decoding imm field of a S-type instruction.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint8_t imm4_0 : 5;
@@ -642,12 +647,20 @@ typedef union {
     };
 } RiscvInstructionTypeSDecoderImm_u;
 
+/* ===== RiscvEmulatorTypeU.h ===== */
+
+/**
+ * U-type instruction.
+ */
 typedef struct __attribute__((packed)) {
     uint8_t opcode : 7;
     uint8_t rd : 5;
     uint32_t imm31_12 : 20;
 } RiscvInstructionTypeU_t;
 
+/**
+ * Union for decoding imm field of a U-type instruction.
+ */
 typedef union {
     struct __attribute__((packed)) {
         uint16_t imm11_0 : 12;
@@ -659,9 +672,16 @@ typedef union {
     };
 } RiscvInstructionTypeUDecoderImm_u;
 
+/**
+ * All the instruction types combined.
+ */
 typedef union {
     uint32_t value;
 
+    /**
+     * Easy access to the opcode of an 32-bit instruction when you do not know the instruction type
+     * yet.
+     */
     struct __attribute__((packed)) {
         uint8_t opcode : 7;
     };
@@ -677,6 +697,7 @@ typedef union {
     RiscvInstructionTypeCILui_t cilui;
     RiscvInstructionTypeCILwsp_t cilwsp;
     RiscvInstructionTypeCSS_t csstype;
+    RiscvInstructionTypeCSSFsdsp_t cssfsdsp;
     RiscvInstructionTypeCIW_t ciwtype;
     RiscvInstructionTypeCL_t cltype;
     RiscvInstructionTypeCS_t cstype;
@@ -684,79 +705,252 @@ typedef union {
     RiscvInstructionTypeCB_t cbtype;
     RiscvInstructionTypeCBImm_t cbimm;
     RiscvInstructionTypeCJ_t cjtype;
+
     RiscvInstructionTypeR_t rtype;
     RiscvInstructionTypeI_t itype;
-    RiscvInstructionTypeICSR_t itypecsr;
-    RiscvInstructionTypeICSRImm_t itypecsrimm;
     RiscvInstructionTypeIMiscMemt_t itypemiscmem;
     RiscvInstructionTypeIShiftByConstant_t itypeshiftbyconstant;
     RiscvInstructionTypeIStystem_t itypesystem;
+    RiscvInstructionTypeIStystemCustom_t itypesystemcustom;
     RiscvInstructionTypeS_t stype;
     RiscvInstructionTypeB_t btype;
     RiscvInstructionTypeU_t utype;
     RiscvInstructionTypeJ_t jtype;
 } RiscvInstruction_u;
 
+/* ===== RiscvEmulatorTypeRegister.h ===== */
+
+/**
+ * Union of all the ways a register can be accessed.
+ */
 typedef union {
+    /**
+     * Symbolic registers.
+     */
     struct {
+        /**
+         * Always zero.
+         */
         uint32_t Zero;
+
+        /**
+         * Return address.
+         */
         uint32_t ra;
+
+        /**
+         * Stack pointer.
+         */
         uint32_t sp;
+
+        /**
+         * Global pointer.
+         */
         uint32_t gp;
+
+        /**
+         * Thread pointer.
+         */
         uint32_t tp;
+
+        /**
+         * Temporary or alternate link register.
+         */
         uint32_t t0;
+
+        /**
+         * Temporary register.
+         */
         uint32_t t1;
+
+        /**
+         * Temporary register.
+         */
         uint32_t t2;
+
+        /**
+         * Saved register or frame pointer.
+         */
         uint32_t s0_fp;
+
+        /**
+         * Saved register.
+         */
         uint32_t s1;
+
+        /**
+         * Function argument or return value.
+         */
         uint32_t a0;
+
+        /**
+         * Function argument or return value.
+         */
         uint32_t a1;
+
+        /**
+         * Function argument.
+         */
         uint32_t a2;
+
+        /**
+         * Function argument.
+         */
         uint32_t a3;
+
+        /**
+         * Function argument.
+         */
         uint32_t a4;
+
+        /**
+         * Function argument.
+         */
         uint32_t a5;
+
+        /**
+         * Function argument.
+         */
         uint32_t a6;
+
+        /**
+         * Function argument.
+         */
         uint32_t a7;
+
+        /**
+         * Saved register.
+         */
         uint32_t s2;
+
+        /**
+         * Saved register.
+         */
         uint32_t s3;
+
+        /**
+         * Saved register.
+         */
         uint32_t s4;
+
+        /**
+         * Saved register.
+         */
         uint32_t s5;
+
+        /**
+         * Saved register.
+         */
         uint32_t s6;
+
+        /**
+         * Saved register.
+         */
         uint32_t s7;
+
+        /**
+         * Saved register.
+         */
         uint32_t s8;
+
+        /**
+         * Saved register.
+         */
         uint32_t s9;
+
+        /**
+         * Saved register.
+         */
         uint32_t s10;
+
+        /**
+         * Saved register.
+         */
         uint32_t s11;
+
+        /**
+         * Temporary register.
+         */
         uint32_t t3;
+
+        /**
+         * Temporary register.
+         */
         uint32_t t4;
+
+        /**
+         * Temporary register.
+         */
         uint32_t t5;
+
+        /**
+         * Temporary register.
+         */
         uint32_t t6;
     };
+
+    /**
+     * Named registers.
+     */
     uint32_t x[32];
 } RiscvRegister_u;
 
+/**
+ * Riscv emulator state flags.
+ */
 typedef union {
     struct {
         uint8_t illegalinstruction : 1;
-        uint8_t instructionaddressmisaligned : 1;
-        uint8_t breakpoint : 1;
-        uint8_t loadaddressmisaligned : 1;
-        uint8_t storeaddressmisaligned : 1;
-        uint8_t environmentcallfrommmode : 1;
     };
+
     uint8_t value;
 } RiscvEmulatorTrapFlag_u;
 
+/**
+ * Riscv emulator state.
+ */
 struct RiscvEmulatorState {
     RiscvEmulatorTrapFlag_u trapflag;
     uint32_t programcounter;
     uint32_t programcounternext;
     RiscvInstruction_u instruction;
     RiscvRegister_u reg;
-    RiscvCSR_t csr;
 };
 
+/* ===== RiscvEmulatorTypeHook.h ===== */
+
+/**
+ * Generic hook function context.
+ */
+typedef struct {
+    uint8_t hook;
+    const char *instruction;
+    uint8_t rs1num;
+    const void *rs1;
+    uint8_t rs2num;
+    const void *rs2;
+    uint8_t rdnum;
+    const void *rd;
+    uint16_t csrnum;
+    const void *csr;
+    char *immname;
+    uint8_t immlength;
+    uint8_t immissigned;
+    uint32_t imm;
+    uint32_t upperimmediate;
+    uint32_t memorylocation;
+    uint8_t length;
+} RiscvEmulatorHookContext_t;
+
+/* ===== RiscvEmulatorDefine.h ===== */
+
+#define IALIGN 16
+
+#define IO_ORIGIN 0x02000000
+#define UART_ORIGIN 0x10000000
 #define ROM_ORIGIN 0x20000000
+
+/* ===== RiscvEmulatorDefineBType.h ===== */
 
 // B-type, branch.
 
@@ -770,14 +964,9 @@ struct RiscvEmulatorState {
 #define BRANCH_YES 0
 #define BRANCH_NO 1
 
-// Machine cause exception code.
+/* ===== RiscvEmulatorDefineCSRMachineTrapHandling.h ===== */
 
-#define MCAUSE_EXCEPTION_CODE_INSTRUCTION_ADDRESS_MISALIGNED 0
-#define MCAUSE_EXCEPTION_CODE_ILLEGAL_INSTRUCTION 2
-#define MCAUSE_EXCEPTION_CODE_BREAKPOINT 3
-#define MCAUSE_EXCEPTION_CODE_LOAD_ADDRESS_MISALIGNED 4
-#define MCAUSE_EXCEPTION_CODE_STORE_ADDRESS_MISALIGNED 6
-#define MCAUSE_EXCEPTION_CODE_ENVIRONMENT_CALL_FROM_MMODE 11
+/* ===== RiscvEmulatorDefineCType.h ===== */
 
 // Compressed Register.
 
@@ -796,6 +985,14 @@ struct RiscvEmulatorState {
 #define FUNCT3_FUNCT2_SRLI 0b10000
 #define FUNCT3_FUNCT2_SRAI 0b10001
 #define FUNCT3_FUNCT2_ANDI 0b10010
+
+/* ===== RiscvEmulatorDefineHook.h ===== */
+
+#define HOOK_UNKNOWN 0
+#define HOOK_BEGIN 1
+#define HOOK_END 2
+
+/* ===== RiscvEmulatorDefineIType.h ===== */
 
 // I-type, register immediate.
 
@@ -821,28 +1018,33 @@ struct RiscvEmulatorState {
 #define FUNCT3_LOAD_LBU 0b100
 #define FUNCT3_LOAD_LHU 0b101
 
-#define FUNCT3_CSR_CSRRW 0b001
-#define FUNCT3_CSR_CSRRS 0b010
-#define FUNCT3_CSR_CSRRC 0b011
-#define FUNCT3_CSR_CSRRWI 0b101
-#define FUNCT3_CSR_CSRRSI 0b110
-#define FUNCT3_CSR_CSRRCI 0b111
-
 #define FUNCT12_ECALL 0b000000000000
 #define FUNCT12_EBREAK 0b000000000001
+#define FUNCT12_URET 0b000000000010
+#define FUNCT12_SRET 0b000100000010
 #define FUNCT12_MRET 0b001100000010
+#define FUNCT12_MNRET 0b011100000010
+#define FUNCT12_WFI 0b000100000101
 
 #define FUNCT3_FENCE 0b000
 
 #define FUNCT3_FENCEI 0b001
+/* ===== RiscvEmulatorDefineOpcode.h ===== */
 
+#define OPCODE16_QUADRANT_0 0b00
+#define OPCODE16_QUADRANT_1 0b01
+#define OPCODE16_QUADRANT_2 0b10
 #define OPCODE16_QUADRANT_INVALID 0b11
 
 // 16-bit opcodes when RV32. Bits [15:13][1:0].
 
 #define OPCODE16_ADDI4SPN 0b00000
+#define OPCODE16_FLD 0b00100
 #define OPCODE16_LW 0b01000
+#define OPCODE16_FLW 0b01100
+#define OPCODE16_FSD 0b10100
 #define OPCODE16_SW 0b11000
+#define OPCODE16_FSW 0b11100
 #define OPCODE16_ADDI 0b00001
 #define OPCODE16_JAL 0b00101
 #define OPCODE16_LI 0b01001
@@ -852,23 +1054,45 @@ struct RiscvEmulatorState {
 #define OPCODE16_BEQZ 0b11001
 #define OPCODE16_BNEZ 0b11101
 #define OPCODE16_SLLI 0b00010
+#define OPCODE16_FLDSP 0b00110
 #define OPCODE16_LWSP 0b01010
+#define OPCODE16_FLWSP 0b01110
 #define OPCODE16_JALR_MV_ADD 0b10010
+#define OPCODE16_FSDSP 0b10110
 #define OPCODE16_SWSP 0b11010
+#define OPCODE16_FSWSP 0b11110
 
 // 32-bit opcodes. Bits [6:0].
 
 #define OPCODE32_LOAD 0b0000011
+#define OPCODE32_LOADFP 0b0000111
+#define OPCODE32_CUSTOM0 0b0001011
 #define OPCODE32_MISCMEM 0b0001111
 #define OPCODE32_IMMEDIATE 0b0010011
 #define OPCODE32_ADDUPPERIMMEDIATE2PC 0b0010111
 #define OPCODE32_STORE 0b0100011
+#define OPCODE32_STOREFP 0b0100111
+#define OPCODE32_CUSTOM1 0b0101011
+#define OPCODE32_ATOMICMEMORYOPERATION 0b0101111
 #define OPCODE32_OPERATION 0b0110011
 #define OPCODE32_LOADUPPERIMMEDIATE 0b0110111
+#define OPCODE32_OPERATIONFPADD 0b1000011
+#define OPCODE32_OPERATIONFPSUB 0b1000111
+#define OPCODE32_OPERATIONFPFNMSUB 0b1001011
+#define OPCODE32_OPERATIONFPFNMADD 0b1001111
+#define OPCODE32_OPERATIONFP 0b1010011
+#define OPCODE32_OPERATIONVECTOR 0b1010111
+#define OPCODE32_CUSTOM2 0b1011011
 #define OPCODE32_BRANCH 0b1100011
 #define OPCODE32_JUMPANDLINKREGISTER 0b1100111
+#define OPCODE32_RESERVED_6B 0b1101011
 #define OPCODE32_JUMPANDLINK 0b1101111
 #define OPCODE32_SYSTEM 0b1110011
+#define OPCODE32_PACKED_SIMD 0b1110111
+#define OPCODE32_CUSTOM3 0b1111011
+#define OPCODE32_ILLEGAL 0b1111111
+
+/* ===== RiscvEmulatorDefineRType.h ===== */
 
 // R-type, register register.
 
@@ -892,41 +1116,355 @@ struct RiscvEmulatorState {
 #define FUNCT7_FUNCT3_OPERATION_REM 0b0000001110
 #define FUNCT7_FUNCT3_OPERATION_REMU 0b0000001111
 
+/* ===== RiscvEmulatorDefineSType.h ===== */
+
 // S-type, store.
 
 #define FUNCT3_STORE_SB 0b000
 #define FUNCT3_STORE_SH 0b001
 #define FUNCT3_STORE_SW 0b010
 
-static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *state, const uint16_t csr) {
-    void *address = 0;
-    switch (csr) {
-    case 0xF14: address = &state->csr.mhartid; break;
-    case 0x300: address = &state->csr.mstatus; break;
-    case 0x302: address = &state->csr.medeleg; break;
-    case 0x303: address = &state->csr.mideleg; break;
-    case 0x304: address = &state->csr.mie; break;
-    case 0x305: address = &state->csr.mtvec; break;
-    case 0x310: address = &state->csr.mstatush; break;
-    case 0x340: address = &state->csr.mscratch; break;
-    case 0x341: address = &state->csr.mepc; break;
-    case 0x342: address = &state->csr.mcause; break;
-    case 0x343: address = &state->csr.mtval; break;
-    case 0x344: address = &state->csr.mip; break;
-    case 0x3A0: address = &state->csr.pmpcfg0; break;
-    case 0x3B0: address = &state->csr.pmpaddr0; break;
-    case 0x744: address = &state->csr.mnstatus; break;
-    case 0x180: address = &state->csr.satp; break;
-    default:
-        address = RiscvEmulatorGetUnknownCSR(state, csr);
-        if (address == 0) {
-            state->trapflag.illegalinstruction = 1;
-            RiscvEmulatorUnknownCSR(state);
-        }
-    }
-    return address;
-}
+/* ===== RiscvEmulatorExtension.h ===== */
 
+/* ===== RiscvEmulatorExtensionA.h ===== */
+
+/* ===== RiscvEmulatorExtensionC.h ===== */
+
+/**
+ * rd = (*sp + nzuimm)
+ */
+
+/**
+ * Load word from memory to rd.
+ */
+
+/**
+ * Store word in rs2 to memory.
+ */
+
+/**
+ * rd = rd + nzimm
+ */
+
+/**
+ * pc += offset
+ */
+
+/**
+ * pc += rs1
+ */
+
+/**
+ * pc += offset
+ */
+
+/**
+ * pc += rs1
+ */
+
+/**
+ * Branch if rs1 == 0
+ */
+
+/**
+ * Branch if rs1 != 0
+ */
+
+/**
+ * Logical shift left: rd = rs1 << shamt
+ */
+
+/**
+ * rd = imm
+ */
+
+/**
+ * sp += imm*16
+ */
+
+/**
+ * Load upper with immediate.
+ */
+
+/**
+ * Logical shift right: rd = rd >> shamt
+ */
+
+/**
+ * Arithmetic shift right: rd = rs1 >> shamt
+ */
+
+/**
+ * rd = rd & imm.
+ */
+
+/**
+ * rd = rd - rs2.
+ */
+
+/**
+ * Exclusive or: rd = rd ^ rs2
+ */
+
+/**
+ * Exclusive or: rd = rd | rs2
+ */
+
+/**
+ * Exclusive or: rd = rd & rs2
+ */
+
+/**
+ * Load memorylocation (*sp + offset) into rd.
+ */
+
+/**
+ * rd = rs2
+ */
+
+/**
+ * Cause control to be transferred back to a debugging environment.
+ */
+
+/**
+ * rd = rd + rs2
+ */
+
+/**
+ * Store rs2 to memorylocation (*sp + offset)
+ */
+
+/**
+ * Process compressed opcodes.
+ */
+
+/* ===== RiscvEmulatorExtensionI.h ===== */
+
+/* ===== RiscvEmulatorExtensionM.h ===== */
+
+/**
+ * Multiply signed or unsigned.
+ */
+
+/**
+ * Multiply signed, return 32 bit MSB of resulting 64-bit value.
+ */
+
+/**
+ * Multiply signed rs1 and unsigned rs2, return 32 bit MSB of resulting unsigned 64-bit value.
+ */
+
+/**
+ * Multiply unsigned, return 32 bit MSB of resulting unsigned 64-bit value.
+ */
+
+/**
+ * Divide signed.
+ */
+
+/**
+ * Divide unsigned.
+ */
+
+/**
+ * Remainder signed.
+ */
+
+/**
+ * Remainder unsigned.
+ */
+
+/* ===== RiscvEmulatorExtensionZba.h ===== */
+
+/* ===== RiscvEmulatorExtensionZbb.h ===== */
+
+/* ===== RiscvEmulatorExtensionZbc.h ===== */
+
+/* ===== RiscvEmulatorExtensionZbs.h ===== */
+
+/* ===== RiscvEmulatorExtensionZicsr.h ===== */
+
+/**
+ * Jump and link register.
+ */
+
+/**
+ * Process JALR opcode.
+ */
+
+/**
+ * Add: rd = rs1 + rs2
+ */
+
+/**
+ * Add: rd = rs1 + imm
+ */
+
+/**
+ * Subtract: rd = rs1 - rs2
+ */
+
+/**
+ * Logical shift left: rd = rs1 << (rs2 & 0b11111)
+ */
+
+/**
+ * Logical shift left: rd = rs1 << (shamt & 0b11111)
+ */
+
+/**
+ * Signed compare: rd = (rs1 < rs2)
+ */
+
+/**
+ * Signed compare: rd = (rs1 < imm)
+ */
+
+/**
+ * Unsigned compare: rd = (rs1 < rs2)
+ */
+
+/**
+ * Unsigned compare: rd = (rs1 < imm)
+ */
+
+/**
+ * Exclusive or: rd = rs1 ^ rs2
+ */
+
+/**
+ * Exclusive or: rd = rs1 ^ imm
+ */
+
+/**
+ * Logical shift right: rd = rs1 >> (rs2 & 0b11111)
+ */
+
+/**
+ * Logical shift right: rd = rs1 >> (shamt & 0b11111)
+ */
+
+/**
+ * Arithmetic shift right: rd = rs1 >> (rs2 & 0b11111)
+ */
+
+/**
+ * Arithmetic shift right: rd = rs1 >> (shamt & 0b11111)
+ */
+
+/**
+ * Boolean or: rd = rs1 | rs2
+ */
+
+/**
+ * Boolean or: rd = rs1 | imm
+ */
+
+/**
+ * Boolean and: rd = rs1 & rs2
+ */
+
+/**
+ * Boolean and: rd = rs1 & imm
+ */
+
+/**
+ * Process operation opcodes.
+ */
+
+/**
+ * Process immediate opcodes.
+ */
+
+/**
+ * Process load opcodes.
+ */
+
+/**
+ * Process store opcodes.
+ */
+
+/**
+ * Branch if equal.
+ */
+
+/**
+ * Branch if not equal.
+ */
+
+/**
+ * Branch if greater than or equal.
+ */
+
+/**
+ * Branch if greater than or equal unsigned.
+ */
+
+/**
+ * Branch if less than.
+ */
+
+/**
+ * Branch if less than unsigned.
+ */
+
+/**
+ * Process branch opcodes.
+ */
+
+/**
+ * Add upper immediate to program counter.
+ */
+
+/**
+ * Load upper with immediate.
+ */
+
+/**
+ * Jump and link.
+ */
+
+/**
+ * Make a service request to the execution environment.
+ */
+
+/**
+ * Cause control to be transferred back to a debugging environment.
+ */
+
+/**
+ * Process system opcodes.
+ */
+
+/**
+ * Excutes the fence instuction.
+ *
+ * This does nothing in this emulator because all memory access is always completely processed.
+ */
+
+/**
+ * Excutes the fencei instuction.
+ *
+ * This does nothing in this emulator because all memory access is always completely processed.
+ */
+
+/**
+ * Process miscellaneous memory opcodes.
+ */
+
+/* ===== RiscvEmulatorTrap.h ===== */
+
+/**
+ * Handle a trap.
+ */
+
+/* ===== RiscvEmulator.h ===== */
+
+/**
+ * Initialize the emulator.
+ *
+ * @param ram_length The size in bytes of the RAM available.
+ */
 void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp) {
     // Initialize stack pointer.
     state->reg.sp = initial_sp;
@@ -938,26 +1476,30 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp) {
     // Initialize X0.
     state->reg.Zero = 0;
 
-    // Initialize CSR.
-    memset(&state->csr, 0, sizeof(state->csr));
-
     // Initialize trap flags.
     state->trapflag.value = 0;
 }
 
+/**
+ * Call this function repeatedly to execute the emulator one instruction at a time.
+ */
 void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
+
     state->programcounter = state->programcounternext;
+
     uint8_t instructionlength = 32;
 
     // Read 16 bits.
     state->instruction.H = 0;
     RiscvEmulatorLoad(state->programcounter, &state->instruction.L, sizeof(state->instruction.L));
+
     state->programcounternext += sizeof(state->instruction.L);
 
     // Read another 16 bits when this is a 32-bit instruction.
     if (state->instruction.copcode.op == OPCODE16_QUADRANT_INVALID) {
         RiscvEmulatorLoad(state->programcounternext, &state->instruction.H,
                           sizeof(state->instruction.L));
+
         state->programcounternext += sizeof(state->instruction.L);
     } else {
         instructionlength = 16;
@@ -969,6 +1511,7 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
             decoderOpcode16.funct3 = state->instruction.copcode.funct3;
             decoderOpcode16.op = state->instruction.copcode.op;
             uint8_t opfunct3 = decoderOpcode16.opfunct3;
+
             uint8_t funct3_funct2 = 0;
             uint8_t funct6_funct2 = 0;
             int8_t rdnum = -1;
@@ -981,37 +1524,43 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
             void *sp = &state->reg.sp;
             void *ra = &state->reg.ra;
 
+            // Whenever possible, combine decoding instruction bits for multiple instructions.
             switch (opfunct3) {
             case OPCODE16_ADDI4SPN: {
-                RiscvInstructionTypeCIWDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm2 = state->instruction.ciwtype.imm2;
-                immdecoder.bit.imm3 = state->instruction.ciwtype.imm3;
-                immdecoder.bit.imm5_4 = state->instruction.ciwtype.imm5_4;
-                immdecoder.bit.imm9_6 = state->instruction.ciwtype.imm9_6;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCIWDecoderImm_u RiscvInstructionTypeCIWDecoderImm = {0};
+                RiscvInstructionTypeCIWDecoderImm.bit.imm2 = state->instruction.ciwtype.imm2;
+                RiscvInstructionTypeCIWDecoderImm.bit.imm3 = state->instruction.ciwtype.imm3;
+                RiscvInstructionTypeCIWDecoderImm.bit.imm5_4 = state->instruction.ciwtype.imm5_4;
+                RiscvInstructionTypeCIWDecoderImm.bit.imm9_6 = state->instruction.ciwtype.imm9_6;
+                imm = RiscvInstructionTypeCIWDecoderImm.imm;
                 rdnum = state->instruction.ciwtype.rdp + 8;
                 break;
             }
             case OPCODE16_MISCALU: {
-                RiscvInstructionTypeCBDecoderFunct3Funct2_u funct = {0};
-                funct.funct3 = state->instruction.cbimm.funct3;
-                funct.funct2 = state->instruction.cbimm.funct2;
-                funct3_funct2 = funct.funct3_funct2;
+                RiscvInstructionTypeCBDecoderFunct3Funct2_u
+                    RiscvInstructionTypeCBDecoderFunct3Funct2 = {0};
+                RiscvInstructionTypeCBDecoderFunct3Funct2.funct3 = state->instruction.cbimm.funct3;
+                RiscvInstructionTypeCBDecoderFunct3Funct2.funct2 = state->instruction.cbimm.funct2;
+                funct3_funct2 = RiscvInstructionTypeCBDecoderFunct3Funct2.funct3_funct2;
+
+                RiscvInstructionTypeCBImmDecoderImm_u RiscvInstructionTypeCBImmDecoderImm = {0};
 
                 if (funct3_funct2 == FUNCT3_FUNCT2_SRLI || funct3_funct2 == FUNCT3_FUNCT2_SRAI ||
                     funct3_funct2 == FUNCT3_FUNCT2_ANDI) {
-                    RiscvInstructionTypeCBImmDecoderImm_u immdecoder = {0};
-                    immdecoder.bit.imm4_0 = state->instruction.cbimm.imm4_0;
-                    immdecoder.bit.imm5 = state->instruction.cbimm.imm5;
-                    imm = immdecoder.imm;
+                    RiscvInstructionTypeCBImmDecoderImm.bit.imm4_0 =
+                        state->instruction.cbimm.imm4_0;
+                    RiscvInstructionTypeCBImmDecoderImm.bit.imm5 = state->instruction.cbimm.imm5;
+                    imm = RiscvInstructionTypeCBImmDecoderImm.imm;
+
                     rdnum = state->instruction.cbimm.rdp + 8;
                     break;
                 }
 
-                RiscvInstructionTypeCADecoderFunct6Funct2_u catfunct = {0};
-                catfunct.funct6 = state->instruction.catype.funct6;
-                catfunct.funct2 = state->instruction.catype.funct2;
-                funct6_funct2 = catfunct.funct6_funct2;
+                RiscvInstructionTypeCADecoderFunct6Funct2_u
+                    RiscvInstructionTypeCADecoderFunct6Funct2 = {0};
+                RiscvInstructionTypeCADecoderFunct6Funct2.funct6 = state->instruction.catype.funct6;
+                RiscvInstructionTypeCADecoderFunct6Funct2.funct2 = state->instruction.catype.funct2;
+                funct6_funct2 = RiscvInstructionTypeCADecoderFunct6Funct2.funct6_funct2;
 
                 if (funct6_funct2 == FUNCT6_FUNCT2_SUB || funct6_funct2 == FUNCT6_FUNCT2_XOR ||
                     funct6_funct2 == FUNCT6_FUNCT2_OR || funct6_funct2 == FUNCT6_FUNCT2_AND) {
@@ -1023,186 +1572,223 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
             }
             case OPCODE16_BEQZ:
             case OPCODE16_BNEZ: {
-                RiscvInstructionTypeCBDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm2_1 = state->instruction.cbtype.imm2_1;
-                immdecoder.bit.imm4_3 = state->instruction.cbtype.imm4_3;
-                immdecoder.bit.imm5 = state->instruction.cbtype.imm5;
-                immdecoder.bit.imm7_6 = state->instruction.cbtype.imm7_6;
-                immdecoder.bit.imm8 = state->instruction.cbtype.imm8;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCBDecoderImm_u RiscvInstructionTypeCBDecoderImm = {0};
+                RiscvInstructionTypeCBDecoderImm.bit.imm2_1 = state->instruction.cbtype.imm2_1;
+                RiscvInstructionTypeCBDecoderImm.bit.imm4_3 = state->instruction.cbtype.imm4_3;
+                RiscvInstructionTypeCBDecoderImm.bit.imm5 = state->instruction.cbtype.imm5;
+                RiscvInstructionTypeCBDecoderImm.bit.imm7_6 = state->instruction.cbtype.imm7_6;
+                RiscvInstructionTypeCBDecoderImm.bit.imm8 = state->instruction.cbtype.imm8;
+                imm = RiscvInstructionTypeCBDecoderImm.imm;
                 rs1num = state->instruction.cbtype.rs1p + 8;
                 break;
             }
             case OPCODE16_ADDI:
             case OPCODE16_LI:
             case OPCODE16_SLLI: {
-                RiscvInstructionTypeCIDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm4_0 = state->instruction.citype.imm4_0;
-                immdecoder.bit.imm5 = state->instruction.citype.imm5;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCIDecoderImm_u RiscvInstructionTypeCIDecoderImm = {0};
+                RiscvInstructionTypeCIDecoderImm.bit.imm4_0 = state->instruction.citype.imm4_0;
+                RiscvInstructionTypeCIDecoderImm.bit.imm5 = state->instruction.citype.imm5;
+                imm = RiscvInstructionTypeCIDecoderImm.imm;
                 rdnum = state->instruction.citype.rd;
                 break;
             }
             case OPCODE16_JAL:
             case OPCODE16_J: {
-                RiscvInstructionTypeCJDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm3_1 = state->instruction.cjtype.imm3_1;
-                immdecoder.bit.imm4 = state->instruction.cjtype.imm4;
-                immdecoder.bit.imm5 = state->instruction.cjtype.imm5;
-                immdecoder.bit.imm6 = state->instruction.cjtype.imm6;
-                immdecoder.bit.imm7 = state->instruction.cjtype.imm7;
-                immdecoder.bit.imm9_8 = state->instruction.cjtype.imm9_8;
-                immdecoder.bit.imm10 = state->instruction.cjtype.imm10;
-                immdecoder.bit.imm11 = state->instruction.cjtype.imm11;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCJDecoderImm_u RiscvInstructionTypeCJDecoderImm = {0};
+                RiscvInstructionTypeCJDecoderImm.bit.imm3_1 = state->instruction.cjtype.imm3_1;
+                RiscvInstructionTypeCJDecoderImm.bit.imm4 = state->instruction.cjtype.imm4;
+                RiscvInstructionTypeCJDecoderImm.bit.imm5 = state->instruction.cjtype.imm5;
+                RiscvInstructionTypeCJDecoderImm.bit.imm6 = state->instruction.cjtype.imm6;
+                RiscvInstructionTypeCJDecoderImm.bit.imm7 = state->instruction.cjtype.imm7;
+                RiscvInstructionTypeCJDecoderImm.bit.imm9_8 = state->instruction.cjtype.imm9_8;
+                RiscvInstructionTypeCJDecoderImm.bit.imm10 = state->instruction.cjtype.imm10;
+                RiscvInstructionTypeCJDecoderImm.bit.imm11 = state->instruction.cjtype.imm11;
+                imm = RiscvInstructionTypeCJDecoderImm.imm;
                 break;
             }
             case OPCODE16_LW: {
-                RiscvInstructionTypeCLDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm2 = state->instruction.cltype.imm2;
-                immdecoder.bit.imm5_3 = state->instruction.cltype.imm5_3;
-                immdecoder.bit.imm6 = state->instruction.cltype.imm6;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCLDecoderImm_u RiscvInstructionTypeCLDecoderImm = {0};
+                RiscvInstructionTypeCLDecoderImm.bit.imm2 = state->instruction.cltype.imm2;
+                RiscvInstructionTypeCLDecoderImm.bit.imm5_3 = state->instruction.cltype.imm5_3;
+                RiscvInstructionTypeCLDecoderImm.bit.imm6 = state->instruction.cltype.imm6;
+                imm = RiscvInstructionTypeCLDecoderImm.imm;
                 rs1num = state->instruction.cltype.rs1p + 8;
                 rdnum = state->instruction.cltype.rdp + 8;
                 break;
             }
             case OPCODE16_SW: {
-                RiscvInstructionTypeCSDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm2 = state->instruction.cstype.imm2;
-                immdecoder.bit.imm5_3 = state->instruction.cstype.imm5_3;
-                immdecoder.bit.imm6 = state->instruction.cstype.imm6;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCSDecoderImm_u RiscvInstructionTypeCSDecoderImm = {0};
+                RiscvInstructionTypeCSDecoderImm.bit.imm2 = state->instruction.cstype.imm2;
+                RiscvInstructionTypeCSDecoderImm.bit.imm5_3 = state->instruction.cstype.imm5_3;
+                RiscvInstructionTypeCSDecoderImm.bit.imm6 = state->instruction.cstype.imm6;
+                imm = RiscvInstructionTypeCSDecoderImm.imm;
                 rs1num = state->instruction.cstype.rs1p + 8;
                 rs2num = state->instruction.cstype.rs2p + 8;
                 break;
             }
             case OPCODE16_LWSP: {
-                RiscvInstructionTypeCILwspDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm4_2 = state->instruction.cilwsp.imm4_2;
-                immdecoder.bit.imm5 = state->instruction.cilwsp.imm5;
-                immdecoder.bit.imm7_6 = state->instruction.cilwsp.imm7_6;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCILwspDecoderImm_u RiscvInstructionTypeCILwspDecoderImm = {0};
+                RiscvInstructionTypeCILwspDecoderImm.bit.imm4_2 = state->instruction.cilwsp.imm4_2;
+                RiscvInstructionTypeCILwspDecoderImm.bit.imm5 = state->instruction.cilwsp.imm5;
+                RiscvInstructionTypeCILwspDecoderImm.bit.imm7_6 = state->instruction.cilwsp.imm7_6;
+                imm = RiscvInstructionTypeCILwspDecoderImm.imm;
                 rdnum = state->instruction.cilwsp.rd;
                 break;
             }
             case OPCODE16_SWSP: {
-                RiscvInstructionTypeCSSDecoderImm_u immdecoder = {0};
-                immdecoder.bit.imm5_2 = state->instruction.csstype.imm5_2;
-                immdecoder.bit.imm7_6 = state->instruction.csstype.imm7_6;
-                imm = immdecoder.imm;
+                RiscvInstructionTypeCSSDecoderImm_u RiscvInstructionTypeCSSDecoderImm = {0};
+                RiscvInstructionTypeCSSDecoderImm.bit.imm5_2 = state->instruction.csstype.imm5_2;
+                RiscvInstructionTypeCSSDecoderImm.bit.imm7_6 = state->instruction.csstype.imm7_6;
+                imm = RiscvInstructionTypeCSSDecoderImm.imm;
                 rs2num = state->instruction.csstype.rs2;
                 break;
             }
             }
 
-            if (rdnum >= 0) rd = &state->reg.x[rdnum];
-            if (rs1num >= 0) rs1 = &state->reg.x[rs1num];
-            if (rs2num >= 0) rs2 = &state->reg.x[rs2num];
+            if (rdnum >= 0) { rd = &state->reg.x[rdnum]; }
+            if (rs1num >= 0) { rs1 = &state->reg.x[rs1num]; }
+            if (rs2num >= 0) { rs2 = &state->reg.x[rs2num]; }
 
             switch (opfunct3) {
             case OPCODE16_ADDI4SPN:
                 if (imm != 0) {
-                    if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)sp + (uint16_t)imm;
+                    if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)sp + (uint16_t)imm; }
                 } else {
                     state->trapflag.illegalinstruction = 1;
                 }
                 break;
             case OPCODE16_LW: {
-                uint32_t memorylocation = *(int32_t *)rs1 + (uint8_t)imm;
-                if (state->trapflag.storeaddressmisaligned == 1) goto __inl_1;
-                RiscvEmulatorLoad(memorylocation, rd, sizeof(uint32_t));
 
-            __inl_1:;
+                uint8_t length = sizeof(uint32_t);
+
+                uint32_t memorylocation = *(int32_t *)rs1 + (uint8_t)imm;
+
+                RiscvEmulatorLoad(memorylocation, rd, length);
             } break;
             case OPCODE16_SW: {
-                uint32_t memorylocation = *(int32_t *)rs1 + (uint8_t)imm;
-                if (state->trapflag.storeaddressmisaligned == 1) goto __inl_2;
-                RiscvEmulatorStore(memorylocation, rs2, sizeof(uint32_t));
 
-            __inl_2:;
+                uint8_t length = sizeof(uint32_t);
+
+                uint32_t memorylocation = *(int32_t *)rs1 + (uint8_t)imm;
+
+                RiscvEmulatorStore(memorylocation, rs2, length);
             } break;
             case OPCODE16_ADDI:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rd + (int8_t)imm;
+                if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rd + (int8_t)imm; }
                 break;
             case OPCODE16_JAL: {
+
                 *(uint32_t *)ra = state->programcounter + 2;
                 state->programcounternext = state->programcounter + (int16_t)imm;
             } break;
             case OPCODE16_LI:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = (int8_t)imm;
+                if (rdnum != 0) { *(int32_t *)rd = (int8_t)imm; }
                 break;
             case OPCODE16_LUI_ADDI16SP: {
                 rdnum = state->instruction.cilui.rd;
                 rd = &state->reg.x[rdnum];
+
                 if (rdnum == 2) {
                     {
+
                         RiscvInstructionTypeCIAddi16spDecoderImm_u immdecoder = {0};
                         immdecoder.bit.imm4 = state->instruction.ciaddi16sp.imm4;
                         immdecoder.bit.imm5 = state->instruction.ciaddi16sp.imm5;
                         immdecoder.bit.imm6 = state->instruction.ciaddi16sp.imm6;
                         immdecoder.bit.imm8_7 = state->instruction.ciaddi16sp.imm8_7;
                         immdecoder.bit.imm9 = state->instruction.ciaddi16sp.imm9;
+
                         int16_t nzimm = immdecoder.imm;
-                        if (nzimm == 0) goto __inl_3;
+
+                        if (nzimm == 0) { goto __inl_1; }
+
                         *(int32_t *)rd += nzimm;
 
-                    __inl_3:;
+                    __inl_1:;
                     }
                 } else {
                     {
+
                         RiscvInstructionTypeCILuiDecoderImm_u immdecoder = {0};
                         immdecoder.bit.imm16_12 = state->instruction.cilui.imm16_12;
                         immdecoder.bit.imm17 = state->instruction.cilui.imm17;
                         int32_t nzimm = immdecoder.imm;
 
-                        if ((uint8_t)rdnum == 0) goto __inl_4;
+                        if (rdnum == 0) { goto __inl_2; }
+
                         *(int32_t *)rd = nzimm;
 
-                    __inl_4:;
+                    __inl_2:;
                     }
                 }
                 break;
             }
             case OPCODE16_MISCALU:
                 if (funct3_funct2 == FUNCT3_FUNCT2_SRLI) {
-                    if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)rd >> (uint8_t)imm;
-                } else if (funct3_funct2 == FUNCT3_FUNCT2_SRAI) {
-                    if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rd >> (uint8_t)imm;
-                } else if (funct3_funct2 == FUNCT3_FUNCT2_ANDI) {
-                    if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rd & (int8_t)imm;
-                } else if (funct6_funct2 == FUNCT6_FUNCT2_SUB) {
-                    if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rd - *(int32_t *)rs2;
-                } else if (funct6_funct2 == FUNCT6_FUNCT2_XOR) {
-                    if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)rd ^ *(uint32_t *)rs2;
-                } else if (funct6_funct2 == FUNCT6_FUNCT2_OR) {
-                    if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)rd | *(uint32_t *)rs2;
-                } else if (funct6_funct2 == FUNCT6_FUNCT2_AND) {
-                    if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)rd & *(uint32_t *)rs2;
-                } else {
-                    state->trapflag.illegalinstruction = 1;
+                    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)rd >> (uint8_t)imm; }
+                    break;
                 }
+
+                if (funct3_funct2 == FUNCT3_FUNCT2_SRAI) {
+                    if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rd >> (uint8_t)imm; }
+                    break;
+                }
+
+                if (funct3_funct2 == FUNCT3_FUNCT2_ANDI) {
+                    if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rd & (int8_t)imm; }
+                    break;
+                }
+
+                if (funct6_funct2 == FUNCT6_FUNCT2_SUB) {
+                    if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rd - *(int32_t *)rs2; }
+                    break;
+                }
+
+                if (funct6_funct2 == FUNCT6_FUNCT2_XOR) {
+                    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)rd ^ *(uint32_t *)rs2; }
+                    break;
+                }
+
+                if (funct6_funct2 == FUNCT6_FUNCT2_OR) {
+                    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)rd | *(uint32_t *)rs2; }
+                    break;
+                }
+
+                if (funct6_funct2 == FUNCT6_FUNCT2_AND) {
+                    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)rd & *(uint32_t *)rs2; }
+                    break;
+                }
+
+                state->trapflag.illegalinstruction = 1;
                 break;
             case OPCODE16_J: {
+
                 state->programcounternext = state->programcounter + (int16_t)imm;
             } break;
             case OPCODE16_BEQZ: {
-                if (*(int32_t *)rs1 == 0)
+
+                if (*(int32_t *)rs1 == 0) {
                     state->programcounternext = state->programcounter + (int16_t)imm;
+                };
             } break;
             case OPCODE16_BNEZ: {
-                if (*(int32_t *)rs1 != 0)
+
+                if (*(int32_t *)rs1 != 0) {
                     state->programcounternext = state->programcounter + (int16_t)imm;
+                };
             } break;
             case OPCODE16_SLLI:
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)rd << (uint8_t)imm;
+                if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)rd << (uint8_t)imm; }
                 break;
             case OPCODE16_LWSP: {
+
                 uint32_t memorylocation = *(int32_t *)sp + (uint8_t)imm;
-                if ((uint8_t)rdnum == 0) goto __inl_5;
+
+                if (rdnum == 0) { goto __inl_3; }
+
                 RiscvEmulatorLoad(memorylocation, rd, sizeof(uint32_t));
 
-            __inl_5:;
+            __inl_3:;
             } break;
             case OPCODE16_JALR_MV_ADD:
                 rdnum = state->instruction.crtype.rd;
@@ -1214,26 +1800,29 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
                     if (rs2num == 0) {
                         { state->programcounternext = *(int32_t *)rd & (UINT32_MAX - 1); }
                     } else {
-                        if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs2;
+                        if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs2; }
                     }
-                } else if (rdnum == 0 && rs2num == 0) {
-                    {
-                        state->trapflag.breakpoint = 1;
-                        state->csr.mtval = state->programcounter;
-                        RiscvEmulatorHandleEBREAK(state);
+                } else /* FUNCT4_ADD */
+                {
+                    if (rdnum == 0 && rs2num == 0) {
+                        { RiscvEmulatorHandleEBREAK(state); }
+                    } else if (rs2num == 0) {
+                        {
+
+                            uint32_t originalvaluers1 = *(int32_t *)rd;
+
+                            *(uint32_t *)ra = state->programcounter + 2;
+                            state->programcounternext = (originalvaluers1 & (UINT32_MAX - 1));
+                        }
+                    } else {
+                        if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rd + *(int32_t *)rs2; }
                     }
-                } else if (rs2num == 0) {
-                    {
-                        uint32_t target = *(int32_t *)rd;
-                        *(uint32_t *)ra = state->programcounter + 2;
-                        state->programcounternext = target & (UINT32_MAX - 1);
-                    }
-                } else {
-                    if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rd + *(int32_t *)rs2;
                 }
                 break;
             case OPCODE16_SWSP: {
+
                 uint32_t memorylocation = *(int32_t *)sp + (uint8_t)imm;
+
                 RiscvEmulatorStore(memorylocation, rs2, sizeof(uint32_t));
             } break;
             default: state->trapflag.illegalinstruction = 1; break;
@@ -1250,9 +1839,16 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
                     void *rd = &state->reg.x[rdnum];
                     uint8_t rs1num = state->instruction.itype.rs1;
                     void *rs1 = &state->reg.x[rs1num];
+
                     int16_t imm = state->instruction.itype.imm;
+
                     uint32_t jumptoprogramcounter = (*(uint32_t *)rs1 + imm) & (UINT32_MAX - 1);
-                    if (rdnum != 0) *(uint32_t *)rd = state->programcounternext;
+
+                    // Set destination register to current next instruction acting as a return
+                    // address.
+                    if (rdnum != 0) { *(uint32_t *)rd = state->programcounternext; }
+
+                    // Execute jump.
                     state->programcounternext = jumptoprogramcounter;
                 }
             } else {
@@ -1260,184 +1856,234 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
             }
         } break;
         case OPCODE32_OPERATION: {
+            int8_t detectedUnknownInstruction = 1;
+
             uint8_t rdnum = state->instruction.rtype.rd;
             void *rd = &state->reg.x[rdnum];
             uint8_t rs1num = state->instruction.rtype.rs1;
             void *rs1 = &state->reg.x[rs1num];
             uint8_t rs2num = state->instruction.rtype.rs2;
             void *rs2 = &state->reg.x[rs2num];
-            RiscvInstructionTypeRDecoderFunct7Funct3_u decoder = {0};
-            decoder.funct3 = state->instruction.rtype.funct3;
-            decoder.funct7 = state->instruction.rtype.funct7;
 
-            switch (decoder.funct7_3) {
-            case FUNCT7_FUNCT3_OPERATION_ADD:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs1 + *(int32_t *)rs2;
-                break;
-            case FUNCT7_FUNCT3_OPERATION_SUB:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs1 - *(int32_t *)rs2;
-                break;
-            case FUNCT7_FUNCT3_OPERATION_SLL:
-                if ((uint8_t)rdnum != 0)
-                    *(uint32_t *)rd = *(uint32_t *)rs1 << (*(uint32_t *)rs2 & 0b11111);
-                break;
-            case FUNCT7_FUNCT3_OPERATION_SLT:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = (*(int32_t *)rs1 < *(int32_t *)rs2);
-                break;
-            case FUNCT7_FUNCT3_OPERATION_SLTU:
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = (*(uint32_t *)rs1 < *(uint32_t *)rs2);
-                break;
-            case FUNCT7_FUNCT3_OPERATION_XOR:
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)rs1 ^ *(uint32_t *)rs2;
-                break;
-            case FUNCT7_FUNCT3_OPERATION_SRL:
-                if ((uint8_t)rdnum != 0)
-                    *(uint32_t *)rd = *(uint32_t *)rs1 >> (*(uint32_t *)rs2 & 0b11111);
-                break;
-            case FUNCT7_FUNCT3_OPERATION_SRA:
-                if ((uint8_t)rdnum != 0)
-                    *(int32_t *)rd = *(int32_t *)rs1 >> (*(uint32_t *)rs2 & 0b11111);
-                break;
-            case FUNCT7_FUNCT3_OPERATION_OR:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs1 | *(int32_t *)rs2;
-                break;
-            case FUNCT7_FUNCT3_OPERATION_AND:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs1 & *(int32_t *)rs2;
-                break;
-            case FUNCT7_FUNCT3_OPERATION_MUL:
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = (*(uint32_t *)rs1 * *(uint32_t *)rs2);
-                break;
-            case FUNCT7_FUNCT3_OPERATION_MULH:
-                if ((uint8_t)rdnum != 0) {
-                    int64_t result = (int64_t)(*(int32_t *)rs1 * (int64_t) * (int32_t *)rs2);
-                    *(int32_t *)rd = (result >> 32);
+            if (detectedUnknownInstruction == 1) {
+                RiscvInstructionTypeRDecoderFunct7Funct3_u instruction_decoderhelper_rtype = {0};
+                instruction_decoderhelper_rtype.funct3 = state->instruction.rtype.funct3;
+                instruction_decoderhelper_rtype.funct7 = state->instruction.rtype.funct7;
+
+                detectedUnknownInstruction = -1;
+                switch (instruction_decoderhelper_rtype.funct7_3) {
+                case FUNCT7_FUNCT3_OPERATION_ADD:
+                    if ((uint8_t)rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs1 + *(int32_t *)rs2; }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_SUB:
+                    if ((uint8_t)rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs1 - *(int32_t *)rs2; }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_SLL:
+                    if ((uint8_t)rdnum != 0) {
+                        *(uint32_t *)rd = *(uint32_t *)rs1 << (*(uint32_t *)rs2 & 0b11111);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_SLT:
+                    if ((uint8_t)rdnum != 0) {
+                        *(int32_t *)rd = (*(int32_t *)rs1 < *(int32_t *)rs2);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_SLTU:
+                    if ((uint8_t)rdnum != 0) {
+                        *(uint32_t *)rd = (*(uint32_t *)rs1 < *(uint32_t *)rs2);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_XOR:
+                    if ((uint8_t)rdnum != 0) {
+                        *(uint32_t *)rd = *(uint32_t *)rs1 ^ *(uint32_t *)rs2;
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_SRL:
+                    if ((uint8_t)rdnum != 0) {
+                        *(uint32_t *)rd = *(uint32_t *)rs1 >> (*(uint32_t *)rs2 & 0b11111);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_SRA:
+                    if ((uint8_t)rdnum != 0) {
+                        *(int32_t *)rd = *(int32_t *)rs1 >> (*(uint32_t *)rs2 & 0b11111);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_OR:
+                    if ((uint8_t)rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs1 | *(int32_t *)rs2; }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_AND:
+                    if ((uint8_t)rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs1 & *(int32_t *)rs2; }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_MUL:
+                    if ((uint8_t)rdnum != 0) {
+                        *(uint32_t *)rd = (*(uint32_t *)rs1 * *(uint32_t *)rs2);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_MULH:
+                    if ((uint8_t)rdnum != 0) {
+                        int64_t result = (int64_t)(*(int32_t *)rs1 * (int64_t) * (int32_t *)rs2);
+                        *(int32_t *)rd = (result >> 32);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_MULHSU:
+                    if ((uint8_t)rdnum != 0) {
+                        int64_t result = (int64_t)(*(int32_t *)rs1 * (uint64_t) * (uint32_t *)rs2);
+                        *(int32_t *)rd = (result >> 32);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_MULHU:
+                    if ((uint8_t)rdnum != 0) {
+                        uint64_t result =
+                            (uint64_t)(*(uint32_t *)rs1 * (uint64_t) * (uint32_t *)rs2);
+                        *(uint32_t *)rd = (result >> 32);
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_DIV:
+                    if ((uint8_t)rdnum != 0) {
+                        if (*(int32_t *)rs2 == 0) {
+                            // Division by zero.
+                            *(int32_t *)rd = -1;
+                        } else if (*(int32_t *)rs1 == INT32_MIN && *(int32_t *)rs2 == -1) {
+                            // Overflow.
+                            *(int32_t *)rd = INT32_MIN;
+                        } else {
+                            *(int32_t *)rd = (*(int32_t *)rs1 / *(int32_t *)rs2);
+                        }
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_DIVU:
+                    if ((uint8_t)rdnum != 0) {
+                        if (*(uint32_t *)rs2 == 0) {
+                            // Division by zero.
+                            *(uint32_t *)rd = UINT32_MAX;
+                        } else {
+                            *(uint32_t *)rd = (*(uint32_t *)rs1 / *(uint32_t *)rs2);
+                        }
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_REM:
+                    if ((uint8_t)rdnum != 0) {
+                        if (*(int32_t *)rs2 == 0) {
+                            // Division by zero.
+                            *(int32_t *)rd = *(int32_t *)rs1;
+                        } else if (*(int32_t *)rs1 == INT32_MIN && *(int32_t *)rs2 == -1) {
+                            // Overflow.
+                            *(int32_t *)rd = 0;
+                        } else {
+                            *(int32_t *)rd = (*(int32_t *)rs1 % *(int32_t *)rs2);
+                        }
+                    }
+                    break;
+                case FUNCT7_FUNCT3_OPERATION_REMU:
+                    if ((uint8_t)rdnum != 0) {
+                        if (*(uint32_t *)rs2 == 0) {
+                            // Division by zero.
+                            *(uint32_t *)rd = *(uint32_t *)rs1;
+                        } else {
+                            *(uint32_t *)rd = (*(uint32_t *)rs1 % *(uint32_t *)rs2);
+                        }
+                    }
+                    break;
+                default: detectedUnknownInstruction = 1; break;
                 }
-                break;
-            case FUNCT7_FUNCT3_OPERATION_MULHSU:
-                if ((uint8_t)rdnum != 0) {
-                    int64_t result = (int64_t)(*(int32_t *)rs1 * (uint64_t) * (uint32_t *)rs2);
-                    *(int32_t *)rd = (result >> 32);
-                }
-                break;
-            case FUNCT7_FUNCT3_OPERATION_MULHU:
-                if ((uint8_t)rdnum != 0) {
-                    uint64_t result = (uint64_t)(*(uint32_t *)rs1 * (uint64_t) * (uint32_t *)rs2);
-                    *(uint32_t *)rd = (result >> 32);
-                }
-                break;
-            case FUNCT7_FUNCT3_OPERATION_DIV:
-                if ((uint8_t)rdnum != 0) {
-                    if (*(int32_t *)rs2 == 0) *(int32_t *)rd = -1;
-                    else if (*(int32_t *)rs1 == INT32_MIN && *(int32_t *)rs2 == -1)
-                        *(int32_t *)rd = INT32_MIN;
-                    else *(int32_t *)rd = (*(int32_t *)rs1 / *(int32_t *)rs2);
-                }
-                break;
-            case FUNCT7_FUNCT3_OPERATION_DIVU:
-                if ((uint8_t)rdnum != 0) {
-                    if (*(uint32_t *)rs2 == 0) *(uint32_t *)rd = UINT32_MAX;
-                    else *(uint32_t *)rd = (*(uint32_t *)rs1 / *(uint32_t *)rs2);
-                }
-                break;
-            case FUNCT7_FUNCT3_OPERATION_REM:
-                if ((uint8_t)rdnum != 0) {
-                    if (*(int32_t *)rs2 == 0) *(int32_t *)rd = *(int32_t *)rs1;
-                    else if (*(int32_t *)rs1 == INT32_MIN && *(int32_t *)rs2 == -1)
-                        *(int32_t *)rd = 0;
-                    else *(int32_t *)rd = (*(int32_t *)rs1 % *(int32_t *)rs2);
-                }
-                break;
-            case FUNCT7_FUNCT3_OPERATION_REMU:
-                if ((uint8_t)rdnum != 0) {
-                    if (*(uint32_t *)rs2 == 0) *(uint32_t *)rd = *(uint32_t *)rs1;
-                    else *(uint32_t *)rd = (*(uint32_t *)rs1 % *(uint32_t *)rs2);
-                }
-                break;
-            default: state->trapflag.illegalinstruction = 1; break;
             }
+
+            if (detectedUnknownInstruction == 1) { state->trapflag.illegalinstruction = 1; }
         } break;
         case OPCODE32_IMMEDIATE: {
+            int8_t detectedUnknownInstruction = 1;
+
             uint8_t rdnum = state->instruction.itype.rd;
             void *rd = &state->reg.x[rdnum];
             uint8_t rs1num = state->instruction.itype.rs1;
             void *rs1 = &state->reg.x[rs1num];
-            uint8_t funct3 = state->instruction.itype.funct3;
 
-            if (funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_1 || funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_5) {
-                uint8_t shamt = state->instruction.itypeshiftbyconstant.shamt;
-                RiscvInstructionTypeIDecoderImm11_7Funct3Imm11_7Funct3_u decoder = {0};
-                decoder.funct3 = funct3;
-                decoder.imm11_5 = state->instruction.itypeshiftbyconstant.imm11_5;
+            if (detectedUnknownInstruction == 1) {
+                // If funct3 == 0b001 or 0b101 then a whole set of functions are encoded in parts of
+                // imm.
+                if (state->instruction.itype.funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_1 ||
+                    state->instruction.itype.funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_5) {
 
-                switch (decoder.imm11_5funct3) {
-                case IMM11_5_FUNCT3_IMMEDIATE_SLLI:
-                    if ((uint8_t)rdnum != 0)
-                        *(uint32_t *)rd = *(uint32_t *)rs1 << ((uint8_t)shamt & 0b11111);
-                    goto __inl_6;
-                case IMM11_5_FUNCT3_IMMEDIATE_SRLI:
-                    if ((uint8_t)rdnum != 0)
-                        *(uint32_t *)rd = *(uint32_t *)rs1 >> ((uint8_t)shamt & 0b11111);
-                    goto __inl_6;
-                case IMM11_5_FUNCT3_IMMEDIATE_SRAI:
-                    if ((uint8_t)rdnum != 0)
-                        *(int32_t *)rd = *(int32_t *)rs1 >> ((uint8_t)shamt & 0b11111);
-                    goto __inl_6;
+                    uint8_t shamt = state->instruction.itypeshiftbyconstant.shamt;
+
+                    RiscvInstructionTypeIDecoderImm11_7Funct3Imm11_7Funct3_u
+                        instruction_decoderhelper_itype_functions_shamt = {0};
+
+                    instruction_decoderhelper_itype_functions_shamt.funct3 =
+                        state->instruction.itype.funct3;
+                    instruction_decoderhelper_itype_functions_shamt.imm11_5 =
+                        state->instruction.itypeshiftbyconstant.imm11_5;
+
+                    detectedUnknownInstruction = -1;
+                    switch (instruction_decoderhelper_itype_functions_shamt.imm11_5funct3) {
+                    case IMM11_5_FUNCT3_IMMEDIATE_SLLI:
+                        if ((uint8_t)rdnum != 0) {
+                            *(uint32_t *)rd = *(uint32_t *)rs1 << ((uint8_t)shamt & 0b11111);
+                        }
+                        break;
+                    case IMM11_5_FUNCT3_IMMEDIATE_SRLI:
+                        if ((uint8_t)rdnum != 0) {
+                            *(uint32_t *)rd = *(uint32_t *)rs1 >> ((uint8_t)shamt & 0b11111);
+                        }
+                        break;
+                    case IMM11_5_FUNCT3_IMMEDIATE_SRAI:
+                        if ((uint8_t)rdnum != 0) {
+                            *(int32_t *)rd = *(int32_t *)rs1 >> ((uint8_t)shamt & 0b11111);
+                        }
+                        break;
+                    default: detectedUnknownInstruction = 1; break;
+                    }
                 }
             }
 
-            int16_t imm = state->instruction.itype.imm;
-            switch (funct3) {
-            case FUNCT3_IMMEDIATE_ADDI:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs1 + (int16_t)imm;
-                break;
-            case FUNCT3_IMMEDIATE_SLTI:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = (*(int32_t *)rs1 < (int16_t)imm);
-                break;
-            case FUNCT3_IMMEDIATE_SLTIU:
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = (*(uint32_t *)rs1 < (uint32_t)imm);
-                break;
-            case FUNCT3_IMMEDIATE_XORI:
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)rs1 ^ (uint32_t)imm;
-                break;
-            case FUNCT3_IMMEDIATE_ORI:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs1 | (int16_t)imm;
-                break;
-            case FUNCT3_IMMEDIATE_ANDI:
-                if ((uint8_t)rdnum != 0) *(int32_t *)rd = *(int32_t *)rs1 & (int16_t)imm;
-                break;
-            default: state->trapflag.illegalinstruction = 1; break;
+            if (detectedUnknownInstruction == 1) {
+                detectedUnknownInstruction = -1;
+                int16_t imm = state->instruction.itype.imm;
+                switch (state->instruction.itype.funct3) {
+                case FUNCT3_IMMEDIATE_ADDI:
+                    if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs1 + (int16_t)imm; }
+                    break;
+                case FUNCT3_IMMEDIATE_SLTI:
+                    if (rdnum != 0) { *(int32_t *)rd = (*(int32_t *)rs1 < (int16_t)imm); }
+                    break;
+                case FUNCT3_IMMEDIATE_SLTIU:
+                    if (rdnum != 0) { *(uint32_t *)rd = (*(uint32_t *)rs1 < (uint32_t)imm); }
+                    break;
+                case FUNCT3_IMMEDIATE_XORI:
+                    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)rs1 ^ (uint32_t)imm; }
+                    break;
+                case FUNCT3_IMMEDIATE_ORI:
+                    if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs1 | (int16_t)imm; }
+                    break;
+                case FUNCT3_IMMEDIATE_ANDI:
+                    if (rdnum != 0) { *(int32_t *)rd = *(int32_t *)rs1 & (int16_t)imm; }
+                    break;
+                default: detectedUnknownInstruction = 1; break;
+                }
             }
 
-        __inl_6:;
+            if (detectedUnknownInstruction == 1) { state->trapflag.illegalinstruction = 1; }
         } break;
         case OPCODE32_LOAD: {
             uint8_t rdnum = state->instruction.itype.rd;
             void *rd = &state->reg.x[rdnum];
             uint8_t rs1num = state->instruction.stype.rs1;
             void *rs1 = &state->reg.x[rs1num];
+
             int16_t imm = state->instruction.itype.imm;
             uint32_t memorylocation = imm + *(uint32_t *)rs1;
+
             uint8_t length = 0;
             switch (state->instruction.itype.funct3) {
-            case FUNCT3_LOAD_LB:
+            case FUNCT3_LOAD_LB: length = sizeof(uint8_t); break;
             case FUNCT3_LOAD_LBU: length = sizeof(uint8_t); break;
-            case FUNCT3_LOAD_LH:
+            case FUNCT3_LOAD_LH: length = sizeof(uint16_t); break;
             case FUNCT3_LOAD_LHU: length = sizeof(uint16_t); break;
             case FUNCT3_LOAD_LW: length = sizeof(uint32_t); break;
-            default: state->trapflag.illegalinstruction = 1; goto __inl_7;
+            default: state->trapflag.illegalinstruction = 1; goto __inl_4;
             }
 
-            if (length > 1) {
-                uint8_t memorylocation8 = memorylocation & 0xFF;
-                if ((memorylocation8 % length) != 0) {
-                    state->trapflag.loadaddressmisaligned = 1;
-                    state->csr.mtval = memorylocation;
-                }
-            }
-
-            if (rdnum == 0) goto __inl_7;
-
-            if (state->trapflag.loadaddressmisaligned == 1) goto __inl_7;
+            if (rdnum == 0) { goto __inl_4; }
 
             uint32_t value = 0;
             RiscvEmulatorLoad(memorylocation, &value, length);
@@ -1450,186 +2096,173 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
             case FUNCT3_LOAD_LW: *(uint32_t *)rd = (uint32_t)value; break;
             }
 
-        __inl_7:;
+        __inl_4:;
         } break;
         case OPCODE32_STORE: {
+            // Untangle the immediate bits.
             RiscvInstructionTypeSDecoderImm_u immdecoder = {0};
             immdecoder.bit.imm4_0 = state->instruction.stype.imm4_0;
             immdecoder.bit.imm11_5 = state->instruction.stype.imm11_5;
             int16_t offset = immdecoder.imm;
+
             uint8_t rs1num = state->instruction.stype.rs1;
             void *rs1 = &state->reg.x[rs1num];
             uint8_t rs2num = state->instruction.stype.rs2;
             void *rs2 = &state->reg.x[rs2num];
+
             uint32_t memorylocation = offset + *(uint32_t *)rs1;
+
             uint8_t length = 0;
             switch (state->instruction.stype.funct3) {
             case FUNCT3_STORE_SW: length = sizeof(uint32_t); break;
             case FUNCT3_STORE_SH: length = sizeof(uint16_t); break;
             case FUNCT3_STORE_SB: length = sizeof(uint8_t); break;
-            default: state->trapflag.illegalinstruction = 1; goto __inl_8;
+            default: state->trapflag.illegalinstruction = 1; goto __inl_5;
             }
-
-            if (length > 1) {
-                uint8_t memorylocation8 = memorylocation & 0xFF;
-                if ((memorylocation8 % length) != 0) {
-                    state->trapflag.storeaddressmisaligned = 1;
-                    state->csr.mtval = memorylocation;
-                }
-            }
-
-            if (state->trapflag.storeaddressmisaligned == 1) goto __inl_8;
 
             RiscvEmulatorStore(memorylocation, rs2, length);
 
-        __inl_8:;
+        __inl_5:;
         } break;
         case OPCODE32_BRANCH: {
+            uint8_t executebranch = BRANCH_NO;
             uint8_t rs1num = state->instruction.btype.rs1;
             void *rs1 = &state->reg.x[rs1num];
             uint8_t rs2num = state->instruction.btype.rs2;
             void *rs2 = &state->reg.x[rs2num];
+
+            // Untangle the immediate bits.
             RiscvInstructionTypeBDecoderImm_u immdecoder = {0};
             immdecoder.bit.imm4_1 = state->instruction.btype.imm4_1;
             immdecoder.bit.imm10_5 = state->instruction.btype.imm10_5;
             immdecoder.bit.imm11 = state->instruction.btype.imm11;
             immdecoder.bit.imm12 = state->instruction.btype.imm12;
             int16_t imm = immdecoder.imm;
-            uint8_t executebranch = BRANCH_NO;
+
+            RiscvEmulatorHookContext_t hc;
+
             switch (state->instruction.btype.funct3) {
-            case FUNCT3_BRANCH_BEQ:
-                if (*(int32_t *)rs1 == *(int32_t *)rs2) executebranch = BRANCH_YES;
-                break;
-            case FUNCT3_BRANCH_BNE:
-                if (*(int32_t *)rs1 != *(int32_t *)rs2) executebranch = BRANCH_YES;
-                break;
-            case FUNCT3_BRANCH_BGE:
-                if (*(int32_t *)rs1 >= *(int32_t *)rs2) executebranch = BRANCH_YES;
-                break;
-            case FUNCT3_BRANCH_BGEU:
-                if (*(uint32_t *)rs1 >= *(uint32_t *)rs2) executebranch = BRANCH_YES;
-                break;
-            case FUNCT3_BRANCH_BLT:
-                if (*(int32_t *)rs1 < *(int32_t *)rs2) executebranch = BRANCH_YES;
-                break;
-            case FUNCT3_BRANCH_BLTU:
-                if (*(uint32_t *)rs1 < *(uint32_t *)rs2) executebranch = BRANCH_YES;
-                break;
-            default: state->trapflag.illegalinstruction = 1; goto __inl_9;
+            case FUNCT3_BRANCH_BEQ: {
+
+                if (*(int32_t *)rs1 == *(int32_t *)rs2) { *(&executebranch) = BRANCH_YES; }
+            } break;
+            case FUNCT3_BRANCH_BNE: {
+
+                if (*(int32_t *)rs1 != *(int32_t *)rs2) { *(&executebranch) = BRANCH_YES; }
+            } break;
+            case FUNCT3_BRANCH_BGE: {
+
+                if (*(int32_t *)rs1 >= *(int32_t *)rs2) { *(&executebranch) = BRANCH_YES; }
+            } break;
+            case FUNCT3_BRANCH_BGEU: {
+
+                if (*(uint32_t *)rs1 >= *(uint32_t *)rs2) { *(&executebranch) = BRANCH_YES; }
+            } break;
+            case FUNCT3_BRANCH_BLT: {
+
+                if (*(int32_t *)rs1 < *(int32_t *)rs2) { *(&executebranch) = BRANCH_YES; }
+            } break;
+            case FUNCT3_BRANCH_BLTU: {
+
+                if (*(uint32_t *)rs1 < *(uint32_t *)rs2) { *(&executebranch) = BRANCH_YES; }
+            } break;
+            default: state->trapflag.illegalinstruction = 1; goto __inl_6;
             }
 
-            if (executebranch == BRANCH_YES)
+            if (executebranch == BRANCH_YES) {
                 state->programcounternext = state->programcounter + imm;
+            }
 
-        __inl_9:;
+        __inl_6:;
         } break;
         case OPCODE32_ADDUPPERIMMEDIATE2PC: {
+            uint32_t upperimmediate = state->instruction.utype.imm31_12;
+
             RiscvInstructionTypeUDecoderImm_u immdecoder = {0};
-            immdecoder.bit.imm31_12 = state->instruction.utype.imm31_12;
+            immdecoder.bit.imm31_12 = upperimmediate;
             int32_t imm = immdecoder.imm;
+
             uint8_t rdnum = state->instruction.utype.rd;
-            if (rdnum != 0) state->reg.x[rdnum] = state->programcounter + imm;
+
+            if (rdnum != 0) { state->reg.x[rdnum] = state->programcounter + imm; }
         } break;
         case OPCODE32_LOADUPPERIMMEDIATE: {
             RiscvInstructionTypeUDecoderImm_u immdecoder = {0};
             immdecoder.bit.imm11_0 = 0;
             immdecoder.bit.imm31_12 = state->instruction.utype.imm31_12;
+
             uint8_t rdnum = state->instruction.utype.rd;
-            if (rdnum != 0) state->reg.x[rdnum] = immdecoder.imm;
+            void *rd = &state->reg.x[rdnum];
+
+            uint32_t imm = immdecoder.imm;
+
+            if (rdnum != 0) { *(uint32_t *)rd = imm; }
         } break;
         case OPCODE32_JUMPANDLINK: {
             uint8_t rdnum = state->instruction.jtype.rd;
             void *rd = &state->reg.x[rdnum];
+
+            // Untangle the immediate bits.
             RiscvInstructionTypeJDecoderImm_u immdecoder = {0};
             immdecoder.bit.imm10_1 = state->instruction.jtype.imm10_1;
             immdecoder.bit.imm11 = state->instruction.jtype.imm11;
             immdecoder.bit.imm19_12 = state->instruction.jtype.imm19_12;
             immdecoder.bit.imm20 = state->instruction.jtype.imm20;
+
             uint32_t jumptoprogramcounter = state->programcounter + immdecoder.imm;
-            if (rdnum != 0) *(uint32_t *)rd = state->programcounternext;
+
+            // Set destination register to current next instruction acting as a return address.
+            if (rdnum != 0) { *(uint32_t *)rd = state->programcounternext; }
+
+            // Execute jump.
             state->programcounternext = jumptoprogramcounter;
         } break;
         case OPCODE32_SYSTEM: {
-            if (state->instruction.itypesystem.rd == 0 &&
-                state->instruction.itypesystem.funct3 == 0 &&
-                state->instruction.itypesystem.rs1 == 0) {
-                switch (state->instruction.itypesystem.funct12) {
-                case FUNCT12_MRET: {
-                    state->csr.mstatush.mpv = 0;
-                    state->csr.mstatus.mpp = 0;
-                    state->csr.mstatus.mie = state->csr.mstatus.mpie;
-                    state->csr.mstatus.mpie = 1;
-                    state->programcounternext = state->csr.mepc;
-                }
-                    goto __inl_10;
-                case FUNCT12_ECALL: {
-                    state->trapflag.environmentcallfrommmode = 1;
-                    RiscvEmulatorHandleECALL(state);
-                }
-                    goto __inl_10;
-                case FUNCT12_EBREAK: {
-                    state->trapflag.breakpoint = 1;
-                    state->csr.mtval = state->programcounter;
-                    RiscvEmulatorHandleEBREAK(state);
-                }
-                    goto __inl_10;
+            int8_t detectedUnknownInstruction = 1;
+
+            if (detectedUnknownInstruction == 1) {
+                if (state->instruction.itypesystem.rd == 0 &&
+                    state->instruction.itypesystem.funct3 == 0 &&
+                    state->instruction.itypesystem.rs1 == 0) {
+                    detectedUnknownInstruction = -1;
+                    switch (state->instruction.itypesystem.funct12) {
+                    case FUNCT12_ECALL: {
+
+                        RiscvEmulatorHandleECALL(state);
+                    } break;
+                    case FUNCT12_EBREAK: {
+
+                        RiscvEmulatorHandleEBREAK(state);
+                    } break;
+                    default: detectedUnknownInstruction = 1; break;
+                    }
                 }
             }
 
-            uint8_t rdnum = state->instruction.itypecsr.rd;
-            void *rd = &state->reg.x[rdnum];
-            uint8_t rs1num = state->instruction.itypecsr.rs1;
-            void *rs1 = &state->reg.x[rs1num];
-            uint8_t imm = state->instruction.itypecsrimm.imm;
-            uint16_t csrnum = state->instruction.itypecsr.csr;
-            void *csr = RiscvEmulatorGetCSRAddress(state, csrnum);
-
-            if (state->trapflag.value > 0) goto __inl_10;
-
-            switch (state->instruction.itypecsr.funct3) {
-            case FUNCT3_CSR_CSRRW: {
-                uint32_t originalvaluers1 = *(uint32_t *)rs1;
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)csr;
-                *(uint32_t *)csr = originalvaluers1;
-            } break;
-            case FUNCT3_CSR_CSRRWI: {
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)csr;
-                *(uint32_t *)csr = (uint8_t)imm;
-            } break;
-            case FUNCT3_CSR_CSRRS: {
-                int32_t initialrs1value = *(uint32_t *)rs1;
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)csr;
-                if (initialrs1value != 0) *(uint32_t *)csr |= initialrs1value;
-            } break;
-            case FUNCT3_CSR_CSRRSI: {
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)csr;
-                if ((uint8_t)imm != 0) *(uint32_t *)csr |= (uint8_t)imm;
-            } break;
-            case FUNCT3_CSR_CSRRC: {
-                int32_t initialrs1value = *(uint32_t *)rs1;
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)csr;
-                if (initialrs1value != 0) *(uint32_t *)csr &= ~initialrs1value;
-            } break;
-            case FUNCT3_CSR_CSRRCI: {
-                if ((uint8_t)rdnum != 0) *(uint32_t *)rd = *(uint32_t *)csr;
-                if ((uint8_t)imm != 0) *(uint32_t *)csr &= ~(uint8_t)imm;
-            } break;
-            default: state->trapflag.illegalinstruction = 1; break;
-            }
-
-        __inl_10:;
+            if (detectedUnknownInstruction == 1) { state->trapflag.illegalinstruction = 1; }
         } break;
         case OPCODE32_MISCMEM: {
-            uint8_t rd = state->instruction.itypemiscmem.rd;
-            uint8_t funct3 = state->instruction.itypemiscmem.funct3;
-            uint8_t rs1 = state->instruction.itypemiscmem.rs1;
+            uint8_t detectedUnknownInstruction = 1;
 
-            if (rd == 0 && rs1 == 0 && (funct3 == FUNCT3_FENCE || funct3 == FUNCT3_FENCEI))
-                goto __inl_11;
+            if (detectedUnknownInstruction) {
+                if (state->instruction.itypemiscmem.rd == 0 &&
+                    state->instruction.itypemiscmem.funct3 == FUNCT3_FENCE &&
+                    state->instruction.itypemiscmem.rs1 == 0) {
+                    detectedUnknownInstruction = -1;
+                    {}
+                }
+            }
 
-            state->trapflag.illegalinstruction = 1;
+            if (detectedUnknownInstruction) {
+                if (state->instruction.itypemiscmem.rd == 0 &&
+                    state->instruction.itypemiscmem.funct3 == FUNCT3_FENCEI &&
+                    state->instruction.itypemiscmem.rs1 == 0) {
+                    detectedUnknownInstruction = -1;
+                    {}
+                }
+            }
 
-        __inl_11:;
+            if (detectedUnknownInstruction == 1) { state->trapflag.illegalinstruction = 1; }
         } break;
         default: state->trapflag.illegalinstruction = 1; break;
         }
@@ -1637,51 +2270,15 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
 
     if (state->trapflag.value > 0) {
         {
-            // Instruction address misaligned
-            if (state->trapflag.instructionaddressmisaligned == 1) {
-                state->csr.mcause.exceptioncode =
-                    MCAUSE_EXCEPTION_CODE_INSTRUCTION_ADDRESS_MISALIGNED;
-            }
 
-            // Breakpoint
-            if (state->trapflag.breakpoint == 1)
-                state->csr.mcause.exceptioncode = MCAUSE_EXCEPTION_CODE_BREAKPOINT;
-
-            // Load address misaligned
-            if (state->trapflag.loadaddressmisaligned == 1)
-                state->csr.mcause.exceptioncode = MCAUSE_EXCEPTION_CODE_LOAD_ADDRESS_MISALIGNED;
-
-            // Store/AMO address misaligned
-            if (state->trapflag.storeaddressmisaligned == 1)
-                state->csr.mcause.exceptioncode = MCAUSE_EXCEPTION_CODE_STORE_ADDRESS_MISALIGNED;
-
-            //  Environment call from M-mode
-            if (state->trapflag.environmentcallfrommmode == 1)
-                state->csr.mcause.exceptioncode = MCAUSE_EXCEPTION_CODE_ENVIRONMENT_CALL_FROM_MMODE;
-
-            // Illegal instruction
-            if (state->trapflag.illegalinstruction == 1) {
-                state->csr.mcause.exceptioncode = MCAUSE_EXCEPTION_CODE_ILLEGAL_INSTRUCTION;
-                state->csr.mtval = state->instruction.value;
-            }
-
-            state->csr.mstatus.mpp = 3; // Previous privilege mode: M
-            state->csr.mstatus.mpie = state->csr.mstatus.mie;
-            state->csr.mstatus.mie = 0;
-            state->csr.mepc = state->programcounter;
-
-            // Jump to trap handler.
-            state->programcounternext = state->csr.mtvec.base << 2;
-            // For mode 1, add some offset based on exceptioncode.
-            if (state->csr.mtvec.mode == 1)
-                state->programcounternext = 4 * state->csr.mcause.exceptioncode;
-
-            if (state->trapflag.illegalinstruction == 1) RiscvEmulatorIllegalInstruction(state);
+            if (state->trapflag.illegalinstruction == 1) { RiscvEmulatorIllegalInstruction(state); }
 
             state->trapflag.value = 0;
         }
     }
 }
+
+#pragma GCC diagnostic pop
 
 /* ------------------------------------------------------------ public API glue */
 
@@ -1714,15 +2311,6 @@ void RiscvEmulatorSetProgramCounter(RiscvEmulatorState_t *state, uint32_t pc) {
 uint32_t RiscvEmulatorGetInstruction(const RiscvEmulatorState_t *state) {
     return state->instruction.value;
 }
-uint16_t RiscvEmulatorGetCsrNumber(const RiscvEmulatorState_t *state) {
-    return state->instruction.itypecsr.csr;
-}
-uint32_t RiscvEmulatorGetTrapVectorBase(const RiscvEmulatorState_t *state) {
-    return state->csr.mtvec.base;
-}
 void RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state) {
     state->trapflag.illegalinstruction = 1;
-}
-void RiscvEmulatorClearTrap(RiscvEmulatorState_t *state) {
-    state->trapflag.value = 0;
 }

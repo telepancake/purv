@@ -1,8 +1,9 @@
 # Writing your own guest code for purv
 
-purv executes **RV32IMC + Zicsr/Zifencei**: it has 32-bit multiply/divide (M) and
-compressed instructions (C), but **no** hardware floating point (no F/D), **no**
-atomics (no A), and no bit-manip (no Zbb). A "compiler builtin" / runtime-library
+purv executes **RV32IMC + Zifencei** as a userspace program runner: it has 32-bit
+multiply/divide (M) and compressed instructions (C), but **no** hardware floating
+point (no F/D), **no** atomics (no A), no bit-manip (no Zbb), and no privileged
+machine mode (no Zicsr CSRs or trap handling). A "compiler builtin" / runtime-library
 call appears for exactly two reasons: the ISA has no instruction for the
 operation, or a language feature needs runtime support. Keeping those calls to a
 minimum is mostly about staying inside what the ISA can do.

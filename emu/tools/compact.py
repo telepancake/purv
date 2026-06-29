@@ -6,13 +6,16 @@ of blank lines, three-line guard blocks, braces around single statements. This
 makes two passes:
 
   1. clang-format with a dense (but still 4-space, readable) style: collapse
-     blank-line runs, put short blocks/ifs on one line, and drop the braces
-     around single-statement bodies (RemoveBracesLLVM).
+     blank-line runs and put short blocks/ifs on one line.
   2. collapse the many single-field `typedef struct {...}` definitions that
      clang-format always leaves spread over three lines.
 
-Both are behavior-preserving (C is free-form; the dropped braces wrap single
-statements), so the compiled output is unchanged.
+Both are behavior-preserving (C is free-form), so the compiled output is
+unchanged. Note: clang-format's RemoveBracesLLVM is deliberately NOT used. It
+is not always semantics-preserving -- on `if (c) { if (a) X else Y } else Z` it
+strips the outer braces and the `else Z` then dangles to the inner `if (a)`,
+silently changing control flow (it bit the inlined C.JALR/C.ADD/C.MV dispatch).
+Keeping the braces costs a few lines and keeps the meaning.
 The inline style means no .clang-format file is left around to affect the
 hand-written sources. Used by `make regen`; run directly as: compact.py FILE...
 """
@@ -23,8 +26,7 @@ STYLE = ("{BasedOnStyle: LLVM, IndentWidth: 4, ColumnLimit: 100, "
          "AllowShortIfStatementsOnASingleLine: AllIfsAndElse, "
          "AllowShortLoopsOnASingleLine: true, AllowShortCaseLabelsOnASingleLine: true, "
          "AllowShortFunctionsOnASingleLine: Inline, AllowShortEnumsOnASingleLine: true, "
-         "BreakBeforeBraces: Attach, SpaceBeforeParens: ControlStatements, "
-         "RemoveBracesLLVM: true}")
+         "BreakBeforeBraces: Attach, SpaceBeforeParens: ControlStatements}")
 
 # A single-field packed struct: three lines clang-format won't join -> one line.
 SINGLE_FIELD = re.compile(

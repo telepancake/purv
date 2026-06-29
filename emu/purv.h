@@ -1,11 +1,12 @@
 /*
- * purv.h - RISC-V (RV32IMC + Zicsr/Zifencei) emulator: public interface.
+ * purv.h - RISC-V (RV32IMC + Zifencei) userspace emulator: public interface.
  *
  * A small, hand-written engine in the spirit of atoomnetmarc/RISC-V-emulator
  * (Apache-2.0, (c) Marc Ketel): the host owns all policy and reaches the engine
- * only through the hooks below; the engine knows nothing of the memory map. The
- * VM state is opaque (its layout lives in purv.c) and this header is the entire
- * public surface.
+ * only through the hooks below; the engine knows nothing of the memory map. It
+ * runs user-level programs -- no CSRs, no privileged modes, no trap-to-mtvec;
+ * ecall/ebreak/illegal are handed straight to the host. The VM state is opaque
+ * (its layout lives in purv.c) and this header is the entire public surface.
  */
 #ifndef PURV_H_
 #define PURV_H_
@@ -37,15 +38,12 @@ uint32_t RiscvEmulatorGetProgramCounter(const RiscvEmulatorState_t *state);
 uint32_t RiscvEmulatorGetNextProgramCounter(const RiscvEmulatorState_t *state);
 void     RiscvEmulatorSetProgramCounter(RiscvEmulatorState_t *state, uint32_t pc);
 
-/* ---- Decode/trap details a hook may need ---- */
+/* ---- Decode details a hook may need ---- */
 uint32_t RiscvEmulatorGetInstruction(const RiscvEmulatorState_t *state);      /* raw word */
-uint16_t RiscvEmulatorGetCsrNumber(const RiscvEmulatorState_t *state);        /* CSR being accessed */
-uint32_t RiscvEmulatorGetTrapVectorBase(const RiscvEmulatorState_t *state);   /* mtvec.base */
-void     RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state);
-void     RiscvEmulatorClearTrap(RiscvEmulatorState_t *state);                 /* consume pending trap (e.g. host-handled ecall) */
+void     RiscvEmulatorRaiseIllegalInstruction(RiscvEmulatorState_t *state);   /* a hook can force illegal */
 
 /* ---- Hooks YOU implement (atoom's whole "API"): the engine reaches your
- *      memory map and trap policy only through these. ---- */
+ *      memory map and userspace traps only through these. ---- */
 void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length);
 void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length);
 /* OPTIONAL fetch fast-path. The engine fetches one instruction per step through
@@ -59,10 +57,9 @@ void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length);
  * keeps the original behaviour with no code change. */
 const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t address, uint32_t *available);
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state);
-void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state);
-/* Supply backing storage for a CSR the engine does not implement (the engine
- * reads/writes through the returned pointer); return NULL to raise illegal. */
-void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *state, uint16_t csrnum);
+/* ecall is a service request to the execution environment (a syscall); ebreak is
+ * a debugger breakpoint. The engine just hands control to these -- nothing
+ * vectors to a trap handler, because there is no machine mode here. */
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state);
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *state);
 

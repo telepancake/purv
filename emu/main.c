@@ -123,51 +123,21 @@ void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
 }
 
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) {
-    /* If the program installed a trap vector, RiscvEmulatorTrap already
-     * redirected execution there; nothing for the host to do. Otherwise the
-     * program cannot self-handle, so stop. */
-    if (RiscvEmulatorGetTrapVectorBase(state) != 0) {
-        return;
-    }
+    /* A userspace program cannot self-handle an illegal instruction (there is no
+     * trap vector to take), so report it and stop. */
     fprintf(stderr, "purv: illegal instruction 0x%08x at pc=0x%08x\n",
             RiscvEmulatorGetInstruction(state), RiscvEmulatorGetProgramCounter(state));
     g_halt = 1;
     g_exit = 1;
 }
 
-void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state) {
-    /* Unimplemented CSR -> raise illegal-instruction, like real hardware. */
-    fprintf(stderr, "purv: unknown CSR 0x%03x at pc=0x%08x\n",
-            RiscvEmulatorGetCsrNumber(state), RiscvEmulatorGetProgramCounter(state));
-    RiscvEmulatorRaiseIllegalInstruction(state);
-}
-
-/* Machine-information CSRs are implementation policy, so the host supplies them
- * rather than the engine. misa advertises the configured ISA (RV32IMC); the
- * vendor/arch/impl IDs read as zero ("not implemented", which is legal). */
-void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *state, uint16_t csrnum) {
-    static uint32_t misa = (1u << 30)            /* MXL = 1 -> XLEN 32 */
-                         | (1u << ('I' - 'A'))
-                         | (1u << ('M' - 'A'))
-                         | (1u << ('C' - 'A'));
-    static uint32_t zero;
-    (void)state;
-    switch (csrnum) {
-    case 0x301: return &misa;                    /* misa  */
-    case 0xF11:                                  /* mvendorid */
-    case 0xF12:                                  /* marchid   */
-    case 0xF13:                                  /* mimpid    */
-        zero = 0; return &zero;                  /* read-only zero */
-    default:    return NULL;                     /* genuinely unimplemented */
-    }
-}
-
 /* User-mode syscall emulation (Linux/RISC-V ABI subset): a7=number,
  * a0..a5=args, result in a0. Only what single-threaded console programs need;
- * everything else returns -ENOSYS. Enabled by --user; otherwise ecall traps
- * normally (machine-mode conformance is unaffected). */
+ * everything else returns -ENOSYS. Enabled by --user; without it an ecall has no
+ * effect (this is a userspace engine -- there is no machine handler to vector to,
+ * and the signature-dump suites halt via the tohost store, not ecall). */
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
-    if (!g_user_mode) return;            /* let it vector to the test's handler */
+    if (!g_user_mode) return;            /* no syscall ABI requested: ignore */
     uint32_t num = RiscvEmulatorGetRegister(state, 17);   /* a7 */
     uint32_t a0  = RiscvEmulatorGetRegister(state, 10);
     uint32_t a1  = RiscvEmulatorGetRegister(state, 11);
@@ -200,7 +170,6 @@ void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
         break;
     }
     RiscvEmulatorSetRegister(state, 10, ret);
-    RiscvEmulatorClearTrap(state);        /* consume the ecall; don't vector */
 }
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *state) { (void)state; }
 
