@@ -142,3 +142,23 @@ comparison isolates the cost of interpreting RV32 instruction-by-instruction. Th
 purv host prints these stats only when asked (`./host guest.elf --stats`); the
 plain demo run is unaffected. `~70 MIPS` and `~350×` are representative of a
 simple non-JIT interpreter.
+
+## Profiling the interpreter
+
+The host is built with `-g` (still `-O2`), so a profiler can map back to source.
+`host.c` and `purv.c` are separate translation units (no `-flto`), so the engine's
+`RiscvEmulatorLoop` profiles as its own function instead of being inlined into
+`main`:
+
+```sh
+valgrind --tool=callgrind --callgrind-out-file=cg.out ./host guest.elf
+callgrind_annotate --auto=yes cg.out ../purv.c | less
+```
+
+A representative split: `RiscvEmulatorLoop` ~63%, the `RiscvEmulatorLoad` hook
+~29% (instruction fetch dominates), `main` ~7%. With `--auto=yes` you get the hot
+*lines* inside `RiscvEmulatorLoop` — the 16-bit fetch, the compressed-opcode test,
+the dispatch switch. (If instead you see `???:main` at ~97% with `RiscvEmulatorLoop`
+absent, that profile came from a build that inlined the engine into `main` — e.g.
+`-flto` or compiling everything as one unit — and a `-g`-less binary, so there are
+no source lines either.)

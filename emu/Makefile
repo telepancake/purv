@@ -13,7 +13,9 @@
 # bit-field structs; gcc emits a note about a pre-4.4 layout change that is
 # irrelevant here (the layout is consistent within our own build).
 CC      ?= gcc
-CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wno-packed-bitfield-compat
+# -g keeps debug line info (no effect on -O2 codegen) so profilers/debuggers
+# (callgrind_annotate --auto=yes, perf, gdb) can map back to purv.c/main.c source.
+CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wno-packed-bitfield-compat
 
 # Guest toolchain (compiles RISC-V code the emulator runs). clang needs no
 # cross-gcc: it targets riscv32 directly and lld links it.

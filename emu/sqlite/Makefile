@@ -38,7 +38,12 @@ GUEST   := clang --target=riscv32 -march=rv32imc -mabi=ilp32 -mcmodel=medany \
 RVLD    := ld.lld -m elf32lriscv --image-base=0x80000000 -e _start --gc-sections
 
 HOSTCC    ?= gcc
-HOSTFLAGS := -std=c11 -O2 -Wall -Wextra -Wno-packed-bitfield-compat
+# -g: keep debug line info (does not change -O2 codegen) so a profiler
+# (callgrind_annotate --auto=yes, perf) can map back to purv.c / host.c source
+# lines instead of showing `???`. host.c and purv.c stay separate translation
+# units (no -flto), so the engine's RiscvEmulatorLoop is profiled as its own
+# function rather than being inlined into main.
+HOSTFLAGS := -std=c11 -O2 -g -Wall -Wextra -Wno-packed-bitfield-compat
 NATIVECC  ?= cc
 
 # shared prerequisites for the guest objects.

@@ -25,9 +25,10 @@ mandelbrot.bin: mandelbrot.o link-flat.ld
 	ld.lld --oformat binary -T link-flat.ld --gc-sections -e _start -s -o mandelbrot.bin mandelbrot.o
 	@echo "flat image: $$(stat -c%s mandelbrot.bin) bytes"
 
-# Host: its own, depending only on the purv engine.
+# Host: its own, depending only on the purv engine. -g keeps source line info for
+# profilers/debuggers (no effect on -O2 codegen).
 host: host.c ../purv.c ../purv.h
-	gcc -std=c11 -O2 -Wall -Wextra -Wno-packed-bitfield-compat host.c ../purv.c -o host
+	gcc -std=c11 -O2 -g -Wall -Wextra -Wno-packed-bitfield-compat host.c ../purv.c -o host
 
 run: mandelbrot.bin host
 	./host mandelbrot.bin
