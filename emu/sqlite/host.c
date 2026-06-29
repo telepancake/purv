@@ -12,12 +12,14 @@
  * The guest's entire dependency on the outside world is the two host calls
  * (write, exit). There is no MMIO, no syscall ABI baked into the engine.
  */
+#define _POSIX_C_SOURCE 199309L      /* clock_gettime/CLOCK_MONOTONIC under -std=c11 */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "../purv.h"
 #include "hostcalls.h"
@@ -222,10 +224,13 @@ static uint32_t load_elf(const char *path) {
 /* ------------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <guest.elf> [--max-insns=N]\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s <guest.elf> [--max-insns=N] [--stats]\n", argv[0]); return 2; }
     uint64_t max_insns = 20000ull * 1000 * 1000;       /* generous cap */
-    for (int i = 2; i < argc; i++)
+    int stats = 0;
+    for (int i = 2; i < argc; i++) {
         if (!strncmp(argv[i], "--max-insns=", 12)) max_insns = strtoull(argv[i] + 12, 0, 0);
+        else if (!strcmp(argv[i], "--stats")) stats = 1;
+    }
 
     g_ram = calloc(1, RAM_BYTES);
     if (!g_ram) { fprintf(stderr, "OOM\n"); return 2; }
@@ -243,12 +248,22 @@ int main(int argc, char **argv) {
     RiscvEmulatorSetRegister(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of RAM */
     RiscvEmulatorSetProgramCounter(st, entry);
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     uint64_t i = 0;
     for (; i < max_insns && !g_halt; i++) {
         RiscvEmulatorLoop(st);
         if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); }
     }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
     if (i >= max_insns) { fprintf(stderr, "purv-sqlite: instruction cap reached\n"); g_exit = 3; }
+
+    if (stats) {
+        double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        /* machine-parseable line for benchmark.sh, plus a human note */
+        fprintf(stderr, "BENCH wall_ms=%.0f insns=%llu mips=%.1f\n",
+                ms, (unsigned long long)i, ms > 0 ? i / (ms * 1000.0) : 0.0);
+    }
 
     RiscvEmulatorDestroy(st);
     return g_exit;

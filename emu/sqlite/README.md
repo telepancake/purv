@@ -103,3 +103,39 @@ if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); }
 
 Needs `clang` (targets riscv32 directly), `ld.lld`, and a host `gcc`. The big
 `sqlite3.c` object is cached after the first build.
+
+## Benchmark: native vs emulated
+
+`bench.c` is a deliberately heavy, fully reproducible SQL workload — bulk insert
+in a transaction, a secondary index, `GROUP BY`/`HAVING`, window functions, a
+correlated self-join, string functions, an `UPDATE`+`DELETE` pass, a large
+`ORDER BY`, and two recursive CTEs (a Collatz-length tournament and an
+integer-only Mandelbrot escape-count grid). It is **all integer arithmetic**
+(the build has no floats) and every phase collapses to one checksum row, so the
+transcript is small and deterministic.
+
+```sh
+./benchmark.sh          # or: make benchmark        (default workload)
+./benchmark.sh 30       # or: make benchmark SCALE=30 (percent of default size)
+```
+
+The script builds the *same* `bench.c` two ways — once linked against a SQLite
+compiled for this machine, once as the freestanding RV32 guest on purv — runs
+both, **diffs the two transcripts (they must be byte-identical)**, and reports
+the wall-clock time for each plus the slowdown:
+
+```
+  SQLite freestanding benchmark   (BENCH_SCALE=100, 13-line transcript, identical)
+
+                      wall time   throughput
+    native (host)       0.087 s
+    purv (RV32 emu)    30.250 s   73.9 MIPS, 2.24 G instructions
+    slowdown            347.7x
+```
+
+The same SQLite options are used on both sides (the native build only swaps the
+guest's stub VFS for this box's normal one — immaterial for `:memory:`), so the
+comparison isolates the cost of interpreting RV32 instruction-by-instruction. The
+purv host prints these stats only when asked (`./host guest.elf --stats`); the
+plain demo run is unaffected. `~70 MIPS` and `~350×` are representative of a
+simple non-JIT interpreter.

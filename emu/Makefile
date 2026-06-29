@@ -3,6 +3,7 @@
 #   make            build the host emulator binary `purv`
 #   make test       build + run the examples (wasm-style call + signature dump)
 #   make sqlite      build + run freestanding SQLite on purv (see sqlite/README.md)
+#   make benchmark   build a heavy SQLite workload native + on purv, compare timings
 #   make compact     build + run the 363-byte no-runtime flat binary (see compact/README.md)
 #   make regen      regenerate purv.h from the atoom submodule (needs it checked out)
 #   make clean
@@ -28,13 +29,19 @@ LDFLAGS  ?= -m elf32lriscv --image-base=0x80000000
 ATOOM_INC ?= ../third_party/atoomnetmarc-rv/include
 OUTDIR    ?= .
 
-.PHONY: all test conformance sqlite compact regen clean
+.PHONY: all test conformance sqlite benchmark compact regen clean
 all: purv
 
 # Freestanding SQLite running on purv: fetches the amalgamation, builds the
 # guest + host, and runs the SQL demo. Self-contained; see sqlite/README.md.
 sqlite:
 	$(MAKE) -C sqlite run
+
+# Benchmark: the heavy bench.c workload compiled both native and for purv, run on
+# each, transcripts diffed for equality, wall-clock + MIPS reported. `SCALE=` (a
+# percentage of the default size) dials the runtime; see sqlite/benchmark.sh.
+benchmark:
+	$(MAKE) -C sqlite benchmark SCALE=$(SCALE)
 
 # Compact no-runtime demo: a 363-byte headerless fixed-point Mandelbrot flat
 # binary, self-contained (own host). See PORTING.md and compact/README.md.

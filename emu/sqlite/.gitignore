@@ -2,3 +2,9 @@ vendor/
 *.o
 guest.elf
 host
+guest-bench.elf
+bench-native
+native.out
+native.err
+purv.out
+purv.err

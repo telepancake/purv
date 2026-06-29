@@ -5,6 +5,7 @@
 #   make emu-test     build + run the emulator examples
 #   make secure       tagged-memory pointer-safety demo (emu/purvs)
 #   make sqlite       freestanding SQLite running on purv (fetch + build + run)
+#   make benchmark    heavy SQLite workload: native vs purv timings (SCALE=NN to dial)
 #   make compact      363-byte no-runtime flat binary: fixed-point Mandelbrot
 #
 # Conformance harness (RISCOF vs the Sail reference model):
@@ -41,10 +42,10 @@ SAIL_BIN       ?= $(SAIL_DL_BIN)
 # Built artifact Spike's plugin invokes.
 SPIKE_BIN   := $(SPIKE_DIR)/build/spike
 
-.PHONY: help emu emu-test secure sqlite compact bootstrap spike sail sail-dl sail-build validate conformance clean distclean
+.PHONY: help emu emu-test secure sqlite benchmark compact bootstrap spike sail sail-dl sail-build validate conformance clean distclean
 
 help:
-	@sed -n '1,16p' $(MAKEFILE_LIST)
+	@sed -n '1,17p' $(MAKEFILE_LIST)
 
 # --- The emulator and demos (the actual purv work) ------------------------
 
@@ -59,6 +60,11 @@ secure:
 
 sqlite:
 	$(MAKE) -C emu sqlite
+
+# Heavy SQLite workload timed native vs on purv. `make benchmark SCALE=30` for a
+# quick pass (percent of the default size).
+benchmark:
+	$(MAKE) -C emu benchmark SCALE=$(SCALE)
 
 compact:
 	$(MAKE) -C emu compact
