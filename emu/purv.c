@@ -5,14 +5,12 @@
  * The only public surface is purv.h.
  */
 #include <stdint.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "purv.h"
 
-typedef struct __attribute__((packed)) {
-    uint32_t hartid : 32;
-} RiscvCSRmhartid_t;
+typedef struct __attribute__((packed)) { uint32_t hartid : 32; } RiscvCSRmhartid_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t pmp0cfg;
@@ -21,9 +19,7 @@ typedef struct __attribute__((packed)) {
     uint8_t pmp3cfg;
 } RiscvCSRpmpcfg0_t;
 
-typedef struct __attribute__((packed)) {
-    uint32_t address;
-} RiscvCSRpmpaddr0_t;
+typedef struct __attribute__((packed)) { uint32_t address; } RiscvCSRpmpaddr0_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t : 3;
@@ -35,18 +31,14 @@ typedef struct __attribute__((packed)) {
     uint32_t : 19;
 } RiscvCSRmnstatus_t;
 
-typedef struct __attribute__((packed)) {
-    uint32_t mscratch;
-} RiscvCSRmscratch_t;
+typedef struct __attribute__((packed)) { uint32_t mscratch; } RiscvCSRmscratch_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t exceptioncode : 31;
     uint8_t interrupt : 1;
 } RiscvCSRmcause_t;
 
-typedef struct __attribute__((packed)) {
-    uint32_t mip;
-} RiscvCSRmip_t;
+typedef struct __attribute__((packed)) { uint32_t mip; } RiscvCSRmip_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t : 1;
@@ -118,13 +110,8 @@ typedef union {
     };
 } RiscvCSRmisa_u;
 
-typedef struct __attribute__((packed)) {
-    uint32_t synchronousexceptions;
-} RiscvCSRmedeleg_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t interrupts;
-} RiscvCSRmideleg_t;
+typedef struct __attribute__((packed)) { uint32_t synchronousexceptions; } RiscvCSRmedeleg_t;
+typedef struct __attribute__((packed)) { uint32_t interrupts; } RiscvCSRmideleg_t;
 
 typedef union {
     struct __attribute__((packed)) {
@@ -749,8 +736,7 @@ typedef union {
 } RiscvRegister_u;
 
 typedef union {
-    struct
-    {
+    struct {
         uint8_t illegalinstruction : 1;
         uint8_t instructionaddressmisaligned : 1;
         uint8_t breakpoint : 1;
@@ -912,33 +898,28 @@ struct RiscvEmulatorState {
 #define FUNCT3_STORE_SH 0b001
 #define FUNCT3_STORE_SW 0b010
 
-static void RiscvEmulatorC_ADDI4SPN(const uint8_t rdnum, void *rd, void *sp, const uint16_t nzuimm) {
-    if (rdnum == 0) {
-        return;
-    }
+static void RiscvEmulatorC_ADDI4SPN(const uint8_t rdnum, void *rd, void *sp,
+                                    const uint16_t nzuimm) {
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)sp + nzuimm;
 }
 
-static void RiscvEmulatorC_LW(RiscvEmulatorState_t *state, void *rd, void *rs1, const uint8_t offset) {
+static void RiscvEmulatorC_LW(RiscvEmulatorState_t *state, void *rd, void *rs1,
+                              const uint8_t offset) {
     uint32_t memorylocation = *(int32_t *)rs1 + offset;
-    if (state->trapflag.storeaddressmisaligned == 1) {
-        return;
-    }
+    if (state->trapflag.storeaddressmisaligned == 1) { return; }
     RiscvEmulatorLoad(memorylocation, rd, sizeof(uint32_t));
 }
 
-static void RiscvEmulatorC_SW(RiscvEmulatorState_t *state, void *rs1, void *rs2, const uint8_t offset) {
+static void RiscvEmulatorC_SW(RiscvEmulatorState_t *state, void *rs1, void *rs2,
+                              const uint8_t offset) {
     uint32_t memorylocation = *(int32_t *)rs1 + offset;
-    if (state->trapflag.storeaddressmisaligned == 1) {
-        return;
-    }
+    if (state->trapflag.storeaddressmisaligned == 1) { return; }
     RiscvEmulatorStore(memorylocation, rs2, sizeof(uint32_t));
 }
 
 static void RiscvEmulatorC_ADDI(const uint8_t rdnum, void *rd, const int8_t nzimm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rd + nzimm;
 }
 
@@ -962,28 +943,20 @@ static void RiscvEmulatorC_JR(RiscvEmulatorState_t *state, void *rs1) {
 }
 
 static void RiscvEmulatorC_BEQZ(RiscvEmulatorState_t *state, void *rs1, const int16_t imm) {
-    if (*(int32_t *)rs1 == 0) {
-        state->programcounternext = state->programcounter + imm;
-    }
+    if (*(int32_t *)rs1 == 0) { state->programcounternext = state->programcounter + imm; }
 }
 
 static void RiscvEmulatorC_BNEZ(RiscvEmulatorState_t *state, void *rs1, const int16_t imm) {
-    if (*(int32_t *)rs1 != 0) {
-        state->programcounternext = state->programcounter + imm;
-    }
+    if (*(int32_t *)rs1 != 0) { state->programcounternext = state->programcounter + imm; }
 }
 
 static void RiscvEmulatorC_SLLI(const uint8_t rdnum, void *rd, const uint8_t shamt) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rd << shamt;
 }
 
 static void RiscvEmulatorC_LI(const uint8_t rdnum, void *rd, const int8_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = imm;
 }
 
@@ -995,9 +968,7 @@ static void RiscvEmulatorC_ADDI16SP(RiscvEmulatorState_t *state, void *rd) {
     immdecoder.bit.imm8_7 = state->instruction.ciaddi16sp.imm8_7;
     immdecoder.bit.imm9 = state->instruction.ciaddi16sp.imm9;
     int16_t nzimm = immdecoder.imm;
-    if (nzimm == 0) {
-        return;
-    }
+    if (nzimm == 0) { return; }
     *(int32_t *)rd += nzimm;
 }
 
@@ -1007,73 +978,53 @@ static void RiscvEmulatorC_LUI(RiscvEmulatorState_t *state, const uint8_t rdnum,
     immdecoder.bit.imm17 = state->instruction.cilui.imm17;
     int32_t nzimm = immdecoder.imm;
 
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = nzimm;
 }
 
 static void RiscvEmulatorC_SRLI(const uint8_t rdnum, void *rd, uint8_t shamt) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rd >> shamt;
 }
 
 static void RiscvEmulatorC_SRAI(const uint8_t rdnum, void *rd, uint8_t shamt) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rd >> shamt;
 }
 
 static void RiscvEmulatorC_ANDI(const uint8_t rdnum, void *rd, int8_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rd & imm;
 }
 
 static void RiscvEmulatorC_SUB(const uint8_t rdnum, void *rd, void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rd - *(int32_t *)rs2;
 }
 
 static void RiscvEmulatorC_XOR(const uint8_t rdnum, void *rd, void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rd ^ *(uint32_t *)rs2;
 }
 
 static void RiscvEmulatorC_OR(const uint8_t rdnum, void *rd, void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rd | *(uint32_t *)rs2;
 }
 
 static void RiscvEmulatorC_AND(const uint8_t rdnum, void *rd, void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rd & *(uint32_t *)rs2;
 }
 
 static void RiscvEmulatorC_LWSP(const uint8_t rdnum, void *rd, void *sp, const uint8_t offset) {
     uint32_t memorylocation = *(int32_t *)sp + offset;
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     RiscvEmulatorLoad(memorylocation, rd, sizeof(uint32_t));
 }
 
 static void RiscvEmulatorC_MV(const uint8_t rdnum, void *rd, void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs2;
 }
 
@@ -1084,9 +1035,7 @@ static void RiscvEmulatorC_EBREAK(RiscvEmulatorState_t *state) {
 }
 
 static void RiscvEmulatorC_ADD(const uint8_t rdnum, void *rd, void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rd + *(int32_t *)rs2;
 }
 
@@ -1129,8 +1078,7 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
         funct.funct2 = state->instruction.cbimm.funct2;
         funct3_funct2 = funct.funct3_funct2;
 
-        if (funct3_funct2 == FUNCT3_FUNCT2_SRLI ||
-            funct3_funct2 == FUNCT3_FUNCT2_SRAI ||
+        if (funct3_funct2 == FUNCT3_FUNCT2_SRLI || funct3_funct2 == FUNCT3_FUNCT2_SRAI ||
             funct3_funct2 == FUNCT3_FUNCT2_ANDI) {
             RiscvInstructionTypeCBImmDecoderImm_u immdecoder = {0};
             immdecoder.bit.imm4_0 = state->instruction.cbimm.imm4_0;
@@ -1145,10 +1093,8 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
         catfunct.funct2 = state->instruction.catype.funct2;
         funct6_funct2 = catfunct.funct6_funct2;
 
-        if (funct6_funct2 == FUNCT6_FUNCT2_SUB ||
-            funct6_funct2 == FUNCT6_FUNCT2_XOR ||
-            funct6_funct2 == FUNCT6_FUNCT2_OR ||
-            funct6_funct2 == FUNCT6_FUNCT2_AND) {
+        if (funct6_funct2 == FUNCT6_FUNCT2_SUB || funct6_funct2 == FUNCT6_FUNCT2_XOR ||
+            funct6_funct2 == FUNCT6_FUNCT2_OR || funct6_funct2 == FUNCT6_FUNCT2_AND) {
             rdnum = state->instruction.catype.rdp + 8;
             rs2num = state->instruction.catype.rs2p + 8;
             break;
@@ -1230,15 +1176,9 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
     }
     }
 
-    if (rdnum >= 0) {
-        rd = &state->reg.x[rdnum];
-    }
-    if (rs1num >= 0) {
-        rs1 = &state->reg.x[rs1num];
-    }
-    if (rs2num >= 0) {
-        rs2 = &state->reg.x[rs2num];
-    }
+    if (rdnum >= 0) { rd = &state->reg.x[rdnum]; }
+    if (rs1num >= 0) { rs1 = &state->reg.x[rs1num]; }
+    if (rs2num >= 0) { rs2 = &state->reg.x[rs2num]; }
 
     switch (opfunct3) {
     case OPCODE16_ADDI4SPN:
@@ -1248,21 +1188,11 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
             state->trapflag.illegalinstruction = 1;
         }
         break;
-    case OPCODE16_LW:
-        RiscvEmulatorC_LW(state, rd, rs1, imm);
-        break;
-    case OPCODE16_SW:
-        RiscvEmulatorC_SW(state, rs1, rs2, imm);
-        break;
-    case OPCODE16_ADDI:
-        RiscvEmulatorC_ADDI(rdnum, rd, imm);
-        break;
-    case OPCODE16_JAL:
-        RiscvEmulatorC_JAL(state, ra, imm);
-        break;
-    case OPCODE16_LI:
-        RiscvEmulatorC_LI(rdnum, rd, imm);
-        break;
+    case OPCODE16_LW: RiscvEmulatorC_LW(state, rd, rs1, imm); break;
+    case OPCODE16_SW: RiscvEmulatorC_SW(state, rs1, rs2, imm); break;
+    case OPCODE16_ADDI: RiscvEmulatorC_ADDI(rdnum, rd, imm); break;
+    case OPCODE16_JAL: RiscvEmulatorC_JAL(state, ra, imm); break;
+    case OPCODE16_LI: RiscvEmulatorC_LI(rdnum, rd, imm); break;
     case OPCODE16_LUI_ADDI16SP: {
         rdnum = state->instruction.cilui.rd;
         rd = &state->reg.x[rdnum];
@@ -1292,21 +1222,11 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
             state->trapflag.illegalinstruction = 1;
         }
         break;
-    case OPCODE16_J:
-        RiscvEmulatorC_J(state, imm);
-        break;
-    case OPCODE16_BEQZ:
-        RiscvEmulatorC_BEQZ(state, rs1, imm);
-        break;
-    case OPCODE16_BNEZ:
-        RiscvEmulatorC_BNEZ(state, rs1, imm);
-        break;
-    case OPCODE16_SLLI:
-        RiscvEmulatorC_SLLI(rdnum, rd, imm);
-        break;
-    case OPCODE16_LWSP:
-        RiscvEmulatorC_LWSP(rdnum, rd, sp, imm);
-        break;
+    case OPCODE16_J: RiscvEmulatorC_J(state, imm); break;
+    case OPCODE16_BEQZ: RiscvEmulatorC_BEQZ(state, rs1, imm); break;
+    case OPCODE16_BNEZ: RiscvEmulatorC_BNEZ(state, rs1, imm); break;
+    case OPCODE16_SLLI: RiscvEmulatorC_SLLI(rdnum, rd, imm); break;
+    case OPCODE16_LWSP: RiscvEmulatorC_LWSP(rdnum, rd, sp, imm); break;
     case OPCODE16_JALR_MV_ADD:
         rdnum = state->instruction.crtype.rd;
         rd = &state->reg.x[rdnum];
@@ -1329,50 +1249,36 @@ static void RiscvEmulatorOpcodeCompressed(RiscvEmulatorState_t *state) {
             }
         }
         break;
-    case OPCODE16_SWSP:
-        RiscvEmulatorC_SWSP(rs2, sp, imm);
-        break;
-    default:
-        state->trapflag.illegalinstruction = 1;
-        break;
+    case OPCODE16_SWSP: RiscvEmulatorC_SWSP(rs2, sp, imm); break;
+    default: state->trapflag.illegalinstruction = 1; break;
     }
 }
 
 static void RiscvEmulatorMUL(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = (*(uint32_t *)rs1 * *(uint32_t *)rs2);
 }
 
 static void RiscvEmulatorMULH(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     int64_t result = (int64_t)(*(int32_t *)rs1 * (int64_t) * (int32_t *)rs2);
     *(int32_t *)rd = (result >> 32);
 }
 
 static void RiscvEmulatorMULHSU(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     int64_t result = (int64_t)(*(int32_t *)rs1 * (uint64_t) * (uint32_t *)rs2);
     *(int32_t *)rd = (result >> 32);
 }
 
 static void RiscvEmulatorMULHU(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     uint64_t result = (uint64_t)(*(uint32_t *)rs1 * (uint64_t) * (uint32_t *)rs2);
     *(uint32_t *)rd = (result >> 32);
 }
 
 static void RiscvEmulatorDIV(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     if (*(int32_t *)rs2 == 0) {
         *(int32_t *)rd = -1;
     } else if (*(int32_t *)rs1 == INT32_MIN && *(int32_t *)rs2 == -1) {
@@ -1383,9 +1289,7 @@ static void RiscvEmulatorDIV(const uint8_t rdnum, void *rd, const void *rs1, con
 }
 
 static void RiscvEmulatorDIVU(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     if (*(uint32_t *)rs2 == 0) {
         *(uint32_t *)rd = UINT32_MAX;
     } else {
@@ -1394,9 +1298,7 @@ static void RiscvEmulatorDIVU(const uint8_t rdnum, void *rd, const void *rs1, co
 }
 
 static void RiscvEmulatorREM(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     if (*(int32_t *)rs2 == 0) {
         *(int32_t *)rd = *(int32_t *)rs1;
     } else if (*(int32_t *)rs1 == INT32_MIN && *(int32_t *)rs2 == -1) {
@@ -1407,9 +1309,7 @@ static void RiscvEmulatorREM(const uint8_t rdnum, void *rd, const void *rs1, con
 }
 
 static void RiscvEmulatorREMU(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     if (*(uint32_t *)rs2 == 0) {
         *(uint32_t *)rd = *(uint32_t *)rs1;
     } else {
@@ -1428,54 +1328,22 @@ static void RiscvEmulatorMRET(RiscvEmulatorState_t *state) {
 static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *state, const uint16_t csr) {
     void *address = 0;
     switch (csr) {
-    case 0xF14:
-        address = &state->csr.mhartid;
-        break;
-    case 0x300:
-        address = &state->csr.mstatus;
-        break;
-    case 0x302:
-        address = &state->csr.medeleg;
-        break;
-    case 0x303:
-        address = &state->csr.mideleg;
-        break;
-    case 0x304:
-        address = &state->csr.mie;
-        break;
-    case 0x305:
-        address = &state->csr.mtvec;
-        break;
-    case 0x310:
-        address = &state->csr.mstatush;
-        break;
-    case 0x340:
-        address = &state->csr.mscratch;
-        break;
-    case 0x341:
-        address = &state->csr.mepc;
-        break;
-    case 0x342:
-        address = &state->csr.mcause;
-        break;
-    case 0x343:
-        address = &state->csr.mtval;
-        break;
-    case 0x344:
-        address = &state->csr.mip;
-        break;
-    case 0x3A0:
-        address = &state->csr.pmpcfg0;
-        break;
-    case 0x3B0:
-        address = &state->csr.pmpaddr0;
-        break;
-    case 0x744:
-        address = &state->csr.mnstatus;
-        break;
-    case 0x180:
-        address = &state->csr.satp;
-        break;
+    case 0xF14: address = &state->csr.mhartid; break;
+    case 0x300: address = &state->csr.mstatus; break;
+    case 0x302: address = &state->csr.medeleg; break;
+    case 0x303: address = &state->csr.mideleg; break;
+    case 0x304: address = &state->csr.mie; break;
+    case 0x305: address = &state->csr.mtvec; break;
+    case 0x310: address = &state->csr.mstatush; break;
+    case 0x340: address = &state->csr.mscratch; break;
+    case 0x341: address = &state->csr.mepc; break;
+    case 0x342: address = &state->csr.mcause; break;
+    case 0x343: address = &state->csr.mtval; break;
+    case 0x344: address = &state->csr.mip; break;
+    case 0x3A0: address = &state->csr.pmpcfg0; break;
+    case 0x3B0: address = &state->csr.pmpaddr0; break;
+    case 0x744: address = &state->csr.mnstatus; break;
+    case 0x180: address = &state->csr.satp; break;
     default:
         address = RiscvEmulatorGetUnknownCSR(state, csr);
         if (address == 0) {
@@ -1486,57 +1354,43 @@ static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *state, const uint1
     return address;
 }
 
-static void RiscvEmulatorCSRRW(const uint8_t rdnum, const void *rd, const void *rs1, const void *csr) {
+static void RiscvEmulatorCSRRW(const uint8_t rdnum, const void *rd, const void *rs1,
+                               const void *csr) {
     uint32_t originalvaluers1 = *(uint32_t *)rs1;
-    if (rdnum != 0) {
-        *(uint32_t *)rd = *(uint32_t *)csr;
-    }
+    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)csr; }
     *(uint32_t *)csr = originalvaluers1;
 }
 
-static void RiscvEmulatorCSRRWI(const uint8_t rdnum, const void *rd, const uint8_t uimm, const void *csr) {
-    if (rdnum != 0) {
-        *(uint32_t *)rd = *(uint32_t *)csr;
-    }
+static void RiscvEmulatorCSRRWI(const uint8_t rdnum, const void *rd, const uint8_t uimm,
+                                const void *csr) {
+    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)csr; }
     *(uint32_t *)csr = uimm;
 }
 
-static void RiscvEmulatorCSRRS(const uint8_t rdnum, const void *rd, const void *rs1, const void *csr) {
+static void RiscvEmulatorCSRRS(const uint8_t rdnum, const void *rd, const void *rs1,
+                               const void *csr) {
     int32_t initialrs1value = *(uint32_t *)rs1;
-    if (rdnum != 0) {
-        *(uint32_t *)rd = *(uint32_t *)csr;
-    }
-    if (initialrs1value != 0) {
-        *(uint32_t *)csr |= initialrs1value;
-    }
+    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)csr; }
+    if (initialrs1value != 0) { *(uint32_t *)csr |= initialrs1value; }
 }
 
-static void RiscvEmulatorCSRRSI(const uint8_t rdnum, const void *rd, const uint8_t uimm, const void *csr) {
-    if (rdnum != 0) {
-        *(uint32_t *)rd = *(uint32_t *)csr;
-    }
-    if (uimm != 0) {
-        *(uint32_t *)csr |= uimm;
-    }
+static void RiscvEmulatorCSRRSI(const uint8_t rdnum, const void *rd, const uint8_t uimm,
+                                const void *csr) {
+    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)csr; }
+    if (uimm != 0) { *(uint32_t *)csr |= uimm; }
 }
 
-static void RiscvEmulatorCSRRC(const uint8_t rdnum, const void *rd, const void *rs1, const void *csr) {
+static void RiscvEmulatorCSRRC(const uint8_t rdnum, const void *rd, const void *rs1,
+                               const void *csr) {
     int32_t initialrs1value = *(uint32_t *)rs1;
-    if (rdnum != 0) {
-        *(uint32_t *)rd = *(uint32_t *)csr;
-    }
-    if (initialrs1value != 0) {
-        *(uint32_t *)csr &= ~initialrs1value;
-    }
+    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)csr; }
+    if (initialrs1value != 0) { *(uint32_t *)csr &= ~initialrs1value; }
 }
 
-static void RiscvEmulatorCSRRCI(const uint8_t rdnum, const void *rd, const uint8_t uimm, const void *csr) {
-    if (rdnum != 0) {
-        *(uint32_t *)rd = *(uint32_t *)csr;
-    }
-    if (uimm != 0) {
-        *(uint32_t *)csr &= ~uimm;
-    }
+static void RiscvEmulatorCSRRCI(const uint8_t rdnum, const void *rd, const uint8_t uimm,
+                                const void *csr) {
+    if (rdnum != 0) { *(uint32_t *)rd = *(uint32_t *)csr; }
+    if (uimm != 0) { *(uint32_t *)csr &= ~uimm; }
 }
 
 static void RiscvEmulatorJALR(RiscvEmulatorState_t *state) {
@@ -1546,9 +1400,7 @@ static void RiscvEmulatorJALR(RiscvEmulatorState_t *state) {
     void *rs1 = &state->reg.x[rs1num];
     int16_t imm = state->instruction.itype.imm;
     uint32_t jumptoprogramcounter = (*(uint32_t *)rs1 + imm) & (UINT32_MAX - 1);
-    if (rdnum != 0) {
-        *(uint32_t *)rd = state->programcounternext;
-    }
+    if (rdnum != 0) { *(uint32_t *)rd = state->programcounternext; }
     state->programcounternext = jumptoprogramcounter;
 }
 
@@ -1561,135 +1413,97 @@ static void RiscvEmulatorOpcodeJumpAndLinkRegister(RiscvEmulatorState_t *state) 
 }
 
 static void RiscvEmulatorADD(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 + *(int32_t *)rs2;
 }
 
 static void RiscvEmulatorADDI(const uint8_t rdnum, void *rd, const void *rs1, const int16_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 + imm;
 }
 
 static void RiscvEmulatorSUB(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 - *(int32_t *)rs2;
 }
 
 static void RiscvEmulatorSLL(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rs1 << (*(uint32_t *)rs2 & 0b11111);
 }
 
 static void RiscvEmulatorSLLI(const uint8_t rdnum, void *rd, const void *rs1, const uint8_t shamt) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rs1 << (shamt & 0b11111);
 }
 
 static void RiscvEmulatorSLT(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = (*(int32_t *)rs1 < *(int32_t *)rs2);
 }
 
 static void RiscvEmulatorSLTI(const uint8_t rdnum, void *rd, const void *rs1, const int16_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = (*(int32_t *)rs1 < imm);
 }
 
 static void RiscvEmulatorSLTU(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = (*(uint32_t *)rs1 < *(uint32_t *)rs2);
 }
 
 static void RiscvEmulatorSLTIU(const uint8_t rdnum, void *rd, const void *rs1, const uint32_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = (*(uint32_t *)rs1 < imm);
 }
 
 static void RiscvEmulatorXOR(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rs1 ^ *(uint32_t *)rs2;
 }
 
 static void RiscvEmulatorXORI(const uint8_t rdnum, void *rd, const void *rs1, const uint32_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rs1 ^ imm;
 }
 
 static void RiscvEmulatorSRL(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rs1 >> (*(uint32_t *)rs2 & 0b11111);
 }
 
 static void RiscvEmulatorSRLI(const uint8_t rdnum, void *rd, const void *rs1, const uint8_t shamt) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(uint32_t *)rd = *(uint32_t *)rs1 >> (shamt & 0b11111);
 }
 
 static void RiscvEmulatorSRA(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 >> (*(uint32_t *)rs2 & 0b11111);
 }
 
 static void RiscvEmulatorSRAI(const uint8_t rdnum, void *rd, const void *rs1, const uint8_t shamt) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 >> (shamt & 0b11111);
 }
 
 static void RiscvEmulatorOR(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 | *(int32_t *)rs2;
 }
 
 static void RiscvEmulatorORI(const uint8_t rdnum, void *rd, const void *rs1, const int16_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 | imm;
 }
 
 static void RiscvEmulatorAND(const uint8_t rdnum, void *rd, const void *rs1, const void *rs2) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 & *(int32_t *)rs2;
 }
 
 static void RiscvEmulatorANDI(const uint8_t rdnum, void *rd, const void *rs1, const int16_t imm) {
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
     *(int32_t *)rd = *(int32_t *)rs1 & imm;
 }
 
@@ -1705,63 +1519,25 @@ static void RiscvEmulatorOpcodeOperation(RiscvEmulatorState_t *state) {
     decoder.funct7 = state->instruction.rtype.funct7;
 
     switch (decoder.funct7_3) {
-    case FUNCT7_FUNCT3_OPERATION_ADD:
-        RiscvEmulatorADD(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_SUB:
-        RiscvEmulatorSUB(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_SLL:
-        RiscvEmulatorSLL(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_SLT:
-        RiscvEmulatorSLT(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_SLTU:
-        RiscvEmulatorSLTU(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_XOR:
-        RiscvEmulatorXOR(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_SRL:
-        RiscvEmulatorSRL(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_SRA:
-        RiscvEmulatorSRA(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_OR:
-        RiscvEmulatorOR(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_AND:
-        RiscvEmulatorAND(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_MUL:
-        RiscvEmulatorMUL(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_MULH:
-        RiscvEmulatorMULH(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_MULHSU:
-        RiscvEmulatorMULHSU(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_MULHU:
-        RiscvEmulatorMULHU(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_DIV:
-        RiscvEmulatorDIV(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_DIVU:
-        RiscvEmulatorDIVU(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_REM:
-        RiscvEmulatorREM(rdnum, rd, rs1, rs2);
-        break;
-    case FUNCT7_FUNCT3_OPERATION_REMU:
-        RiscvEmulatorREMU(rdnum, rd, rs1, rs2);
-        break;
-    default:
-        state->trapflag.illegalinstruction = 1;
-        break;
+    case FUNCT7_FUNCT3_OPERATION_ADD: RiscvEmulatorADD(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_SUB: RiscvEmulatorSUB(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_SLL: RiscvEmulatorSLL(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_SLT: RiscvEmulatorSLT(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_SLTU: RiscvEmulatorSLTU(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_XOR: RiscvEmulatorXOR(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_SRL: RiscvEmulatorSRL(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_SRA: RiscvEmulatorSRA(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_OR: RiscvEmulatorOR(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_AND: RiscvEmulatorAND(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_MUL: RiscvEmulatorMUL(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_MULH: RiscvEmulatorMULH(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_MULHSU: RiscvEmulatorMULHSU(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_MULHU: RiscvEmulatorMULHU(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_DIV: RiscvEmulatorDIV(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_DIVU: RiscvEmulatorDIVU(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_REM: RiscvEmulatorREM(rdnum, rd, rs1, rs2); break;
+    case FUNCT7_FUNCT3_OPERATION_REMU: RiscvEmulatorREMU(rdnum, rd, rs1, rs2); break;
+    default: state->trapflag.illegalinstruction = 1; break;
     }
 }
 
@@ -1772,49 +1548,28 @@ static void RiscvEmulatorOpcodeImmediate(RiscvEmulatorState_t *state) {
     void *rs1 = &state->reg.x[rs1num];
     uint8_t funct3 = state->instruction.itype.funct3;
 
-    if (funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_1 ||
-        funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_5) {
+    if (funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_1 || funct3 == FUNCT3_IMMEDIATE_FUNCTIONS_5) {
         uint8_t shamt = state->instruction.itypeshiftbyconstant.shamt;
         RiscvInstructionTypeIDecoderImm11_7Funct3Imm11_7Funct3_u decoder = {0};
         decoder.funct3 = funct3;
         decoder.imm11_5 = state->instruction.itypeshiftbyconstant.imm11_5;
 
         switch (decoder.imm11_5funct3) {
-        case IMM11_5_FUNCT3_IMMEDIATE_SLLI:
-            RiscvEmulatorSLLI(rdnum, rd, rs1, shamt);
-            return;
-        case IMM11_5_FUNCT3_IMMEDIATE_SRLI:
-            RiscvEmulatorSRLI(rdnum, rd, rs1, shamt);
-            return;
-        case IMM11_5_FUNCT3_IMMEDIATE_SRAI:
-            RiscvEmulatorSRAI(rdnum, rd, rs1, shamt);
-            return;
+        case IMM11_5_FUNCT3_IMMEDIATE_SLLI: RiscvEmulatorSLLI(rdnum, rd, rs1, shamt); return;
+        case IMM11_5_FUNCT3_IMMEDIATE_SRLI: RiscvEmulatorSRLI(rdnum, rd, rs1, shamt); return;
+        case IMM11_5_FUNCT3_IMMEDIATE_SRAI: RiscvEmulatorSRAI(rdnum, rd, rs1, shamt); return;
         }
     }
 
     int16_t imm = state->instruction.itype.imm;
     switch (funct3) {
-    case FUNCT3_IMMEDIATE_ADDI:
-        RiscvEmulatorADDI(rdnum, rd, rs1, imm);
-        break;
-    case FUNCT3_IMMEDIATE_SLTI:
-        RiscvEmulatorSLTI(rdnum, rd, rs1, imm);
-        break;
-    case FUNCT3_IMMEDIATE_SLTIU:
-        RiscvEmulatorSLTIU(rdnum, rd, rs1, imm);
-        break;
-    case FUNCT3_IMMEDIATE_XORI:
-        RiscvEmulatorXORI(rdnum, rd, rs1, imm);
-        break;
-    case FUNCT3_IMMEDIATE_ORI:
-        RiscvEmulatorORI(rdnum, rd, rs1, imm);
-        break;
-    case FUNCT3_IMMEDIATE_ANDI:
-        RiscvEmulatorANDI(rdnum, rd, rs1, imm);
-        break;
-    default:
-        state->trapflag.illegalinstruction = 1;
-        break;
+    case FUNCT3_IMMEDIATE_ADDI: RiscvEmulatorADDI(rdnum, rd, rs1, imm); break;
+    case FUNCT3_IMMEDIATE_SLTI: RiscvEmulatorSLTI(rdnum, rd, rs1, imm); break;
+    case FUNCT3_IMMEDIATE_SLTIU: RiscvEmulatorSLTIU(rdnum, rd, rs1, imm); break;
+    case FUNCT3_IMMEDIATE_XORI: RiscvEmulatorXORI(rdnum, rd, rs1, imm); break;
+    case FUNCT3_IMMEDIATE_ORI: RiscvEmulatorORI(rdnum, rd, rs1, imm); break;
+    case FUNCT3_IMMEDIATE_ANDI: RiscvEmulatorANDI(rdnum, rd, rs1, imm); break;
+    default: state->trapflag.illegalinstruction = 1; break;
     }
 }
 
@@ -1828,19 +1583,11 @@ static void RiscvEmulatorOpcodeLoad(RiscvEmulatorState_t *state) {
     uint8_t length = 0;
     switch (state->instruction.itype.funct3) {
     case FUNCT3_LOAD_LB:
-    case FUNCT3_LOAD_LBU:
-        length = sizeof(uint8_t);
-        break;
+    case FUNCT3_LOAD_LBU: length = sizeof(uint8_t); break;
     case FUNCT3_LOAD_LH:
-    case FUNCT3_LOAD_LHU:
-        length = sizeof(uint16_t);
-        break;
-    case FUNCT3_LOAD_LW:
-        length = sizeof(uint32_t);
-        break;
-    default:
-        state->trapflag.illegalinstruction = 1;
-        return;
+    case FUNCT3_LOAD_LHU: length = sizeof(uint16_t); break;
+    case FUNCT3_LOAD_LW: length = sizeof(uint32_t); break;
+    default: state->trapflag.illegalinstruction = 1; return;
     }
 
     if (length > 1) {
@@ -1851,33 +1598,19 @@ static void RiscvEmulatorOpcodeLoad(RiscvEmulatorState_t *state) {
         }
     }
 
-    if (rdnum == 0) {
-        return;
-    }
+    if (rdnum == 0) { return; }
 
-    if (state->trapflag.loadaddressmisaligned == 1) {
-        return;
-    }
+    if (state->trapflag.loadaddressmisaligned == 1) { return; }
 
     uint32_t value = 0;
     RiscvEmulatorLoad(memorylocation, &value, length);
 
     switch (state->instruction.itype.funct3) {
-    case FUNCT3_LOAD_LB:
-        *(int32_t *)rd = (int8_t)value;
-        break;
-    case FUNCT3_LOAD_LBU:
-        *(uint32_t *)rd = (uint8_t)value;
-        break;
-    case FUNCT3_LOAD_LH:
-        *(int32_t *)rd = (int16_t)value;
-        break;
-    case FUNCT3_LOAD_LHU:
-        *(uint32_t *)rd = (uint16_t)value;
-        break;
-    case FUNCT3_LOAD_LW:
-        *(uint32_t *)rd = (uint32_t)value;
-        break;
+    case FUNCT3_LOAD_LB: *(int32_t *)rd = (int8_t)value; break;
+    case FUNCT3_LOAD_LBU: *(uint32_t *)rd = (uint8_t)value; break;
+    case FUNCT3_LOAD_LH: *(int32_t *)rd = (int16_t)value; break;
+    case FUNCT3_LOAD_LHU: *(uint32_t *)rd = (uint16_t)value; break;
+    case FUNCT3_LOAD_LW: *(uint32_t *)rd = (uint32_t)value; break;
     }
 }
 
@@ -1893,18 +1626,10 @@ static void RiscvEmulatorOpcodeStore(RiscvEmulatorState_t *state) {
     uint32_t memorylocation = offset + *(uint32_t *)rs1;
     uint8_t length = 0;
     switch (state->instruction.stype.funct3) {
-    case FUNCT3_STORE_SW:
-        length = sizeof(uint32_t);
-        break;
-    case FUNCT3_STORE_SH:
-        length = sizeof(uint16_t);
-        break;
-    case FUNCT3_STORE_SB:
-        length = sizeof(uint8_t);
-        break;
-    default:
-        state->trapflag.illegalinstruction = 1;
-        return;
+    case FUNCT3_STORE_SW: length = sizeof(uint32_t); break;
+    case FUNCT3_STORE_SH: length = sizeof(uint16_t); break;
+    case FUNCT3_STORE_SB: length = sizeof(uint8_t); break;
+    default: state->trapflag.illegalinstruction = 1; return;
     }
 
     if (length > 1) {
@@ -1915,9 +1640,7 @@ static void RiscvEmulatorOpcodeStore(RiscvEmulatorState_t *state) {
         }
     }
 
-    if (state->trapflag.storeaddressmisaligned == 1) {
-        return;
-    }
+    if (state->trapflag.storeaddressmisaligned == 1) { return; }
 
     RiscvEmulatorStore(memorylocation, rs2, length);
 }
@@ -1936,37 +1659,27 @@ static void RiscvEmulatorOpcodeBranch(RiscvEmulatorState_t *state) {
     uint8_t executebranch = BRANCH_NO;
     switch (state->instruction.btype.funct3) {
     case FUNCT3_BRANCH_BEQ:
-        if (*(int32_t *)rs1 == *(int32_t *)rs2)
-            executebranch = BRANCH_YES;
+        if (*(int32_t *)rs1 == *(int32_t *)rs2) executebranch = BRANCH_YES;
         break;
     case FUNCT3_BRANCH_BNE:
-        if (*(int32_t *)rs1 != *(int32_t *)rs2)
-            executebranch = BRANCH_YES;
+        if (*(int32_t *)rs1 != *(int32_t *)rs2) executebranch = BRANCH_YES;
         break;
     case FUNCT3_BRANCH_BGE:
-        if (*(int32_t *)rs1 >= *(int32_t *)rs2)
-            executebranch = BRANCH_YES;
+        if (*(int32_t *)rs1 >= *(int32_t *)rs2) executebranch = BRANCH_YES;
         break;
     case FUNCT3_BRANCH_BGEU:
-        if (*(uint32_t *)rs1 >= *(uint32_t *)rs2)
-            executebranch = BRANCH_YES;
+        if (*(uint32_t *)rs1 >= *(uint32_t *)rs2) executebranch = BRANCH_YES;
         break;
     case FUNCT3_BRANCH_BLT:
-        if (*(int32_t *)rs1 < *(int32_t *)rs2)
-            executebranch = BRANCH_YES;
+        if (*(int32_t *)rs1 < *(int32_t *)rs2) executebranch = BRANCH_YES;
         break;
     case FUNCT3_BRANCH_BLTU:
-        if (*(uint32_t *)rs1 < *(uint32_t *)rs2)
-            executebranch = BRANCH_YES;
+        if (*(uint32_t *)rs1 < *(uint32_t *)rs2) executebranch = BRANCH_YES;
         break;
-    default:
-        state->trapflag.illegalinstruction = 1;
-        return;
+    default: state->trapflag.illegalinstruction = 1; return;
     }
 
-    if (executebranch == BRANCH_YES) {
-        state->programcounternext = state->programcounter + imm;
-    }
+    if (executebranch == BRANCH_YES) { state->programcounternext = state->programcounter + imm; }
 }
 
 static void RiscvEmulatorAUIPC(RiscvEmulatorState_t *state) {
@@ -1974,9 +1687,7 @@ static void RiscvEmulatorAUIPC(RiscvEmulatorState_t *state) {
     immdecoder.bit.imm31_12 = state->instruction.utype.imm31_12;
     int32_t imm = immdecoder.imm;
     uint8_t rdnum = state->instruction.utype.rd;
-    if (rdnum != 0) {
-        state->reg.x[rdnum] = state->programcounter + imm;
-    }
+    if (rdnum != 0) { state->reg.x[rdnum] = state->programcounter + imm; }
 }
 
 static void RiscvEmulatorLUI(RiscvEmulatorState_t *state) {
@@ -1984,9 +1695,7 @@ static void RiscvEmulatorLUI(RiscvEmulatorState_t *state) {
     immdecoder.bit.imm11_0 = 0;
     immdecoder.bit.imm31_12 = state->instruction.utype.imm31_12;
     uint8_t rdnum = state->instruction.utype.rd;
-    if (rdnum != 0) {
-        state->reg.x[rdnum] = immdecoder.imm;
-    }
+    if (rdnum != 0) { state->reg.x[rdnum] = immdecoder.imm; }
 }
 
 static void RiscvEmulatorJAL(RiscvEmulatorState_t *state) {
@@ -1998,9 +1707,7 @@ static void RiscvEmulatorJAL(RiscvEmulatorState_t *state) {
     immdecoder.bit.imm19_12 = state->instruction.jtype.imm19_12;
     immdecoder.bit.imm20 = state->instruction.jtype.imm20;
     uint32_t jumptoprogramcounter = state->programcounter + immdecoder.imm;
-    if (rdnum != 0) {
-        *(uint32_t *)rd = state->programcounternext;
-    }
+    if (rdnum != 0) { *(uint32_t *)rd = state->programcounternext; }
     state->programcounternext = jumptoprogramcounter;
 }
 
@@ -2016,19 +1723,12 @@ static void RiscvEmulatorEBREAK(RiscvEmulatorState_t *state) {
 }
 
 static void RiscvEmulatorOpcodeSystem(RiscvEmulatorState_t *state) {
-    if (state->instruction.itypesystem.rd == 0 &&
-        state->instruction.itypesystem.funct3 == 0 &&
+    if (state->instruction.itypesystem.rd == 0 && state->instruction.itypesystem.funct3 == 0 &&
         state->instruction.itypesystem.rs1 == 0) {
         switch (state->instruction.itypesystem.funct12) {
-        case FUNCT12_MRET:
-            RiscvEmulatorMRET(state);
-            return;
-        case FUNCT12_ECALL:
-            RiscvEmulatorECALL(state);
-            return;
-        case FUNCT12_EBREAK:
-            RiscvEmulatorEBREAK(state);
-            return;
+        case FUNCT12_MRET: RiscvEmulatorMRET(state); return;
+        case FUNCT12_ECALL: RiscvEmulatorECALL(state); return;
+        case FUNCT12_EBREAK: RiscvEmulatorEBREAK(state); return;
         }
     }
 
@@ -2040,32 +1740,16 @@ static void RiscvEmulatorOpcodeSystem(RiscvEmulatorState_t *state) {
     uint16_t csrnum = state->instruction.itypecsr.csr;
     void *csr = RiscvEmulatorGetCSRAddress(state, csrnum);
 
-    if (state->trapflag.value > 0) {
-        return;
-    }
+    if (state->trapflag.value > 0) { return; }
 
     switch (state->instruction.itypecsr.funct3) {
-    case FUNCT3_CSR_CSRRW:
-        RiscvEmulatorCSRRW(rdnum, rd, rs1, csr);
-        break;
-    case FUNCT3_CSR_CSRRWI:
-        RiscvEmulatorCSRRWI(rdnum, rd, imm, csr);
-        break;
-    case FUNCT3_CSR_CSRRS:
-        RiscvEmulatorCSRRS(rdnum, rd, rs1, csr);
-        break;
-    case FUNCT3_CSR_CSRRSI:
-        RiscvEmulatorCSRRSI(rdnum, rd, imm, csr);
-        break;
-    case FUNCT3_CSR_CSRRC:
-        RiscvEmulatorCSRRC(rdnum, rd, rs1, csr);
-        break;
-    case FUNCT3_CSR_CSRRCI:
-        RiscvEmulatorCSRRCI(rdnum, rd, imm, csr);
-        break;
-    default:
-        state->trapflag.illegalinstruction = 1;
-        break;
+    case FUNCT3_CSR_CSRRW: RiscvEmulatorCSRRW(rdnum, rd, rs1, csr); break;
+    case FUNCT3_CSR_CSRRWI: RiscvEmulatorCSRRWI(rdnum, rd, imm, csr); break;
+    case FUNCT3_CSR_CSRRS: RiscvEmulatorCSRRS(rdnum, rd, rs1, csr); break;
+    case FUNCT3_CSR_CSRRSI: RiscvEmulatorCSRRSI(rdnum, rd, imm, csr); break;
+    case FUNCT3_CSR_CSRRC: RiscvEmulatorCSRRC(rdnum, rd, rs1, csr); break;
+    case FUNCT3_CSR_CSRRCI: RiscvEmulatorCSRRCI(rdnum, rd, imm, csr); break;
+    default: state->trapflag.illegalinstruction = 1; break;
     }
 }
 
@@ -2074,10 +1758,7 @@ static void RiscvEmulatorOpcodeMiscMem(RiscvEmulatorState_t *state) {
     uint8_t funct3 = state->instruction.itypemiscmem.funct3;
     uint8_t rs1 = state->instruction.itypemiscmem.rs1;
 
-    if (rd == 0 && rs1 == 0 &&
-        (funct3 == FUNCT3_FENCE || funct3 == FUNCT3_FENCEI)) {
-        return;
-    }
+    if (rd == 0 && rs1 == 0 && (funct3 == FUNCT3_FENCE || funct3 == FUNCT3_FENCEI)) { return; }
 
     state->trapflag.illegalinstruction = 1;
 }
@@ -2126,9 +1807,7 @@ static void RiscvEmulatorTrap(RiscvEmulatorState_t *state) {
         state->programcounternext = 4 * state->csr.mcause.exceptioncode;
     }
 
-    if (state->trapflag.illegalinstruction == 1) {
-        RiscvEmulatorIllegalInstruction(state);
-    }
+    if (state->trapflag.illegalinstruction == 1) { RiscvEmulatorIllegalInstruction(state); }
 
     state->trapflag.value = 0;
 }
@@ -2157,79 +1836,45 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
 
     // Read 16 bits.
     state->instruction.H = 0;
-    RiscvEmulatorLoad(
-        state->programcounter,
-        &state->instruction.L,
-        sizeof(state->instruction.L));
+    RiscvEmulatorLoad(state->programcounter, &state->instruction.L, sizeof(state->instruction.L));
     state->programcounternext += sizeof(state->instruction.L);
 
     // Read another 16 bits when this is a 32-bit instruction.
     if (state->instruction.copcode.op == OPCODE16_QUADRANT_INVALID) {
-        RiscvEmulatorLoad(
-            state->programcounternext,
-            &state->instruction.H,
-            sizeof(state->instruction.L));
+        RiscvEmulatorLoad(state->programcounternext, &state->instruction.H,
+                          sizeof(state->instruction.L));
         state->programcounternext += sizeof(state->instruction.L);
     } else {
         instructionlength = 16;
     }
 
-    if (instructionlength == 16) {
-        RiscvEmulatorOpcodeCompressed(state);
-    }
+    if (instructionlength == 16) { RiscvEmulatorOpcodeCompressed(state); }
 
     if (instructionlength == 32) {
         switch (state->instruction.opcode) {
-        case OPCODE32_JUMPANDLINKREGISTER:
-            RiscvEmulatorOpcodeJumpAndLinkRegister(state);
-            break;
-        case OPCODE32_OPERATION:
-            RiscvEmulatorOpcodeOperation(state);
-            break;
-        case OPCODE32_IMMEDIATE:
-            RiscvEmulatorOpcodeImmediate(state);
-            break;
-        case OPCODE32_LOAD:
-            RiscvEmulatorOpcodeLoad(state);
-            break;
-        case OPCODE32_STORE:
-            RiscvEmulatorOpcodeStore(state);
-            break;
-        case OPCODE32_BRANCH:
-            RiscvEmulatorOpcodeBranch(state);
-            break;
-        case OPCODE32_ADDUPPERIMMEDIATE2PC:
-            RiscvEmulatorAUIPC(state);
-            break;
-        case OPCODE32_LOADUPPERIMMEDIATE:
-            RiscvEmulatorLUI(state);
-            break;
-        case OPCODE32_JUMPANDLINK:
-            RiscvEmulatorJAL(state);
-            break;
-        case OPCODE32_SYSTEM:
-            RiscvEmulatorOpcodeSystem(state);
-            break;
-        case OPCODE32_MISCMEM:
-            RiscvEmulatorOpcodeMiscMem(state);
-            break;
-        default:
-            state->trapflag.illegalinstruction = 1;
-            break;
+        case OPCODE32_JUMPANDLINKREGISTER: RiscvEmulatorOpcodeJumpAndLinkRegister(state); break;
+        case OPCODE32_OPERATION: RiscvEmulatorOpcodeOperation(state); break;
+        case OPCODE32_IMMEDIATE: RiscvEmulatorOpcodeImmediate(state); break;
+        case OPCODE32_LOAD: RiscvEmulatorOpcodeLoad(state); break;
+        case OPCODE32_STORE: RiscvEmulatorOpcodeStore(state); break;
+        case OPCODE32_BRANCH: RiscvEmulatorOpcodeBranch(state); break;
+        case OPCODE32_ADDUPPERIMMEDIATE2PC: RiscvEmulatorAUIPC(state); break;
+        case OPCODE32_LOADUPPERIMMEDIATE: RiscvEmulatorLUI(state); break;
+        case OPCODE32_JUMPANDLINK: RiscvEmulatorJAL(state); break;
+        case OPCODE32_SYSTEM: RiscvEmulatorOpcodeSystem(state); break;
+        case OPCODE32_MISCMEM: RiscvEmulatorOpcodeMiscMem(state); break;
+        default: state->trapflag.illegalinstruction = 1; break;
         }
     }
 
-    if (state->trapflag.value > 0) {
-        RiscvEmulatorTrap(state);
-    }
+    if (state->trapflag.value > 0) { RiscvEmulatorTrap(state); }
 }
 
 /* ------------------------------------------------------------ public API glue */
 
 RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t ram_length) {
     RiscvEmulatorState_t *state = calloc(1, sizeof *state);
-    if (state)
-        RiscvEmulatorInit(state, ram_length);
+    if (state) RiscvEmulatorInit(state, ram_length);
     return state;
 }
 void RiscvEmulatorDestroy(RiscvEmulatorState_t *state) {
@@ -2241,8 +1886,7 @@ uint32_t RiscvEmulatorGetRegister(const RiscvEmulatorState_t *state, int index) 
 }
 void RiscvEmulatorSetRegister(RiscvEmulatorState_t *state, int index, uint32_t value) {
     index &= 31;
-    if (index)
-        state->reg.x[index] = value; /* x0 stays hard-wired zero */
+    if (index) state->reg.x[index] = value; /* x0 stays hard-wired zero */
 }
 uint32_t RiscvEmulatorGetProgramCounter(const RiscvEmulatorState_t *state) {
     return state->programcounter;

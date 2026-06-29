@@ -84,10 +84,12 @@ test: purv examples/fn.elf examples/sigtest.elf examples/hello.elf examples/args
 	@./purv --signature=examples/out.sig examples/sigtest.elf && \
 	  echo "signature:" && sed 's/^/  /' examples/out.sig
 
-# Regenerate the amalgamated header from the upstream submodule.
+# Regenerate purv.c from the upstream submodule, then compact it (the flattener
+# emits very sparse C; tools/compact.py reflows it without changing meaning).
 regen:
 	python3 tools/flatten.py $(ATOOM_INC) $(OUTDIR)
-	@echo "regenerated purv.c from $(ATOOM_INC) (purv.h is hand-written)"
+	python3 tools/compact.py $(OUTDIR)/purv.c
+	@echo "regenerated + compacted purv.c from $(ATOOM_INC) (purv.h is hand-written)"
 
 clean:
 	rm -f purv purv_clang examples/*.o examples/*.elf examples/out.sig
