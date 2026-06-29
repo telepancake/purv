@@ -336,7 +336,7 @@ static void exec(RiscvEmulatorState_t *s, uint32_t w) {
  * hook); failing that we fall back to the load hook. Half-word granularity keeps
  * RVC working and means a 32-bit op straddling the window's end still resolves
  * (each half is fetched independently). */
-static uint16_t fetch16(RiscvEmulatorState_t *s, uint32_t addr) {
+static inline uint16_t fetch16(RiscvEmulatorState_t *s, uint32_t addr) {
     if (s->fptr && addr >= s->fbase_lo && addr + 2 <= s->fbase_hi) {
         const uint8_t *p = s->fptr + (addr - s->fbase_lo);
         return (uint16_t)(p[0] | p[1] << 8);
