@@ -10,7 +10,7 @@ reserves no memory upfront: it asks the host for memory on demand, exactly like 
 asks for output.
 
 ```
-$ ./build.sh run
+$ make run
 sqlite 3.47.0  (in-memory, freestanding on purv)
 
 -- rows, ordered by qty desc --
@@ -34,13 +34,14 @@ build for exactly that:
 | `rt.c`          | freestanding runtime: `_start`, the libc subset SQLite links, the `ecall` stubs (incl. `malloc`/`free`/`realloc` as thin host-call wrappers) |
 | `builtins.c`    | compiler runtime `-nostdlib` drops: 64-bit divide, `__atomic_*` (single-core), and the soft-`double` symbols as **trap stubs** — this build has no floating point (see below) |
 | `vfs.c`         | the minimal `SQLITE_OS_OTHER` VFS (in-guest PRNG + nominal time; file ops are stubs — `:memory:` never calls them) |
-| `guest.c`       | the test program: open `:memory:`, run SQL, print rows via `write`      |
+| `guest.c`       | the demo program: open `:memory:`, run SQL, print rows via `write`      |
+| `bench.c`       | the heavy benchmark workload (shared by the guest and native builds)    |
 | `host.c`        | the purv host: loads the ELF, runs the engine, services host calls, and runs the heap allocator over guest RAM (the malloc group) |
 | `include/`      | header stubs so the freestanding compile resolves `<string.h>` etc.     |
 | `vendor/`       | the unmodified SQLite amalgamation (3.47.0)                             |
 
-The SQLite build options (in `build.sh`) are the ones from sqlite.org that strip
-it to that minimum: `SQLITE_OS_OTHER`, `SQLITE_THREADSAFE=0`,
+The SQLite build options (in the `Makefile`) are the ones from sqlite.org that
+strip it to that minimum: `SQLITE_OS_OTHER`, `SQLITE_THREADSAFE=0`,
 `SQLITE_TEMP_STORE=3`, `SQLITE_OMIT_FLOATING_POINT` (see "No floating point"),
 `SQLITE_OMIT_DATETIME_FUNCS`, `SQLITE_DEFAULT_MEMSTATUS=0`, `SQLITE_OMIT_AUTOINIT`,
 and friends. The result: the linked guest has **zero undefined symbols** and just
@@ -97,12 +98,14 @@ if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); }
 ## Build / run
 
 ```sh
-./build.sh        # compile runtime + sqlite3.c + guest, link, build host
-./build.sh run    # build, then run on the emulator
+make              # compile runtime + sqlite3.c + guest, link, build host
+make run          # build, then run on the emulator
 ```
 
-Needs `clang` (targets riscv32 directly), `ld.lld`, and a host `gcc`. The big
-`sqlite3.c` object is cached after the first build.
+It's a real Makefile: every object/ELF/host binary is a file target with proper
+prerequisites, so it rebuilds incrementally and only when an input changes. The
+big `sqlite3.c` object is cached (recompiled only when the amalgamation source is
+newer). Needs `clang` (targets riscv32 directly), `ld.lld`, and a host `gcc`.
 
 ## Benchmark: native vs emulated
 
@@ -115,11 +118,11 @@ integer-only Mandelbrot escape-count grid). It is **all integer arithmetic**
 transcript is small and deterministic.
 
 ```sh
-./benchmark.sh          # or: make benchmark        (default workload)
-./benchmark.sh 30       # or: make benchmark SCALE=30 (percent of default size)
+make benchmark             # default workload
+make benchmark SCALE=30    # percent of the default size (quicker)
 ```
 
-The script builds the *same* `bench.c` two ways — once linked against a SQLite
+The Makefile builds the *same* `bench.c` two ways — once linked against a SQLite
 compiled for this machine, once as the freestanding RV32 guest on purv — runs
 both, **diffs the two transcripts (they must be byte-identical)**, and reports
 the wall-clock time for each plus the slowdown:

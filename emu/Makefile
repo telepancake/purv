@@ -39,9 +39,10 @@ sqlite:
 
 # Benchmark: the heavy bench.c workload compiled both native and for purv, run on
 # each, transcripts diffed for equality, wall-clock + MIPS reported. `SCALE=` (a
-# percentage of the default size) dials the runtime; see sqlite/benchmark.sh.
+# percentage of the default size) dials the runtime; see sqlite/Makefile.
+# Pass SCALE through only when set, so the sub-make keeps its own default.
 benchmark:
-	$(MAKE) -C sqlite benchmark SCALE=$(SCALE)
+	$(MAKE) -C sqlite benchmark $(if $(SCALE),SCALE=$(SCALE))
 
 # Compact no-runtime demo: a 363-byte headerless fixed-point Mandelbrot flat
 # binary, self-contained (own host). See PORTING.md and compact/README.md.

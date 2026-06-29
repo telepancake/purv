@@ -62,9 +62,9 @@ sqlite:
 	$(MAKE) -C emu sqlite
 
 # Heavy SQLite workload timed native vs on purv. `make benchmark SCALE=30` for a
-# quick pass (percent of the default size).
+# quick pass (percent of the default size). Pass SCALE through only when set.
 benchmark:
-	$(MAKE) -C emu benchmark SCALE=$(SCALE)
+	$(MAKE) -C emu benchmark $(if $(SCALE),SCALE=$(SCALE))
 
 compact:
 	$(MAKE) -C emu compact
