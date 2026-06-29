@@ -5,7 +5,7 @@
 #   make emu-test     build + run the emulator examples
 #   make secure       tagged-memory pointer-safety demo (emu/purvs)
 #   make sqlite       freestanding SQLite running on purv (fetch + build + run)
-#   make compact      447-byte no-runtime demo: fixed-point Mandelbrot
+#   make compact      363-byte no-runtime flat binary: fixed-point Mandelbrot
 #
 # Conformance harness (RISCOF vs the Sail reference model):
 #   make bootstrap    fetch submodules + install riscof  (needs open git egress)

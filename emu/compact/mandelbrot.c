@@ -4,16 +4,16 @@
  * A non-trivial computation (the Mandelbrot set, rendered as ASCII) done in
  * Q16.16 *fixed point* -- the kind of thing you would normally write with
  * `double`, here in pure integers so the compiler emits NO soft-float and NO
- * 64-bit divide. The whole program is one translation unit and uses only the
- * shared host-call ABI: memory (malloc/free), output (write), exit.
+ * 64-bit divide. The whole program is one translation unit and reaches the world
+ * only through this example's own host calls (hostcalls.h): memory (malloc/free),
+ * output (write), exit.
  *
- * Built -Os, RVC, --gc-sections and stripped, laid out by link.ld so the ELF is
- * about as small as is reasonable (headers folded into the single load segment).
- * The result reaches the host through exactly the same ecalls as emu/sqlite, but
- * pulls in essentially none of the compiler runtime that SQLite needed.
+ * Built -Os, RVC, --gc-sections and stripped, laid out by link-flat.ld into a
+ * headerless flat binary -- about as small as is reasonable. It pulls in
+ * essentially none of the compiler runtime, in contrast to the SQLite example.
  */
 #include <stdint.h>
-#include "hostcalls.h"        /* shared host-call numbers (see emu/sqlite) */
+#include "hostcalls.h"        /* this example's own host-call ABI */
 
 static inline long hostcall(long n, long a0, long a1, long a2) {
     register long x17 __asm__("a7") = n;

@@ -3,7 +3,7 @@
 #   make            build the host emulator binary `purv`
 #   make test       build + run the examples (wasm-style call + signature dump)
 #   make sqlite      build + run freestanding SQLite on purv (see sqlite/README.md)
-#   make compact     build + run the 447-byte no-runtime demo (see compact/README.md)
+#   make compact     build + run the 363-byte no-runtime flat binary (see compact/README.md)
 #   make regen      regenerate purv.h from the atoom submodule (needs it checked out)
 #   make clean
 #
@@ -36,8 +36,8 @@ all: purv
 sqlite:
 	$(MAKE) -C sqlite run
 
-# Compact no-runtime demo: a 447-byte fixed-point Mandelbrot ELF (see PORTING.md
-# and compact/README.md for how it avoids the compiler runtime).
+# Compact no-runtime demo: a 363-byte headerless fixed-point Mandelbrot flat
+# binary, self-contained (own host). See PORTING.md and compact/README.md.
 compact:
 	$(MAKE) -C compact run
 

@@ -66,14 +66,15 @@ lines, like `sqlite/builtins.c`). `emu/compact` reaches *zero* such symbols;
 
 ## Smallest ELF
 
-`-ffunction-sections -fdata-sections` + `ld.lld --gc-sections -s`, a linker
-script with a single `PT_LOAD` that folds in the ELF/program headers (no
-padding), and a post-link pass to drop the section-header table (a loader only
-reads program headers). `emu/compact` does all of this — 447 bytes.
+For an ELF: `-ffunction-sections -fdata-sections` + `ld.lld --gc-sections -s`, a
+linker script with a single `PT_LOAD` that folds in the ELF/program headers (no
+padding), and optionally dropping the section-header table (a loader only reads
+program headers).
 
-Leaner still: a **flat binary** (`link-flat.ld` with `_start` first, emitted by
-`ld.lld --oformat binary`) drops *all* headers — 363 bytes, every byte program. The
-host loads it explicitly with `--flat` (it never auto-detects the format).
+Leaner still — and what `emu/compact` actually ships — is a **flat binary**:
+`link-flat.ld` puts `_start` first and `ld.lld --oformat binary` emits raw bytes,
+so there are no ELF/program/section headers at all (363 bytes, every byte
+program). Its host loads the image at a fixed address and jumps to offset 0.
 
 ## The escape hatch
 
