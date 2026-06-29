@@ -53,6 +53,16 @@ int cmain(void) {
     w("\n-- a join / computed column --\n");
     run(db, "SELECT name, qty, qty*qty AS sq FROM fruit WHERE qty BETWEEN 3 AND 10 ORDER BY name;");
 
+    /* Heavier workload: 2000 rows via a recursive CTE, then group/aggregate.
+     * This churns the heap (many malloc/realloc/free) and forces it to grow on
+     * demand -- the whole point of moving the allocator to the host. */
+    w("\n-- 2000-row CTE + aggregate (stresses the on-demand heap) --\n");
+    run(db, "CREATE TABLE big(n INTEGER, sq INTEGER);"
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<2000)"
+            "  INSERT INTO big SELECT n, n*n FROM seq;");
+    run(db, "SELECT count(*), sum(n), sum(sq), max(sq) FROM big;");
+    run(db, "SELECT n%7 AS bucket, count(*) FROM big GROUP BY bucket ORDER BY bucket;");
+
     sqlite3_close(db);
     w("\ndone.\n");
     return 0;

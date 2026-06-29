@@ -172,73 +172,13 @@ size_t strftime(char *s, size_t n, const char *f, const struct tm *tm) {
     (void)f; (void)tm; if (n) s[0] = 0; return 0;
 }
 
-/* ------------------------------------------------------------ malloc (K&R) */
-
-#define HEAP_SIZE (48u * 1024 * 1024)
-static unsigned char g_heap[HEAP_SIZE] __attribute__((aligned(16)));
-static size_t g_heap_off;
-
-typedef long Align;
-typedef union header {
-    struct { union header *ptr; size_t size; } s;   /* size in header units */
-    Align x;
-} Header;
-
-static Header  base;
-static Header *freep;
-
-static Header *morecore(size_t nu) {
-    if (nu < 4096) nu = 4096;
-    size_t bytes = nu * sizeof(Header);
-    if (g_heap_off + bytes > HEAP_SIZE) return NULL;
-    Header *up = (Header *)(g_heap + g_heap_off);
-    g_heap_off += bytes;
-    up->s.size = nu;
-    void free_internal(void *);
-    free_internal((void *)(up + 1));
-    return freep;
-}
-
-void *malloc(size_t nbytes) {
-    Header *p, *prevp;
-    size_t nunits = (nbytes + sizeof(Header) - 1) / sizeof(Header) + 1;
-    if ((prevp = freep) == NULL) { base.s.ptr = freep = prevp = &base; base.s.size = 0; }
-    for (p = prevp->s.ptr; ; prevp = p, p = p->s.ptr) {
-        if (p->s.size >= nunits) {
-            if (p->s.size == nunits) prevp->s.ptr = p->s.ptr;
-            else { p->s.size -= nunits; p += p->s.size; p->s.size = nunits; }
-            freep = prevp;
-            return (void *)(p + 1);
-        }
-        if (p == freep) if ((p = morecore(nunits)) == NULL) return NULL;
-    }
-}
-
-void free_internal(void *ap) {
-    Header *bp = (Header *)ap - 1, *p;
-    for (p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
-        if (p >= p->s.ptr && (bp > p || bp < p->s.ptr)) break;
-    if (bp + bp->s.size == p->s.ptr) { bp->s.size += p->s.ptr->s.size; bp->s.ptr = p->s.ptr->s.ptr; }
-    else bp->s.ptr = p->s.ptr;
-    if (p + p->s.size == bp) { p->s.size += bp->s.size; p->s.ptr = bp->s.ptr; }
-    else p->s.ptr = bp;
-    freep = p;
-}
-void free(void *ap) { if (ap) free_internal(ap); }
-
-void *realloc(void *ptr, size_t n) {
-    if (!ptr) return malloc(n);
-    if (n == 0) { free(ptr); return NULL; }
-    Header *h = (Header *)ptr - 1;
-    size_t oldsz = (h->s.size - 1) * sizeof(Header);
-    if (oldsz >= n) return ptr;
-    void *np = malloc(n);
-    if (!np) return NULL;
-    memcpy(np, ptr, oldsz < n ? oldsz : n);
-    free(ptr);
-    return np;
-}
-void *calloc(size_t a, size_t b) {
+/* ------------------------------------------------------------ malloc (host) */
+/* The heap is a host service (the malloc group of host calls). The guest keeps
+ * no allocator and no static heap: memory is requested on demand, like write. */
+void *malloc(size_t n)            { return (void *)hostcall(HOSTCALL_MALLOC, (long)n, 0, 0); }
+void  free(void *p)               { hostcall(HOSTCALL_FREE, (long)p, 0, 0); }
+void *realloc(void *p, size_t n)  { return (void *)hostcall(HOSTCALL_REALLOC, (long)p, (long)n, 0); }
+void *calloc(size_t a, size_t b)  {
     size_t n = a * b;
     void *p = malloc(n);
     if (p) memset(p, 0, n);
