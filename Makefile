@@ -1,29 +1,55 @@
-# purv conformance harness
+# purv — RISC-V (RV32IMC) emulator, plus a conformance harness.
 #
-# Bring-up:   make bootstrap   (fetch submodules + install riscof; needs open git egress)
-#             make spike sail  (build the two reference emulators)
-# Validate:   make validate    (RISCOF: Spike-DUT vs Sail-ref  — proves the harness works)
-# Conform:    make conformance (RISCOF: purv-DUT  vs Sail-ref  — the real conformance run)
+# Emulator & demos (the purv work lives in emu/):
+#   make emu          build the purv emulator  (emu/purv)
+#   make emu-test     build + run the emulator examples
+#   make secure       tagged-memory pointer-safety demo (emu/purvs)
+#   make sqlite       freestanding SQLite running on purv (fetch + build + run)
+#
+# Conformance harness (RISCOF vs the Sail reference model):
+#   make bootstrap    fetch submodules + install riscof  (needs open git egress)
+#   make spike        build Spike (differential oracle)
+#   make sail         fetch the prebuilt Sail 0.12 reference model
+#   make validate     RISCOF: Spike (DUT) vs Sail (reference) — proves the harness
+#   make conformance  RISCOF: purv  (DUT) vs Sail (reference) — the real run
 
 ROOT        := $(CURDIR)
 TP          := $(ROOT)/third_party
 SPIKE_DIR   := $(TP)/riscv-isa-sim
-SAIL_DIR    := $(TP)/sail-riscv
+SAIL_SRC    := $(TP)/sail-riscv          # submodule (source); not used to build the model
 ARCHTEST    := $(TP)/riscv-arch-test
 CONF        := $(ROOT)/conformance
 WORK        := $(ROOT)/riscof_work
 
-# Built artifacts the plugins invoke.
-SPIKE_BIN   := $(SPIKE_DIR)/build/spike
-SAIL_BIN    := $(SAIL_DIR)/c_emulator/riscv_sim_RV32
+# Reference model: the prebuilt Sail release 0.12, which is what ACT4/RISCOF
+# actually consumes. The sail-riscv submodule HEAD is the newer CMake
+# single-binary build and is NOT it (see conformance/STATUS.md), so `make sail`
+# fetches the release binary rather than building the heavy OCaml/opam source.
+SAIL_VER    := 0.12
+SAIL_DIR    := $(ROOT)/tools/sail-$(SAIL_VER)
+SAIL_BIN    := $(SAIL_DIR)/bin/sail_riscv_sim
 
-.PHONY: help bootstrap spike sail validate conformance clean distclean
+# Built artifact Spike's plugin invokes.
+SPIKE_BIN   := $(SPIKE_DIR)/build/spike
+
+.PHONY: help emu emu-test secure sqlite bootstrap spike sail validate conformance clean distclean
 
 help:
-	@sed -n '1,8p' $(MAKEFILE_LIST)
+	@sed -n '1,14p' $(MAKEFILE_LIST)
 
-bootstrap:
-	./scripts/bootstrap.sh
+# --- The emulator and demos (the actual purv work) ------------------------
+
+emu:
+	$(MAKE) -C emu
+
+emu-test:
+	$(MAKE) -C emu test
+
+secure:
+	$(MAKE) -C emu/purvs test
+
+sqlite:
+	$(MAKE) -C emu sqlite
 
 # --- Reference emulators --------------------------------------------------
 
@@ -33,14 +59,19 @@ $(SPIKE_BIN):
 	mkdir -p $(SPIKE_DIR)/build
 	cd $(SPIKE_DIR)/build && ../configure && $(MAKE) -j
 
-# Sail emits a C model that compiles to riscv_sim_RV32. Needs opam/OCaml + the
-# sail compiler on PATH; see third_party/sail-riscv/README for the toolchain.
 sail: $(SAIL_BIN)
 $(SAIL_BIN):
-	@echo "==> Building Sail C emulator (riscv_sim_RV32)"
-	$(MAKE) -C $(SAIL_DIR) ARCH=RV32 c_emulator/riscv_sim_RV32
+	@echo "==> Fetching prebuilt Sail $(SAIL_VER) reference model (sail_riscv_sim)"
+	mkdir -p $(SAIL_DIR)
+	curl -fsSL -o /tmp/sail-$(SAIL_VER).tgz \
+	    "https://github.com/riscv/sail-riscv/releases/download/$(SAIL_VER)/sail-riscv-$$(uname)-$$(arch).tar.gz"
+	tar xzf /tmp/sail-$(SAIL_VER).tgz --directory=$(SAIL_DIR) --strip-components=1
+	@$(SAIL_BIN) --version
 
 # --- RISCOF runs ----------------------------------------------------------
+
+bootstrap:
+	./scripts/bootstrap.sh
 
 # Spike (DUT) vs Sail (reference): no purv required. This is the bring-up run
 # that proves the suite, plugins, linker bracketing and signature extraction
@@ -64,5 +95,4 @@ clean:
 	rm -rf $(WORK)
 
 distclean: clean
-	rm -rf $(SPIKE_DIR)/build
-	-$(MAKE) -C $(SAIL_DIR) clean
+	rm -rf $(SPIKE_DIR)/build $(SAIL_DIR)
