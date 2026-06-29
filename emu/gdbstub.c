@@ -198,9 +198,18 @@ void RiscvEmulatorGdbRecordStore(uint32_t address, const void *old_bytes, uint8_
     memcpy(g_cur->w[i].old, old_bytes, length);
 }
 
+/* The code window the engine fetches from (set by RiscvEmulatorGdbServe). The
+ * pc lives in the state, so a single step is just Loop with max == 1. */
+static const uint8_t *g_code;
+static uint32_t       g_code_len, g_code_base;
+
+static void step_one(RiscvEmulatorState_t *st) {
+    RiscvEmulatorLoop(st, g_code, g_code_len, g_code_base, 1);
+}
+
 /* Step one instruction while recording it into the history ring. */
 static void step_record(RiscvEmulatorState_t *st) {
-    if (!g_hist) { RiscvEmulatorLoop(st, RiscvEmulatorGetNextProgramCounter(st)); return; }   /* no history: just step */
+    if (!g_hist) { step_one(st); return; }   /* no history: just step */
     Frame *f = &g_hist[(g_head + g_count) % HIST_FRAMES];
     if (g_count == HIST_FRAMES) g_head = (g_head + 1) % HIST_FRAMES;
     else g_count++;
@@ -208,7 +217,7 @@ static void step_record(RiscvEmulatorState_t *st) {
     f->reg[32] = RiscvEmulatorGetNextProgramCounter(st);
     f->nw = 0; f->overflow = 0;
     g_cur = f;
-    RiscvEmulatorLoop(st, RiscvEmulatorGetNextProgramCounter(st));
+    step_one(st);
     g_cur = NULL;
 }
 
@@ -218,7 +227,7 @@ static int step_reverse(RiscvEmulatorState_t *st) {
     Frame *f = &g_hist[(g_head + g_count - 1) % HIST_FRAMES];
     if (f->overflow) { g_count--; return -1; }   /* can't faithfully undo */
     for (int i = f->nw - 1; i >= 0; i--)         /* restore memory (g_cur NULL: not re-recorded) */
-        RiscvEmulatorStore(f->w[i].addr, f->w[i].old, f->w[i].len);
+        RiscvEmulatorWriteMemory(st, f->w[i].addr, f->w[i].old, f->w[i].len);
     for (int i = 1; i < 32; i++) RiscvEmulatorSetRegister(st, i, f->reg[i]);
     RiscvEmulatorSetProgramCounter(st, f->reg[32]);
     g_count--;
@@ -333,9 +342,11 @@ static void handle_q(int fd, const char *buf) {
 /* -------------------------------------------------------------- serve loop */
 
 void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
-                           const int *halted, const int *exitcode) {
+                           const int *halted, const int *exitcode,
+                           const uint8_t *code, uint32_t code_len, uint32_t code_base) {
     char buf[GDB_BUF], out[GDB_BUF], wmsg[8] = "S05";
     int exited = 0;
+    g_code = code; g_code_len = code_len; g_code_base = code_base;
     g_nbp = 0;
     g_noack = 0;
     g_head = g_count = 0;
@@ -388,7 +399,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
             char *o = out;
             for (uint32_t i = 0; i < len; i++) {
                 uint8_t b = 0;
-                RiscvEmulatorLoad(addr + i, &b, 1);
+                RiscvEmulatorReadMemory(st, addr + i, &b, 1);
                 *o++ = hexd[b >> 4]; *o++ = hexd[b & 0xf];
             }
             *o = '\0';
@@ -403,7 +414,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
             if (*p == ':') p++;
             for (uint32_t i = 0; i < len && hexval((unsigned char)p[0]) >= 0; i++, p += 2) {
                 uint8_t b = (uint8_t)((hexval((unsigned char)p[0]) << 4) | hexval((unsigned char)p[1]));
-                RiscvEmulatorStore(addr + i, &b, 1);
+                RiscvEmulatorWriteMemory(st, addr + i, &b, 1);
             }
             gdb_send(fd, "OK");
             break;

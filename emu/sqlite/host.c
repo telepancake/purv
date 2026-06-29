@@ -47,7 +47,9 @@ static int in_ram(uint32_t a, uint32_t n) {
 
 static int      g_halt;
 static int      g_exit;
-static int      g_ecall_pending;      /* raised by the ECALL hook, serviced by the loop */
+#ifdef PURV_TAGGED
+static int      g_ecall_pending;      /* purvs: raised by the ECALL hook, serviced by the loop */
+#endif
 
 /* --------------------------- host-side heap allocator (the malloc group) ----
  * The allocator runs here, but the blocks and its free list live in guest RAM;
@@ -117,60 +119,60 @@ static uint32_t host_realloc(uint32_t ap, uint32_t n) {
 
 /* ------------------------------------------------------------- engine hooks */
 
-/* The raw memory operations, shared by the plain and tagged hook wrappers. */
+/* Read guest memory (the host owns g_ram, mapped as the engine's region 0). */
 static void mem_read(uint32_t addr, void *dst, uint32_t len) {
     if (in_ram(addr, len)) memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
     else memset(dst, 0, len);
 }
+
+static void service_hostcall(RiscvEmulatorState_t *st);
+
+#ifdef PURV_TAGGED
+/* purvs is the older, machine-mode tagged engine: it still reaches the host
+ * through link-time memory + trap hooks. Tags are ignored here (we only time the
+ * engine's per-instruction tag tracking, not enforce a policy). */
 static void mem_write(uint32_t addr, const void *src, uint32_t len) {
     if (in_ram(addr, len)) memcpy(&g_ram[addr - RAM_ORIGIN], src, len);
     else { fprintf(stderr, "purv-sqlite: stray store 0x%08x len %u\n", addr, len); g_halt = 1; g_exit = 1; }
 }
-
-#ifdef PURV_TAGGED
-/* purvs hooks: same accesses, tags ignored. The engine still propagates tags
- * through every instruction internally (that's the overhead we want to time);
- * we just don't enforce a policy, so untagged code runs to completion. */
-uint32_t RiscvEmulatorFetch(uint32_t addr, void *dst, uint8_t len) {
-    mem_read(addr, dst, len); return 0; /* NOTAG */
-}
+uint32_t RiscvEmulatorFetch(uint32_t addr, void *dst, uint8_t len) { mem_read(addr, dst, len); return 0; }
 uint32_t RiscvEmulatorLoad(uint32_t addr, uint32_t addr_tag, void *dst, uint8_t len) {
-    (void)addr_tag; mem_read(addr, dst, len); return 0; /* loaded value is untagged */
+    (void)addr_tag; mem_read(addr, dst, len); return 0;
 }
 void RiscvEmulatorStore(uint32_t addr, uint32_t addr_tag, const void *src, uint32_t value_tag, uint8_t len) {
     (void)addr_tag; (void)value_tag; mem_write(addr, src, len);
 }
 void RiscvEmulatorControlTransfer(uint32_t from, uint32_t from_tag, uint32_t to, uint32_t to_tag) {
-    (void)from; (void)from_tag; (void)to; (void)to_tag;   /* no provenance policy */
+    (void)from; (void)from_tag; (void)to; (void)to_tag;
 }
-#else
-void RiscvEmulatorLoad(uint32_t addr, void *dst, uint8_t len) { mem_read(addr, dst, len); }
-void RiscvEmulatorStore(uint32_t addr, const void *src, uint8_t len) { mem_write(addr, src, len); }
-
-/* Fetch fast-path: all guest code lives in the flat RAM image, so hand the
- * engine a direct pointer into g_ram and the bytes remaining to the top of RAM.
- * Stores go through the same g_ram, so self-modifying code stays coherent (the
- * window caches only bounds, not contents). */
-const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t addr, uint32_t *avail) {
-    if (addr < RAM_ORIGIN || addr >= RAM_ORIGIN + RAM_BYTES) return 0;
-    *avail = RAM_ORIGIN + RAM_BYTES - addr;
-    return &g_ram[addr - RAM_ORIGIN];
-}
-#endif
-
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *st) {
     fprintf(stderr, "purv-sqlite: illegal instruction 0x%08x at pc=0x%08x\n",
             RiscvEmulatorGetInstruction(st), RiscvEmulatorGetProgramCounter(st));
     g_halt = 1; g_exit = 1;
 }
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *st) { (void)st; }
-
-/* The whole hook: mark that an ecall happened and let the engine continue. The
- * actual work is done by the run loop below. */
-void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *st) {
+void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *st) { (void)st; g_ecall_pending = 1; }
+void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *st) { RiscvEmulatorRaiseIllegalInstruction(st); }
+void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *st, uint16_t csr) {
+    static uint32_t misa = (1u << 30) | (1u << ('I' - 'A')) | (1u << ('M' - 'A')) | (1u << ('C' - 'A'));
+    static uint32_t zero;
     (void)st;
-    g_ecall_pending = 1;
+    if (csr == 0x301) return &misa;
+    zero = 0; return &zero;
 }
+#else
+/* purv: memory lives in the engine (region 0 == g_ram, mapped in main); the trap
+ * handlers are assigned to the state. The ecall handler services the call in
+ * place and returns whether to stop -- write/malloc/... return 0 and execution
+ * continues inside the engine loop; only exit (which sets g_halt) returns 1. */
+static int on_illegal(RiscvEmulatorState_t *st) {
+    fprintf(stderr, "purv-sqlite: illegal instruction 0x%08x at pc=0x%08x\n",
+            RiscvEmulatorGetInstruction(st), RiscvEmulatorGetProgramCounter(st));
+    g_halt = 1; g_exit = 1; return 1;
+}
+static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
+static int on_ecall(RiscvEmulatorState_t *st) { service_hostcall(st); return g_halt; }
+#endif
 
 /* ------------------------------------------------ host-function service loop */
 
@@ -274,17 +276,44 @@ int main(int argc, char **argv) {
 
     RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
+#ifndef PURV_TAGGED
+    /* purv: map the flat RAM as region 0 and assign the trap handlers. */
+    RiscvEmulatorSetMemory(st, 0, g_ram, RAM_BYTES, 1);
+    RiscvEmulatorSetEcallHandler(st, on_ecall);
+    RiscvEmulatorSetEbreakHandler(st, on_ebreak);
+    RiscvEmulatorSetIllegalHandler(st, on_illegal);
+#endif
     RiscvEmulatorSetRegister(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of RAM */
     RiscvEmulatorSetProgramCounter(st, entry);
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint64_t i = 0;
+#ifdef PURV_TAGGED
+    /* purvs (old API): one instruction per call, service the ecall flag after. */
     uint32_t pc = entry;
     for (; i < max_insns && !g_halt; i++) {
         pc = RiscvEmulatorLoop(st, pc);
         if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); pc = RiscvEmulatorGetNextProgramCounter(st); }
     }
+#else
+    /* purv: the pc lives in the state; run in slices, fetching from the flat RAM
+     * image. ecall is serviced in the hook (no per-instruction return); we
+     * re-check g_halt -- which the store hook may raise -- between slices. */
+    const uint64_t SLICE = 1u << 16;
+    while (i < max_insns && !g_halt) {
+        uint64_t budget = max_insns - i;
+        if (budget > SLICE) budget = SLICE;
+        uint64_t ran = RiscvEmulatorLoop(st, g_ram, RAM_BYTES, RAM_ORIGIN, budget);
+        i += ran;
+        if (g_halt) break;
+        if (ran < budget) {                  /* pc left RAM: stray fetch */
+            fprintf(stderr, "purv-sqlite: fetch outside RAM at pc=0x%08x\n",
+                    RiscvEmulatorGetProgramCounter(st));
+            g_halt = 1; g_exit = 1; break;
+        }
+    }
+#endif
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (i >= max_insns) { fprintf(stderr, "purv-sqlite: instruction cap reached\n"); g_exit = 3; }
 

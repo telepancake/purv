@@ -10,12 +10,12 @@ the host hooks; nothing vectors anywhere.
 
 ```
 emu/
-  purv.h      public interface — opaque state + the calls you need (~65 lines)
-  purv.c      the whole engine, hidden behind purv.h (hand-written, ~330 lines)
+  purv.h      public interface — opaque state + the calls you need (~105 lines)
+  purv.c      the whole engine, hidden behind purv.h (hand-written, ~380 lines)
   act/        userspace ACT conformance vs Spike golden signatures (make act)
   purg.c/.h   the earlier engine, mechanically generated from atoom (g = generated;
               kept for reference, not built — see "How the engine is organized")
-  main.c      the host/driver: memory map + hooks + ELF loader + two run modes
+  main.c      the host/driver: memory map + handlers + ELF loader + two run modes
   runfn.sh    compile a bare function and run it, wasm style
   gdbstub.c   optional GDB Remote Serial Protocol server (build with GDB=1)
   gdbserve.py launcher that brokers a gdb connection and hands purv the fd
@@ -23,24 +23,33 @@ emu/
   examples/   fn.c (bare functions), sigtest.S (signature demo), loop.c (gdb reverse-exec)
 ```
 
-`purv.h` is the entire public surface: the VM state is an **opaque type**, so
-none of the engine's internals leak out. You `#include "purv.h"`, create a state,
-and step it with `RiscvEmulatorLoop(state, pc)` — it executes the instruction at
-`pc` and returns the next `pc` — reading registers through accessors. The
-implementation — every instruction body — lives in `purv.c` and is invisible to
-callers. `main.c` is just one host; write your own and link against the engine.
+`purv.h` is the entire public surface: the VM state is an **opaque fixed-size
+value** (the `struct sockaddr` pattern — a complete type you can keep on the
+stack or copy as a blob, but whose bytes are private). The implementation —
+every instruction body — lives in `purv.c` and is invisible to callers. `main.c`
+is just one host; write your own and link against the engine.
 
-atoom's appeal is that it has essentially *no API*: you define a handful of hook
-functions and the engine reaches your memory map only through them (defined in
-`main.c` here):
+The engine is **self-contained: no link-time host hooks**. Everything it touches
+lives in the state. You map memory regions into it and assign the handlers it
+calls, then set the pc and run a batch:
 
 ```c
-void RiscvEmulatorLoad (uint32_t addr, void *dst, uint8_t len);
-void RiscvEmulatorStore(uint32_t addr, const void *src, uint8_t len);
-void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *);
-void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *);
-void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *);
+RiscvEmulatorState_t *st = RiscvEmulatorCreate(sp_top);
+RiscvEmulatorSetMemory(st, 0, ram, ram_len, /*writable=*/1);   /* region 0 @ 0x80000000 */
+RiscvEmulatorSetEcallHandler  (st, on_ecall);    /* int (*)(state): nonzero -> stop */
+RiscvEmulatorSetEbreakHandler (st, on_ebreak);
+RiscvEmulatorSetIllegalHandler(st, on_illegal);
+RiscvEmulatorSetProgramCounter(st, entry);
+uint64_t ran = RiscvEmulatorLoop(st, code, code_len, code_base, max);  /* runs a batch */
 ```
+
+The address space is **8 evenly spaced regions**, each up to 256 MiB, based at
+`0x80000000`, `0x90000000`, … `0xF0000000`; `SetMemory(st, i, …)` maps region
+`i`. A data load from an unmapped/out-of-bounds address reads zero; a store to a
+read-only or out-of-bounds address is dropped. Instruction *fetch* comes from the
+code window passed to `RiscvEmulatorLoop` (`code`/`code_len`/`code_base`); a pc
+outside it ends the batch. `ecall`/`ebreak`/`illegal` are the only handlers, and
+each returns nonzero to stop the run loop.
 
 ## Build
 
@@ -83,10 +92,10 @@ make examples/args.elf  && ./purv --user examples/args.elf one two
 ```
 
 This is the design pattern for purv: the engine stays minimal and the host owns
-policy. The engine bakes in no syscall ABI — an `ecall` simply calls the host's
-`RiscvEmulatorHandleECALL` and resumes at the next instruction (it is a service
-request to the execution environment, so it returns straight to the caller).
-Without `--user` the host's hook ignores it.
+policy. The engine bakes in no syscall ABI — an `ecall` simply calls the handler
+assigned with `RiscvEmulatorSetEcallHandler`, which services the call and returns
+0 to resume in place (it is a service request to the execution environment, so it
+returns straight to the caller). Without `--user` that handler ignores it.
 
 ## Debug with gdb
 
@@ -121,8 +130,8 @@ The stub serves a `riscv:rv32` target description (the 33 registers `x0..x31`,
 single-step, continue, software breakpoints (`Z0`/`z0`, tracked in the stub rather
 than by patching guest code), Ctrl-C to interrupt a run, and a program exit
 reported back to gdb. It drives the engine purely through `purv.h` — stepping with
-`RiscvEmulatorLoop`, reaching guest memory through the same `RiscvEmulatorLoad`/
-`Store` hooks — so the generated engine is untouched. `--gdb=FD` composes with the
+`RiscvEmulatorLoop` (one instruction at a time), reaching guest memory through
+`RiscvEmulatorRead/WriteMemory` — so the engine is untouched. `--gdb=FD` composes with the
 other modes (`--user`, plain run-to-halt): gdb just takes over execution.
 
 ### Reverse execution (time travel)
@@ -135,14 +144,15 @@ other modes (`--user`, plain run-to-halt): gdb just takes over execution.
 gdb's own `record full` does **not** support riscv (`the current architecture
 doesn't support record function`), so a remote stub is the *only* way to reverse-
 debug riscv in gdb — and an emulator is the natural place for it. The stub keeps a
-per-instruction undo history: before each step it snapshots the register file, and
-the host feeds it the bytes each store overwrites (`RiscvEmulatorGdbRecordStore`,
-the one line added to the host's store hook). Reversing puts the registers back
-and replays those bytes, so **both registers and memory unwind exactly** — a
-forward run that fills an array and a reverse run that empties it land on
-identical state at every step. History is a bounded ring (~64k instructions); past
-the oldest recorded step, reverse is a safe no-op. The engine itself stays
-unmodified — it never knows it is being recorded.
+per-instruction undo history: before each step it snapshots the register file, so
+reversing puts the registers back exactly. History is a bounded ring (~64k
+instructions); past the oldest recorded step, reverse is a safe no-op.
+
+> **Note:** with the self-contained memory model the engine performs stores
+> internally — there is no store hook for the stub to record overwritten bytes
+> through — so reverse execution currently unwinds **registers only**, not
+> memory. (`RiscvEmulatorGdbRecordStore` is retained for when a store-observation
+> path is reintroduced.)
 
 ```sh
 make examples/loop.elf
@@ -162,9 +172,9 @@ purv [--signature=FILE [--signature-granularity=4]] <elf>
 ```
 
 Loads the ELF, runs from its entry point until the program signals completion —
-a store to the `tohost` symbol (RISCOF) or a `0x5555` poweroff write to SYSCON
-at `0x11100000` (mini-rv32ima / ACT4) — then dumps `[begin_signature,
-end_signature)` as one hex word per line. Exit status is `0` on PASS.
+a store to the `tohost` symbol, which the host polls between run slices — then
+dumps `[begin_signature, end_signature)` as one hex word per line. Exit status is
+`0` on PASS.
 
 This matches the CLI that `conformance/plugin-purv` already expects, so purv can
 drop straight into the RISCOF harness given a `riscv*-gcc` cross-compiler.
@@ -198,17 +208,24 @@ applies; ACT is the conformance path.
 
 ## Memory map
 
-| region | address      | behaviour                                  |
-|--------|--------------|--------------------------------------------|
-| RAM    | `0x80000000` | flat backing array (`--ram=` bytes)        |
-| UART   | `0x10000000` | byte store → stdout; `+5` reads tx-ready   |
-| SYSCON | `0x11100000` | store `0x5555` → exit 0 (PASS)             |
+The engine's address space is 8 regions of up to 256 MiB, based 256 MiB apart
+from `0x80000000`; the host maps host storage into them with `SetMemory`.
+
+| region | base address | `main.c` use                                |
+|-------:|--------------|---------------------------------------------|
+| 0      | `0x80000000` | flat RAM backing array (`--ram=` bytes), writable |
+| 1..7   | `0x90000000`…`0xF0000000` | unmapped (reads 0, stores dropped) |
+
+There is no MMIO: console output is the `write` syscall (`--user`) and a
+conformance test halts by writing the `tohost` word, which the host polls (both
+live in region 0). Stores to a read-only or unmapped/out-of-bounds address are
+silently dropped; such loads read zero.
 
 ## How the engine is organized
 
 `purv.c` is hand-written (so are `purv.h` and `main.c`). It keeps atoom's premise
 — the host owns the memory map; the engine reaches the world only through the
-hooks above — but trims the redundancy of the original, in ~330 lines. Two ideas
+hooks above — but trims the redundancy of the original, in ~380 lines. Two ideas
 do most of that:
 
 - **Registers are indices into `x[32]`, not pointers.** `x0` is never written, so
@@ -222,8 +239,11 @@ do most of that:
   instruction decodes a field it won't use. Reserved/illegal encodings `goto
   illegal`, which calls the host's illegal hook.
 
-`RiscvEmulatorLoop(state, pc)` is one fetch → decode → execute step: it takes the
-`pc` to run and returns the next `pc`.
+`RiscvEmulatorLoop(state, code, code_len, code_base, max)` runs a *batch* of up
+to `max` instructions in one call — the fetch → decode → execute step is the body
+of an internal loop, so there is no per-instruction call boundary — and returns
+how many it ran. The pc lives in the state; instructions are fetched from the
+code window, data goes through the mapped regions.
 
 Correctness is **verified against an independent reference** — the ACT suite
 diffed against Spike golden signatures (`make act`, 76/76 in scope; see above and

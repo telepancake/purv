@@ -15,9 +15,12 @@
 
 /* Serve gdb on the connected fd until gdb detaches/kills or the program ends.
  * The engine is stepped from its current PC; *halted (set by the host's hooks
- * when the guest exits) ends a run and is reported to gdb with *exitcode. */
+ * when the guest exits) ends a run and is reported to gdb with *exitcode. The
+ * code window (code/code_len/code_base) is what the engine fetches instructions
+ * from -- the same triple the host passes to RiscvEmulatorLoop. */
 void RiscvEmulatorGdbServe(RiscvEmulatorState_t *state, int fd,
-                           const int *halted, const int *exitcode);
+                           const int *halted, const int *exitcode,
+                           const uint8_t *code, uint32_t code_len, uint32_t code_base);
 
 /* Hook the host calls from RiscvEmulatorStore (for in-RAM writes) with the bytes
  * about to be overwritten, so the stub can undo them for reverse execution. It

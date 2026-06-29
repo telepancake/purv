@@ -112,30 +112,25 @@ FORCE:
 run: host guest.elf
 	@echo "=== run ==="; ./host guest.elf; echo "[exit $$?]"
 
-# Build the workload native and on both engines (purv, purvs), run each, require
-# byte-identical transcripts, and report timings + the tagged-memory overhead.
-benchmark: host host-purvs guest-bench.elf bench-native
+# Build the workload native and on purv, run each, require byte-identical
+# transcripts, and report timings + MIPS. (The purvs tagged-engine comparison is
+# disabled for now; build host-purvs by hand if you want it.)
+benchmark: host guest-bench.elf bench-native
 	@./bench-native                   >native.out 2>native.err
 	@./host       guest-bench.elf --stats >purv.out  2>purv.err
-	@./host-purvs guest-bench.elf --stats >purvs.out 2>purvs.err
-	@for e in purv purvs; do \
-	   if ! diff -q native.out $$e.out >/dev/null; then \
-	     echo "MISMATCH: native vs $$e transcripts differ:"; \
-	     diff native.out $$e.out | head -40; exit 1; fi; done
+	@if ! diff -q native.out purv.out >/dev/null; then \
+	   echo "MISMATCH: native vs purv transcripts differ:"; \
+	   diff native.out purv.out | head -40; exit 1; fi
 	@nat=$$(sed -n 's/.*wall_ms=\([0-9]*\).*/\1/p' native.err); \
 	 pv=$$(sed -n 's/.*wall_ms=\([0-9]*\).*/\1/p' purv.err); \
-	 pvs=$$(sed -n 's/.*wall_ms=\([0-9]*\).*/\1/p' purvs.err); \
 	 pvm=$$(sed -n 's/.*mips=\([0-9.]*\).*/\1/p' purv.err); \
-	 pvsm=$$(sed -n 's/.*mips=\([0-9.]*\).*/\1/p' purvs.err); \
 	 insns=$$(sed -n 's/.*insns=\([0-9]*\).*/\1/p' purv.err); \
 	 lines=$$(wc -l <purv.out | tr -d ' '); \
 	 echo; \
 	 printf '  SQLite freestanding benchmark   (BENCH_SCALE=%s, %s-line transcript, identical)\n\n' "$(SCALE)" "$$lines"; \
 	 printf '    %-20s %5d.%03d s\n' 'native (host)' $$((nat/1000)) $$((nat%1000)); \
 	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions\n' 'purv (RV32)' $$((pv/1000)) $$((pv%1000)) "$$pvm" "$$insns"; \
-	 printf '    %-20s %5d.%03d s   %s MIPS\n' 'purvs (RV32 + tags)' $$((pvs/1000)) $$((pvs%1000)) "$$pvsm"; \
-	 [ "$$nat" -gt 0 ] && printf '    %-20s purv %dx, purvs %dx\n' 'slowdown vs native' $$((pv/nat)) $$((pvs/nat)); \
-	 [ "$$pv"  -gt 0 ] && printf '    %-20s %d.%02dx  (purvs vs purv)\n' 'tag overhead' $$((pvs*100/pv/100)) $$((pvs*100/pv%100)); \
+	 [ "$$nat" -gt 0 ] && printf '    %-20s purv %dx\n' 'slowdown vs native' $$((pv/nat)); \
 	 echo
 
 clean:

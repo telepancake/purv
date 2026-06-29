@@ -33,20 +33,14 @@
 
 /* ------------------------------------------------------------------ memory */
 
-/* Flat RAM backing the architectural RAM_ORIGIN (0x80000000) region. */
+/* Flat RAM, mapped as the engine's region 0 (RAM_ORIGIN..). */
 #define PURV_RAM_DEFAULT (256u * 1024u * 1024u)
 static uint8_t *g_ram;
 static uint32_t g_ram_size;
 
-/* Memory-mapped IO the test environments use (mini-rv32ima conventions). */
-#define UART_THR  0x10000000u            /* write a byte -> stdout            */
-#define UART_LSR  0x10000005u            /* read -> always transmit-ready     */
-#define SYSCON    0x11100000u            /* write 0x5555 -> poweroff/PASS     */
-
-/* Run/termination state shared with the hooks. */
-static int      g_halt;                  /* set by a hook to stop the loop    */
+/* Run/termination state shared with the handlers. */
+static int      g_halt;                  /* set by a handler/poll to stop the loop */
 static int      g_exit = 1;              /* process exit code; 0 == PASS      */
-static int      g_call_mode;             /* in --invoke mode, ignore SYSCON   */
 static int      g_user_mode;             /* --user: ecall -> Linux-ish syscall */
 static uint32_t g_brk;                    /* program break for the brk syscall  */
 #ifdef PURV_GDBSTUB
@@ -62,82 +56,24 @@ static int in_ram(uint32_t addr, uint32_t len) {
            (uint64_t)addr + len <= (uint64_t)RAM_ORIGIN + g_ram_size;
 }
 
-/* ----------------------------------------------- implementation-specific hooks */
+/* ------------------------------------------------ trap handlers (assigned to the state) */
 
-void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length) {
-    if (address == UART_LSR) {           /* THR empty + TEMT: always ready */
-        *(uint8_t *)destination = 0x60;
-        return;
-    }
-    if (in_ram(address, length)) {
-        memcpy(destination, &g_ram[address - RAM_ORIGIN], length);
-        return;
-    }
-    memset(destination, 0, length);      /* unmapped reads as zero */
-}
-
-/* Fetch fast-path (optional hook): guest code lives in the flat RAM image, so
- * hand the engine a direct pointer into g_ram and the bytes left to the top of
- * RAM. Stores route through the same g_ram, so self-modifying code stays
- * coherent. Addresses outside RAM (e.g. ROM_ORIGIN) fall back to the load hook. */
-const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t address, uint32_t *available) {
-    if (address < RAM_ORIGIN || (uint64_t)address >= (uint64_t)RAM_ORIGIN + g_ram_size) return 0;
-    *available = (uint32_t)((uint64_t)RAM_ORIGIN + g_ram_size - address);
-    return &g_ram[address - RAM_ORIGIN];
-}
-
-void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
-    if (address == UART_THR) {
-        putchar(*(const uint8_t *)source);
-        fflush(stdout);
-        return;
-    }
-    if (!g_call_mode && address == SYSCON) {
-        uint32_t v = 0;
-        memcpy(&v, source, length < 4 ? length : 4);
-        g_exit = (v == 0x5555u) ? 0 : 1; /* mini-rv32ima poweroff value */
-        g_halt = 1;
-        return;
-    }
-    if (g_have_tohost && address == g_tohost) {
-        /* HTIF tohost: a write ends the run. Self-checking suites encode the
-         * result here (tohost==1 -> pass; odd value >1 -> (testnum<<1)|1 fail);
-         * signature-dump suites (RISCOF/arch-test) write 1 and rely on the
-         * signature, so the same rule reports PASS for them too. */
-        uint32_t v = 0;
-        memcpy(&v, source, length < 4 ? length : 4);
-        g_exit = (v == 1) ? 0 : 1;
-        g_halt = 1;
-        return;
-    }
-    if (in_ram(address, length)) {
-#ifdef PURV_GDBSTUB
-        RiscvEmulatorGdbRecordStore(address, &g_ram[address - RAM_ORIGIN], length); /* undo log */
-#endif
-        memcpy(&g_ram[address - RAM_ORIGIN], source, length);
-        return;
-    }
-    fprintf(stderr, "purv: stray store addr=0x%08x len=%u\n", address, length);
-    g_halt = 1;
-    g_exit = 1;
-}
-
-void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state) {
-    /* A userspace program cannot self-handle an illegal instruction (there is no
-     * trap vector to take), so report it and stop. */
+static int on_illegal(RiscvEmulatorState_t *state) {
+    /* A userspace program cannot self-handle an illegal instruction, so report
+     * it and stop. */
     fprintf(stderr, "purv: illegal instruction 0x%08x at pc=0x%08x\n",
             RiscvEmulatorGetInstruction(state), RiscvEmulatorGetProgramCounter(state));
     g_halt = 1;
     g_exit = 1;
+    return 1;
 }
 
-/* User-mode syscall emulation (Linux/RISC-V ABI subset): a7=number,
- * a0..a5=args, result in a0. Only what single-threaded console programs need;
- * everything else returns -ENOSYS. Enabled by --user; without it an ecall has no
- * effect (this is a userspace engine -- there is no machine handler to vector to,
- * and the signature-dump suites halt via the tohost store, not ecall). */
-void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
-    if (!g_user_mode) return;            /* no syscall ABI requested: ignore */
+/* User-mode syscall emulation (Linux/RISC-V ABI subset): a7=number, a0..a5=args,
+ * result in a0. Only what single-threaded console programs need; everything else
+ * returns -ENOSYS. Enabled by --user; without it an ecall is a nop and execution
+ * continues (the signature-dump suites halt via the tohost word we poll). */
+static int on_ecall(RiscvEmulatorState_t *state) {
+    if (!g_user_mode) return 0;          /* no syscall ABI requested: keep running */
     uint32_t num = RiscvEmulatorGetRegister(state, 17);   /* a7 */
     uint32_t a0  = RiscvEmulatorGetRegister(state, 10);
     uint32_t a1  = RiscvEmulatorGetRegister(state, 11);
@@ -145,13 +81,12 @@ void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
     uint32_t ret;
     switch (num) {
     case 64:                              /* write(fd, buf, len) */
-        ret = 0;
         for (uint32_t i = 0; i < a2; i++) {
             uint8_t b = 0;
-            RiscvEmulatorLoad(a1 + i, &b, 1);
+            RiscvEmulatorReadMemory(state, a1 + i, &b, 1);
             putchar(b);
-            ret++;
         }
+        ret = a2;
         fflush(stdout);
         (void)a0;                         /* fd ignored: 1/2 both -> stdout */
         break;
@@ -170,8 +105,9 @@ void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state) {
         break;
     }
     RiscvEmulatorSetRegister(state, 10, ret);
+    return g_halt;                        /* exit halts; otherwise keep running in place */
 }
-void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *state) { (void)state; }
+static int on_ebreak(RiscvEmulatorState_t *state) { (void)state; return 1; }
 
 /* ------------------------------------------------------------- ELF32 loading */
 
@@ -370,9 +306,15 @@ int main(int argc, char **argv) {
     RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + g_ram_size);  /* sp = top of RAM */
     if (!st) { fprintf(stderr, "purv: cannot allocate emulator state\n"); return 2; }
 
+    /* Map the flat RAM as region 0 and assign the trap handlers; the engine
+     * reaches the outside world only through these. */
+    RiscvEmulatorSetMemory(st, 0, g_ram, g_ram_size, 1);
+    RiscvEmulatorSetEcallHandler(st, on_ecall);
+    RiscvEmulatorSetEbreakHandler(st, on_ebreak);
+    RiscvEmulatorSetIllegalHandler(st, on_illegal);
+
     uint32_t start = entry;
     if (invoke) {
-        g_call_mode = 1;
         if (!sym_lookup(invoke, &start)) {
             fprintf(stderr, "purv: symbol '%s' not found\n", invoke); return 2;
         }
@@ -393,17 +335,39 @@ int main(int argc, char **argv) {
     if (g_gdb_fd >= 0) {
         /* Hand control to gdb: it steps/continues the engine over the RSP. The
          * guest's console still goes to stdout; the RSP rides the provided fd. */
-        RiscvEmulatorGdbServe(st, g_gdb_fd, &g_halt, &g_exit);
+        RiscvEmulatorGdbServe(st, g_gdb_fd, &g_halt, &g_exit, g_ram, g_ram_size, RAM_ORIGIN);
         RiscvEmulatorDestroy(st);
         return g_exit;
     }
 #endif
 
+    /* Run the engine in slices. Loop stops on an ecall/ebreak/illegal handler
+     * (which set g_halt), but a conformance test ends by *storing* to the tohost
+     * word -- invisible to the engine -- so we poll that word between slices. The
+     * slice is large, so the per-instruction call is gone; at worst a test spins
+     * one slice past its tohost store before we notice. A pc that leaves the
+     * mapped code ends a slice early (ran < budget): the invoke sentinel, or a
+     * runaway jump. */
+    const uint64_t SLICE = 1u << 16;
     uint64_t i = 0;
-    uint32_t pc = start;
-    for (; i < max_insns && !g_halt; i++) {
-        if (invoke && pc == MAGIC_RET) break;   /* function returned to the sentinel */
-        pc = RiscvEmulatorLoop(st, pc);
+    while (i < max_insns && !g_halt) {
+        uint64_t budget = max_insns - i;
+        if (budget > SLICE) budget = SLICE;
+        uint64_t ran = RiscvEmulatorLoop(st, g_ram, g_ram_size, RAM_ORIGIN, budget);
+        i += ran;
+        if (g_halt) break;
+        if (g_have_tohost) {                      /* HTIF tohost: a nonzero write ends the run */
+            uint32_t v = 0;
+            if (in_ram(g_tohost, 4)) memcpy(&v, &g_ram[g_tohost - RAM_ORIGIN], 4);
+            if (v) { g_exit = (v == 1) ? 0 : 1; g_halt = 1; break; }  /* 1 -> PASS */
+        }
+        if (ran < budget) {                      /* pc left the mapped code */
+            uint32_t pc = RiscvEmulatorGetProgramCounter(st);
+            if (invoke && pc == MAGIC_RET) break;   /* invoked function returned */
+            fprintf(stderr, "purv: fetch outside RAM at pc=0x%08x\n", pc);
+            g_halt = 1; g_exit = 1;
+            break;
+        }
     }
 
     if (invoke) {
