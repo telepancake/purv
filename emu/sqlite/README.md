@@ -32,7 +32,7 @@ build for exactly that:
 |-----------------|------------------------------------------------------------------------|
 | `hostcalls.h`   | the whole guest↔host ABI: `ecall` with fn in a7, args in a0.. → a0      |
 | `rt.c`          | freestanding runtime: `_start`, the libc subset SQLite links, the `ecall` stubs (incl. `malloc`/`free`/`realloc` as thin host-call wrappers) |
-| `builtins.c`    | compiler runtime `-nostdlib` drops: 64-bit divide, `__atomic_*`, a tiny soft-double shim (all pure computation, not host deps) |
+| `builtins.c`    | compiler runtime `-nostdlib` drops: 64-bit divide, `__atomic_*` (single-core), and the soft-`double` symbols as **trap stubs** — this build has no floating point (see below) |
 | `vfs.c`         | the minimal `SQLITE_OS_OTHER` VFS (in-guest PRNG + nominal time; file ops are stubs — `:memory:` never calls them) |
 | `guest.c`       | the test program: open `:memory:`, run SQL, print rows via `write`      |
 | `host.c`        | the purv host: loads the ELF, runs the engine, services host calls, and runs the heap allocator over guest RAM (the malloc group) |
@@ -41,7 +41,7 @@ build for exactly that:
 
 The SQLite build options (in `build.sh`) are the ones from sqlite.org that strip
 it to that minimum: `SQLITE_OS_OTHER`, `SQLITE_THREADSAFE=0`,
-`SQLITE_TEMP_STORE=3`, `SQLITE_OMIT_FLOATING_POINT` (no soft-float needed),
+`SQLITE_TEMP_STORE=3`, `SQLITE_OMIT_FLOATING_POINT` (see "No floating point"),
 `SQLITE_OMIT_DATETIME_FUNCS`, `SQLITE_DEFAULT_MEMSTATUS=0`, `SQLITE_OMIT_AUTOINIT`,
 and friends. The result: the linked guest has **zero undefined symbols** and just
 **five `ecall` sites** in the entire binary (`write`, `exit`, `malloc`, `free`,
@@ -56,6 +56,26 @@ allocator (a K&R first-fit with coalescing) over the guest's RAM arena, handing
 back guest addresses. Memory grows on demand within the RAM the host already owns,
 so there is no big upfront lump. A 2000-row recursive-CTE query in the demo churns
 and grows the heap, and the result still matches the reference `sqlite3` exactly.
+
+## No floating point
+
+This build contains no floating-point implementation. `SQLITE_OMIT_FLOATING_POINT`
+turns off SQL-level reals, but it does not make SQLite fully float-free at the C
+level: a little real-`double` code survives — the printf `%f` branch
+(`sqlite3FpDecode`/`dekkerMul2`), the float scanner (`sqlite3AtoF`), and
+value↔REAL coercion. That code is *woven into core functions* (the printf engine,
+the VDBE value system), so you can't cleanly `sed` it out — it isn't a separable
+API, and removing the lines would break compilation.
+
+Instead, the soft-`double` helpers the compiler emits for that code
+(`__muldf3`, `__floatdidf`, `__eqdf2`, …) are provided in `builtins.c` as **trap
+stubs**: they exist only so the program links, and execute `__builtin_trap()` if
+ever called. An integer/text workload never reaches them — verified: the demo
+(including the 2000-row query, whose `sum` exceeds 32 bits) runs to completion and
+matches the reference, so no trap fires. If you ever `SELECT 3.14` or otherwise
+parse/format a REAL, this build stops loudly (illegal instruction) rather than
+silently computing — a deliberate "this build has no floats" stance. Swap the
+stubs for a real soft-float library if you need reals.
 
 ## The host-call mechanism
 
