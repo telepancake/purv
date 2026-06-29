@@ -76,6 +76,16 @@ void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length) {
     memset(destination, 0, length);      /* unmapped reads as zero */
 }
 
+/* Fetch fast-path (optional hook): guest code lives in the flat RAM image, so
+ * hand the engine a direct pointer into g_ram and the bytes left to the top of
+ * RAM. Stores route through the same g_ram, so self-modifying code stays
+ * coherent. Addresses outside RAM (e.g. ROM_ORIGIN) fall back to the load hook. */
+const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t address, uint32_t *available) {
+    if (address < RAM_ORIGIN || (uint64_t)address >= (uint64_t)RAM_ORIGIN + g_ram_size) return 0;
+    *available = (uint32_t)((uint64_t)RAM_ORIGIN + g_ram_size - address);
+    return &g_ram[address - RAM_ORIGIN];
+}
+
 void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length) {
     if (address == UART_THR) {
         putchar(*(const uint8_t *)source);

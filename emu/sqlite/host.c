@@ -146,6 +146,16 @@ void RiscvEmulatorControlTransfer(uint32_t from, uint32_t from_tag, uint32_t to,
 #else
 void RiscvEmulatorLoad(uint32_t addr, void *dst, uint8_t len) { mem_read(addr, dst, len); }
 void RiscvEmulatorStore(uint32_t addr, const void *src, uint8_t len) { mem_write(addr, src, len); }
+
+/* Fetch fast-path: all guest code lives in the flat RAM image, so hand the
+ * engine a direct pointer into g_ram and the bytes remaining to the top of RAM.
+ * Stores go through the same g_ram, so self-modifying code stays coherent (the
+ * window caches only bounds, not contents). */
+const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t addr, uint32_t *avail) {
+    if (addr < RAM_ORIGIN || addr >= RAM_ORIGIN + RAM_BYTES) return 0;
+    *avail = RAM_ORIGIN + RAM_BYTES - addr;
+    return &g_ram[addr - RAM_ORIGIN];
+}
 #endif
 
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *st) {

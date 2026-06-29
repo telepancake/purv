@@ -48,6 +48,16 @@ void     RiscvEmulatorClearTrap(RiscvEmulatorState_t *state);                 /*
  *      memory map and trap policy only through these. ---- */
 void RiscvEmulatorLoad(uint32_t address, void *destination, uint8_t length);
 void RiscvEmulatorStore(uint32_t address, const void *source, uint8_t length);
+/* OPTIONAL fetch fast-path. The engine fetches one instruction per step through
+ * RiscvEmulatorLoad by default; for a host whose code lives in flat, directly
+ * addressable storage, implementing this lets the engine read instruction
+ * half-words straight from a host pointer instead of paying a hook call +
+ * memcpy on every fetch. Return a host pointer at which `address` is readable
+ * and set *available to the number of contiguous bytes valid from there (the
+ * engine caches the window and only re-calls on a miss); return NULL to fall
+ * back to RiscvEmulatorLoad. The symbol is weak: a host that does not define it
+ * keeps the original behaviour with no code change. */
+const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t address, uint32_t *available);
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *state);
 void RiscvEmulatorUnknownCSR(RiscvEmulatorState_t *state);
 /* Supply backing storage for a CSR the engine does not implement (the engine

@@ -38,7 +38,18 @@ struct RiscvEmulatorState {
      * view the trap logic applies with masks; reads/writes are raw words. */
     uint32_t mhartid, mstatus, medeleg, mideleg, mie, mtvec, mstatush, mscratch,
              mepc, mcause, mtval, mip, pmpcfg0, pmpaddr0, mnstatus, satp;
+    /* Cached fetch window (see RiscvEmulatorGetFetchWindow). While pc stays in
+     * [fbase_lo, fbase_hi) the engine reads instruction half-words straight from
+     * host memory at fptr instead of calling the load hook; on a miss it re-asks
+     * the host. fptr == 0 means no window is cached (slow path / hook absent). */
+    const uint8_t *fptr;
+    uint32_t fbase_lo, fbase_hi;
 };
+
+/* Weak: a host need not provide it. An undefined weak symbol resolves to NULL,
+ * so the engine simply keeps fetching through RiscvEmulatorLoad. Declared here
+ * (not in purv.h's required-hook block) because it is an optional accelerator. */
+__attribute__((weak)) const uint8_t *RiscvEmulatorGetFetchWindow(uint32_t address, uint32_t *available);
 
 static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *s, uint16_t csr) {
     switch (csr) {
@@ -319,16 +330,41 @@ static void exec(RiscvEmulatorState_t *s, uint32_t w) {
 
 /* ----------------------------------------------------------------- the VM */
 
+/* Fetch one instruction half-word at addr. The common case -- addr inside the
+ * cached fetch window -- is two byte reads from a host pointer, no call. On a
+ * miss we ask the host for a window covering addr (if it implements the optional
+ * hook); failing that we fall back to the load hook. Half-word granularity keeps
+ * RVC working and means a 32-bit op straddling the window's end still resolves
+ * (each half is fetched independently). */
+static uint16_t fetch16(RiscvEmulatorState_t *s, uint32_t addr) {
+    if (s->fptr && addr >= s->fbase_lo && addr + 2 <= s->fbase_hi) {
+        const uint8_t *p = s->fptr + (addr - s->fbase_lo);
+        return (uint16_t)(p[0] | p[1] << 8);
+    }
+    if (RiscvEmulatorGetFetchWindow) {
+        uint32_t avail = 0;
+        const uint8_t *p = RiscvEmulatorGetFetchWindow(addr, &avail);
+        if (p && avail >= 2) {
+            s->fptr = p;                   /* p maps fbase_lo (== addr) */
+            s->fbase_lo = addr;
+            s->fbase_hi = addr + avail;
+            return (uint16_t)(p[0] | p[1] << 8);
+        }
+        s->fptr = 0;                       /* no usable window here */
+    }
+    return (uint16_t)memload(addr, 2);
+}
+
 uint32_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint32_t pc) {
     s->pc = pc;
 
     /* Fetch: 16 bits, plus another 16 when the low two bits mark a 32-bit op. A
      * compressed half-word is decompressed to its 32-bit equivalent first, so
      * exec() sees a single instruction form. */
-    uint16_t lo = (uint16_t)memload(pc, 2);
+    uint16_t lo = fetch16(s, pc);
     uint32_t w;
     if ((lo & 3) == 3) {
-        s->inst = w = lo | (uint32_t)memload(pc + 2, 2) << 16;
+        s->inst = w = lo | (uint32_t)fetch16(s, pc + 2) << 16;
         s->npc = pc + 4;
     } else {
         s->inst = lo;
@@ -365,6 +401,8 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *s, uint32_t initial_sp) {
     s->mhartid = s->mstatus = s->medeleg = s->mideleg = s->mie = s->mtvec = 0;
     s->mstatush = s->mscratch = s->mepc = s->mcause = s->mtval = s->mip = 0;
     s->pmpcfg0 = s->pmpaddr0 = s->mnstatus = s->satp = 0;
+    s->fptr = 0;                          /* no fetch window cached yet */
+    s->fbase_lo = s->fbase_hi = 0;
 }
 
 RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp) {
