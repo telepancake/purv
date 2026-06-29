@@ -122,26 +122,32 @@ make benchmark             # default workload
 make benchmark SCALE=30    # percent of the default size (quicker)
 ```
 
-The Makefile builds the *same* `bench.c` two ways — once linked against a SQLite
-compiled for this machine, once as the freestanding RV32 guest on purv — runs
-both, **diffs the two transcripts (they must be byte-identical)**, and reports
-the wall-clock time for each plus the slowdown:
+The Makefile builds the *same* `bench.c` three ways — linked against a SQLite
+compiled for this machine, as the freestanding RV32 guest on **purv**, and the
+identical guest on **purvs** (the tagged-memory variant, via the same `host.c`
+built `-DPURV_TAGGED` against `purvs.c`) — runs all three, **diffs the
+transcripts (they must be byte-identical)**, and reports the wall-clock time,
+the slowdown vs native, and the tagged-memory overhead:
 
 ```
   SQLite freestanding benchmark   (BENCH_SCALE=100, 13-line transcript, identical)
 
-                      wall time   throughput
-    native (host)       0.087 s
-    purv (RV32 emu)    30.250 s   73.9 MIPS, 2.24 G instructions
-    slowdown            347.7x
+    native (host)            0.072 s
+    purv (RV32)             28.214 s   79.3 MIPS, 2236144667 instructions
+    purvs (RV32 + tags)     33.254 s   67.2 MIPS
+    slowdown vs native   purv 391x, purvs 461x
+    tag overhead         1.17x  (purvs vs purv)
 ```
 
-The same SQLite options are used on both sides (the native build only swaps the
+The same SQLite options are used on all sides (the native build only swaps the
 guest's stub VFS for this box's normal one — immaterial for `:memory:`), so the
-comparison isolates the cost of interpreting RV32 instruction-by-instruction. The
-purv host prints these stats only when asked (`./host guest.elf --stats`); the
-plain demo run is unaffected. `~70 MIPS` and `~350×` are representative of a
-simple non-JIT interpreter.
+comparison isolates the cost of interpreting RV32 instruction-by-instruction, and
+the purv→purvs delta isolates the per-instruction tag-tracking cost (purvs's
+hooks here are permissive — it tracks tags but enforces nothing, so ordinary
+untagged SQLite runs unchanged). The host prints these stats only when asked
+(`./host guest.elf --stats`); the plain demo run is unaffected. `~80 MIPS`,
+`~390×`, and a `~1.2×` tag overhead are representative of a simple non-JIT
+interpreter.
 
 ## Profiling the interpreter
 

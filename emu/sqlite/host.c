@@ -21,7 +21,17 @@
 #include <unistd.h>
 #include <time.h>
 
+/* The same host drives two engines: plain purv, or purvs (the tagged-memory
+ * variant) when built -DPURV_TAGGED. purvs has the same public API plus tagged
+ * load/store/fetch/control-transfer hook signatures; we implement those
+ * permissively here (do the access, ignore the tags) so an ordinary, untagged
+ * workload like SQLite runs unchanged and we measure only the engine's
+ * per-instruction tag-tracking overhead, not its enforcement. */
+#ifdef PURV_TAGGED
+#include "../purvs/purvs.h"
+#else
 #include "../purv.h"
+#endif
 #include "hostcalls.h"
 
 /* ------------------------------------------------------------------ memory */
@@ -107,14 +117,37 @@ static uint32_t host_realloc(uint32_t ap, uint32_t n) {
 
 /* ------------------------------------------------------------- engine hooks */
 
-void RiscvEmulatorLoad(uint32_t addr, void *dst, uint8_t len) {
+/* The raw memory operations, shared by the plain and tagged hook wrappers. */
+static void mem_read(uint32_t addr, void *dst, uint32_t len) {
     if (in_ram(addr, len)) memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
     else memset(dst, 0, len);
 }
-void RiscvEmulatorStore(uint32_t addr, const void *src, uint8_t len) {
+static void mem_write(uint32_t addr, const void *src, uint32_t len) {
     if (in_ram(addr, len)) memcpy(&g_ram[addr - RAM_ORIGIN], src, len);
     else { fprintf(stderr, "purv-sqlite: stray store 0x%08x len %u\n", addr, len); g_halt = 1; g_exit = 1; }
 }
+
+#ifdef PURV_TAGGED
+/* purvs hooks: same accesses, tags ignored. The engine still propagates tags
+ * through every instruction internally (that's the overhead we want to time);
+ * we just don't enforce a policy, so untagged code runs to completion. */
+uint32_t RiscvEmulatorFetch(uint32_t addr, void *dst, uint8_t len) {
+    mem_read(addr, dst, len); return 0; /* NOTAG */
+}
+uint32_t RiscvEmulatorLoad(uint32_t addr, uint32_t addr_tag, void *dst, uint8_t len) {
+    (void)addr_tag; mem_read(addr, dst, len); return 0; /* loaded value is untagged */
+}
+void RiscvEmulatorStore(uint32_t addr, uint32_t addr_tag, const void *src, uint32_t value_tag, uint8_t len) {
+    (void)addr_tag; (void)value_tag; mem_write(addr, src, len);
+}
+void RiscvEmulatorControlTransfer(uint32_t from, uint32_t from_tag, uint32_t to, uint32_t to_tag) {
+    (void)from; (void)from_tag; (void)to; (void)to_tag;   /* no provenance policy */
+}
+#else
+void RiscvEmulatorLoad(uint32_t addr, void *dst, uint8_t len) { mem_read(addr, dst, len); }
+void RiscvEmulatorStore(uint32_t addr, const void *src, uint8_t len) { mem_write(addr, src, len); }
+#endif
+
 void RiscvEmulatorIllegalInstruction(RiscvEmulatorState_t *st) {
     fprintf(stderr, "purv-sqlite: illegal instruction 0x%08x at pc=0x%08x\n",
             RiscvEmulatorGetInstruction(st), RiscvEmulatorGetProgramCounter(st));
@@ -139,12 +172,6 @@ void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *st) {
 
 /* ------------------------------------------------ host-function service loop */
 
-/* Copy len bytes out of guest RAM into a host buffer (for write). */
-static void guest_read(uint32_t addr, void *dst, uint32_t len) {
-    if (in_ram(addr, len)) memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
-    else memset(dst, 0, len);
-}
-
 static void service_hostcall(RiscvEmulatorState_t *st) {
     uint32_t fn = RiscvEmulatorGetRegister(st, 17);    /* a7 */
     uint32_t a0 = RiscvEmulatorGetRegister(st, 10);
@@ -159,7 +186,7 @@ static void service_hostcall(RiscvEmulatorState_t *st) {
         char buf[4096];
         while (left) {
             uint32_t chunk = left > sizeof buf ? (uint32_t)sizeof buf : left;
-            guest_read(p, buf, chunk);
+            mem_read(p, buf, chunk);
             ssize_t wr = write(a0 == 2 ? 2 : 1, buf, chunk);
             if (wr < 0) break;
             p += chunk; left -= chunk;

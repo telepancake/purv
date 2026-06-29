@@ -3,9 +3,12 @@ vendor/
 guest.elf
 guest-bench.elf
 host
+host-purvs
 bench-native
 .scale
 native.out
 native.err
 purv.out
 purv.err
+purvs.out
+purvs.err

@@ -89,6 +89,13 @@ guest-bench.elf: rt.o builtins.o vfs.o bench.o sqlite3.o
 host: host.c ../purv.c ../purv.h hostcalls.h
 	$(HOSTCC) $(HOSTFLAGS) host.c ../purv.c -I.. -o $@
 
+# Same host, built against the tagged-memory engine (purvs) instead of purv, so
+# the benchmark can run the identical workload through the tag-tracking datapath
+# and show its overhead. -DPURV_TAGGED selects the tagged hook signatures in
+# host.c (implemented permissively: untagged code runs, tags aren't enforced).
+host-purvs: host.c ../purvs/purvs.c ../purvs/purvs.h hostcalls.h
+	$(HOSTCC) $(HOSTFLAGS) -DPURV_TAGGED host.c ../purvs/purvs.c -I.. -I../purvs -o $@
+
 # --- native build of the same workload (for the benchmark) ------------------
 sqlite3-native.o: $(AMALG)
 	$(NATIVECC) -O2 -w $(COMMON) -I$(SQLDIR) -c $< -o $@
@@ -105,28 +112,36 @@ FORCE:
 run: host guest.elf
 	@echo "=== run ==="; ./host guest.elf; echo "[exit $$?]"
 
-# Build both, run each, require byte-identical transcripts, report timings.
-benchmark: host guest-bench.elf bench-native
-	@./bench-native            >native.out 2>native.err
-	@./host guest-bench.elf --stats >purv.out 2>purv.err
-	@if ! diff -q native.out purv.out >/dev/null; then \
-	   echo "MISMATCH: native vs purv transcripts differ:"; \
-	   diff native.out purv.out | head -40; exit 1; fi
+# Build the workload native and on both engines (purv, purvs), run each, require
+# byte-identical transcripts, and report timings + the tagged-memory overhead.
+benchmark: host host-purvs guest-bench.elf bench-native
+	@./bench-native                   >native.out 2>native.err
+	@./host       guest-bench.elf --stats >purv.out  2>purv.err
+	@./host-purvs guest-bench.elf --stats >purvs.out 2>purvs.err
+	@for e in purv purvs; do \
+	   if ! diff -q native.out $$e.out >/dev/null; then \
+	     echo "MISMATCH: native vs $$e transcripts differ:"; \
+	     diff native.out $$e.out | head -40; exit 1; fi; done
 	@nat=$$(sed -n 's/.*wall_ms=\([0-9]*\).*/\1/p' native.err); \
 	 pv=$$(sed -n 's/.*wall_ms=\([0-9]*\).*/\1/p' purv.err); \
-	 mips=$$(sed -n 's/.*mips=\([0-9.]*\).*/\1/p' purv.err); \
+	 pvs=$$(sed -n 's/.*wall_ms=\([0-9]*\).*/\1/p' purvs.err); \
+	 pvm=$$(sed -n 's/.*mips=\([0-9.]*\).*/\1/p' purv.err); \
+	 pvsm=$$(sed -n 's/.*mips=\([0-9.]*\).*/\1/p' purvs.err); \
 	 insns=$$(sed -n 's/.*insns=\([0-9]*\).*/\1/p' purv.err); \
 	 lines=$$(wc -l <purv.out | tr -d ' '); \
 	 echo; \
 	 printf '  SQLite freestanding benchmark   (BENCH_SCALE=%s, %s-line transcript, identical)\n\n' "$(SCALE)" "$$lines"; \
-	 printf '    %-16s %5d.%03d s\n' 'native (host)' $$((nat/1000)) $$((nat%1000)); \
-	 printf '    %-16s %5d.%03d s   %s MIPS, %s instructions\n' 'purv (RV32 emu)' $$((pv/1000)) $$((pv%1000)) "$$mips" "$$insns"; \
-	 [ "$$nat" -gt 0 ] && printf '    %-16s %5dx\n' 'slowdown' $$((pv/nat)); \
+	 printf '    %-20s %5d.%03d s\n' 'native (host)' $$((nat/1000)) $$((nat%1000)); \
+	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions\n' 'purv (RV32)' $$((pv/1000)) $$((pv%1000)) "$$pvm" "$$insns"; \
+	 printf '    %-20s %5d.%03d s   %s MIPS\n' 'purvs (RV32 + tags)' $$((pvs/1000)) $$((pvs%1000)) "$$pvsm"; \
+	 [ "$$nat" -gt 0 ] && printf '    %-20s purv %dx, purvs %dx\n' 'slowdown vs native' $$((pv/nat)) $$((pvs/nat)); \
+	 [ "$$pv"  -gt 0 ] && printf '    %-20s %d.%02dx  (purvs vs purv)\n' 'tag overhead' $$((pvs*100/pv/100)) $$((pvs*100/pv%100)); \
 	 echo
 
 clean:
 	rm -f rt.o builtins.o vfs.o guest.o bench.o guest.elf guest-bench.elf \
-	      host bench-native .scale native.out native.err purv.out purv.err
+	      host host-purvs bench-native .scale \
+	      native.out native.err purv.out purv.err purvs.out purvs.err
 distclean: clean
 	rm -f sqlite3.o sqlite3-native.o
 	rm -rf vendor
