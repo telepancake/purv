@@ -45,7 +45,8 @@ So ~84 bytes of unavoidable ELF structure and the rest is the actual program.
 ## Even leaner: a flat binary (363 bytes, no headers)
 
 ELF isn't the floor. `make` also produces `mandelbrot.bin`, a **raw flat image**
-(`link-flat.ld` puts `_start` first, then `objcopy -O binary`): no ELF header, no
+(`link-flat.ld` puts `_start` first; `ld.lld --oformat binary` emits it directly):
+no ELF header, no
 program header, no section headers — just the 300 bytes of code + 63 bytes of
 strings. The host loads it at `0x80000000` and jumps to offset 0:
 

@@ -26,9 +26,9 @@ mandelbrot.elf: mandelbrot.o link.ld tinyelf.py
 	@python3 tinyelf.py mandelbrot.elf            # drop the unused section headers
 
 # Flat image: no headers at all -- raw code+rodata, _start at offset 0.
+# ld.lld emits the raw binary directly (--oformat binary), so no objcopy needed.
 mandelbrot.bin: mandelbrot.o link-flat.ld
-	ld.lld -T link-flat.ld --gc-sections -e _start -s -o mandelbrot_flat.elf mandelbrot.o
-	llvm-objcopy-18 -O binary mandelbrot_flat.elf mandelbrot.bin
+	ld.lld --oformat binary -T link-flat.ld --gc-sections -e _start -s -o mandelbrot.bin mandelbrot.o
 	@echo "flat image: $$(stat -c%s mandelbrot.bin) bytes (vs ELF $$(stat -c%s mandelbrot.elf 2>/dev/null || echo '?'))"
 
 # Reuse the emu/sqlite host verbatim (same engine, same host-call servicing).
@@ -45,7 +45,7 @@ run-flat: mandelbrot.bin host
 size: mandelbrot.elf
 	@echo "ELF bytes: $$(stat -c%s mandelbrot.elf)"
 	@echo "runtime symbols still undefined (want: none):"
-	@llvm-nm-18 -u mandelbrot.o 2>/dev/null | sed 's/^/  /' || true
+	@llvm-nm -u mandelbrot.o 2>/dev/null | sed 's/^/  /' || true
 
 clean:
 	rm -f *.o *.elf host
