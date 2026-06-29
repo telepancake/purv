@@ -4,7 +4,7 @@
 #   make test     build + run the pointer-safety demo (ok / oob / uaf / cross)
 
 CC      ?= gcc
-CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
+CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wno-packed-bitfield-compat
 
 # Guest toolchain. rv32im (no compressed) so the shadow tag datapath, which
 # decodes 32-bit instructions, sees every instruction.

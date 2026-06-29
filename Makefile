@@ -62,10 +62,19 @@ $(SPIKE_BIN):
 sail: $(SAIL_BIN)
 $(SAIL_BIN):
 	@echo "==> Fetching prebuilt Sail $(SAIL_VER) reference model (sail_riscv_sim)"
-	mkdir -p $(SAIL_DIR)
-	curl -fsSL -o /tmp/sail-$(SAIL_VER).tgz \
-	    "https://github.com/riscv/sail-riscv/releases/download/$(SAIL_VER)/sail-riscv-$$(uname)-$$(arch).tar.gz"
-	tar xzf /tmp/sail-$(SAIL_VER).tgz --directory=$(SAIL_DIR) --strip-components=1
+	@mkdir -p $(SAIL_DIR)
+	@os=$$(uname); [ "$$os" = Darwin ] && os=Mac; \
+	 asset="sail-riscv-$$os-$$(uname -m).tar.gz"; \
+	 url="https://github.com/riscv/sail-riscv/releases/download/$(SAIL_VER)/$$asset"; \
+	 echo "    $$url"; \
+	 curl -fSL -o /tmp/sail-$(SAIL_VER).tgz "$$url" || { \
+	   echo "ERROR: no prebuilt Sail $(SAIL_VER) asset '$$asset' for this platform."; \
+	   echo "       Published: Linux-x86_64, Linux-aarch64, Mac-arm64."; \
+	   echo "       Build from source instead (needs opam + the sail compiler):"; \
+	   echo "         git submodule update --init $(SAIL_SRC)"; \
+	   echo "         cmake -S $(SAIL_SRC) -B $(SAIL_SRC)/build && cmake --build $(SAIL_SRC)/build"; \
+	   exit 1; }; \
+	 tar xzf /tmp/sail-$(SAIL_VER).tgz --directory=$(SAIL_DIR) --strip-components=1
 	@$(SAIL_BIN) --version
 
 # --- RISCOF runs ----------------------------------------------------------

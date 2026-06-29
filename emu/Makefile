@@ -6,9 +6,12 @@
 #   make regen      regenerate purv.h from the atoom submodule (needs it checked out)
 #   make clean
 #
-# Host compiler (the emulator runs on your machine):
+# Host compiler (the emulator runs on your machine).
+# -Wno-packed-bitfield-compat: purv.c decodes instructions with packed
+# bit-field structs; gcc emits a note about a pre-4.4 layout change that is
+# irrelevant here (the layout is consistent within our own build).
 CC      ?= gcc
-CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
+CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wno-packed-bitfield-compat
 
 # Guest toolchain (compiles RISC-V code the emulator runs). clang needs no
 # cross-gcc: it targets riscv32 directly and lld links it.

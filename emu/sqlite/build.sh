@@ -47,7 +47,7 @@ fi
 echo "[6/6] link guest.elf + build host"
 ld.lld -m elf32lriscv --image-base=0x80000000 -e _start --gc-sections \
   rt.o builtins.o vfs.o guest.o sqlite3.o -o guest.elf
-gcc -std=c11 -O2 -Wall -Wextra host.c ../purv.c -I.. -o host
+gcc -std=c11 -O2 -Wall -Wextra -Wno-packed-bitfield-compat host.c ../purv.c -I.. -o host
 
 echo "built: $(ls -la guest.elf host | awk '{print $5, $9}' | tr '\n' '  ')"
 if [ "$1" = run ]; then echo "=== run ==="; ./host guest.elf; echo "[exit $?]"; fi
