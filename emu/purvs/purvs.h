@@ -25,8 +25,8 @@ RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp);  /* alloc + init
 void                  RiscvEmulatorDestroy(RiscvEmulatorState_t *state);
 void                  RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp);
 
-/* ---- The VM: execute one instruction. ---- */
-void RiscvEmulatorLoop(RiscvEmulatorState_t *state);
+/* ---- The VM: execute the instruction at pc, return the next pc. ---- */
+uint32_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint32_t pc);
 
 /* ---- Register / program-counter access (x0..x31; x0 reads 0, ignores writes) ---- */
 uint32_t RiscvEmulatorGetRegister(const RiscvEmulatorState_t *state, int index);

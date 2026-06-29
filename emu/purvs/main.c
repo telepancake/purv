@@ -319,9 +319,10 @@ int main(int argc, char **argv) {
 
     /* The emulator does all the work -- executing instructions and propagating
      * register tags. The host just steps it and records the pc for messages. */
+    uint32_t pc = entry;
     for (uint64_t i = 0; i < max_insns && !g_halt; i++) {
-        g_cur_pc = RiscvEmulatorGetNextProgramCounter(st);
-        RiscvEmulatorLoop(st);
+        g_cur_pc = pc;
+        pc = RiscvEmulatorLoop(st, pc);
     }
 
     RiscvEmulatorDestroy(st);

@@ -1024,8 +1024,8 @@ static void RiscvEmulatorPropagateTag(RiscvEmulatorState_t *state,
     state->reg_tag[rd] = r;
 }
 
-void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
-    state->programcounter = state->programcounternext;
+uint32_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint32_t pc) {
+    state->programcounter = state->programcounternext = pc;
     uint8_t instructionlength = 32;
 
     // Read 16 bits.
@@ -1804,6 +1804,7 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
             state->trapflag.value = 0;
         }
     }
+    return state->programcounternext;
 }
 
 /* ------------------------------------------------------------ public API glue */
