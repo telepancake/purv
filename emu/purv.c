@@ -189,69 +189,57 @@ static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) {
     if (i) s->x[i] = v;               /* writes to x0 are discarded */
 }
 
-/* Decode and execute one 32-bit instruction word in a single opcode dispatch.
- * Each case pulls only the operands it needs out of `w`, so the hot path keeps
- * little live across the switch. Effects land in s->x / memory / s->npc; any
- * exception is recorded in s->trap for Loop's epilogue. */
+/* The M extension: rd = a <op> b, selected by funct3. */
+static uint32_t muldiv(uint32_t f3, uint32_t a, uint32_t b) {
+    switch (f3) {
+    case 0: return a * b;                                                   /* MUL    */
+    case 1: return (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32);    /* MULH   */
+    case 2: return (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32); /* MULHSU */
+    case 3: return (uint32_t)(((uint64_t)a * b) >> 32);                     /* MULHU  */
+    case 4: return b == 0 ? 0xffffffffu                                     /* DIV    */
+                 : (a == 0x80000000u && (int32_t)b == -1) ? a : (uint32_t)((int32_t)a / (int32_t)b);
+    case 5: return b == 0 ? 0xffffffffu : a / b;                            /* DIVU   */
+    case 6: return b == 0 ? a                                               /* REM    */
+                 : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b);
+    default: return b == 0 ? a : a % b;                                     /* REMU   */
+    }
+}
+
+/* Decode and execute one 32-bit instruction word. The register specifiers and
+ * funct fields sit in the same bits in every base format, so they're decoded
+ * once up front; only the immediate is gathered per format, in the case that
+ * needs it. Register-immediate ops (OPIMM) are register-register ops (OP) with
+ * the second operand swapped for the immediate -- same funct3 -- so they share
+ * one ALU via `goto alu`. Effects land in s->x / memory / s->npc; exceptions go
+ * to s->trap for Loop's epilogue. */
 static void exec(RiscvEmulatorState_t *s, uint32_t w) {
-    uint32_t rd = (w >> 7) & 31, f3 = (w >> 12) & 7;
+    uint32_t rd = (w >> 7) & 31, rs1 = (w >> 15) & 31, rs2 = (w >> 20) & 31,
+             f3 = (w >> 12) & 7, f7 = w >> 25, b;
     switch (w & 0x7f) {
-    case OPIMM: {
-        uint32_t a = s->x[(w >> 15) & 31];
-        int32_t imm = (int32_t)w >> 20;
+    case OPIMM:                            /* a <op> imm; shifts take shamt from rs2 */
+        if (f3 == 1 || f3 == 5) b = rs2;   /* SLLI/SRLI/SRAI: shamt is the rs2 field */
+        else { b = (uint32_t)((int32_t)w >> 20); f7 = 0; }  /* imm; ALU never sees SUB/M */
+        goto alu;
+    case OP:
+        if (f7 == 1) { wr(s, rd, muldiv(f3, s->x[rs1], s->x[rs2])); break; }   /* RV32M */
+        b = s->x[rs2];
+    alu: {
+        uint32_t a = s->x[rs1], r;
         switch (f3) {
-        case 0: wr(s, rd, a + imm); break;                          /* ADDI  */
-        case 2: wr(s, rd, (int32_t)a < imm); break;                 /* SLTI  */
-        case 3: wr(s, rd, a < (uint32_t)imm); break;                /* SLTIU */
-        case 4: wr(s, rd, a ^ imm); break;                          /* XORI  */
-        case 6: wr(s, rd, a | imm); break;                          /* ORI   */
-        case 7: wr(s, rd, a & imm); break;                          /* ANDI  */
-        case 1:                                                      /* SLLI  */
-            if (w >> 25) s->trap |= T_ILL;
-            else wr(s, rd, a << ((w >> 20) & 31));
-            break;
-        case 5:                                                      /* SRLI / SRAI */
-            if ((w >> 25) == 0) wr(s, rd, a >> ((w >> 20) & 31));
-            else if ((w >> 25) == 0x20) wr(s, rd, (int32_t)a >> ((w >> 20) & 31));
-            else s->trap |= T_ILL;
-            break;
+        case 0: r = f7 == 0x20 ? a - b : a + b; break;             /* ADD / SUB         */
+        case 1: r = a << (b & 31); break;                          /* SLL               */
+        case 2: r = (int32_t)a < (int32_t)b; break;                /* SLT               */
+        case 3: r = a < b; break;                                  /* SLTU              */
+        case 4: r = a ^ b; break;                                  /* XOR               */
+        case 5: r = f7 == 0x20 ? (uint32_t)((int32_t)a >> (b & 31)) : a >> (b & 31); break; /* SRL/SRA */
+        case 6: r = a | b; break;                                  /* OR                */
+        default: r = a & b; break;                                 /* AND               */
         }
-        break;
-    }
-    case OP: {
-        uint32_t a = s->x[(w >> 15) & 31], b = s->x[(w >> 20) & 31], f7 = w >> 25;
-        if (f7 == 0) switch (f3) {
-        case 0: wr(s, rd, a + b); break;                            /* ADD  */
-        case 1: wr(s, rd, a << (b & 31)); break;                    /* SLL  */
-        case 2: wr(s, rd, (int32_t)a < (int32_t)b); break;          /* SLT  */
-        case 3: wr(s, rd, a < b); break;                            /* SLTU */
-        case 4: wr(s, rd, a ^ b); break;                            /* XOR  */
-        case 5: wr(s, rd, a >> (b & 31)); break;                    /* SRL  */
-        case 6: wr(s, rd, a | b); break;                            /* OR   */
-        case 7: wr(s, rd, a & b); break;                            /* AND  */
-        }
-        else if (f7 == 0x20 && f3 == 0) wr(s, rd, a - b);           /* SUB  */
-        else if (f7 == 0x20 && f3 == 5) wr(s, rd, (int32_t)a >> (b & 31));  /* SRA */
-        else if (f7 == 1) switch (f3) {                            /* RV32M */
-        case 0: wr(s, rd, a * b); break;                            /* MUL    */
-        case 1: wr(s, rd, (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32)); break;
-        case 2: wr(s, rd, (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32)); break;
-        case 3: wr(s, rd, (uint32_t)(((uint64_t)a * b) >> 32)); break;
-        case 4: wr(s, rd, b == 0 ? 0xffffffffu                      /* DIV  */
-                  : (a == 0x80000000u && (int32_t)b == -1) ? a
-                  : (uint32_t)((int32_t)a / (int32_t)b)); break;
-        case 5: wr(s, rd, b == 0 ? 0xffffffffu : a / b); break;     /* DIVU */
-        case 6: wr(s, rd, b == 0 ? a                                /* REM  */
-                  : (a == 0x80000000u && (int32_t)b == -1) ? 0
-                  : (uint32_t)((int32_t)a % (int32_t)b)); break;
-        default: wr(s, rd, b == 0 ? a : a % b); break;             /* REMU */
-        }
-        else s->trap |= T_ILL;
-        break;
-    }
+        wr(s, rd, r);
+    } break;
     case LOAD: {
         if (f3 == 3 || f3 > 5) { s->trap |= T_ILL; break; }
-        uint32_t addr = s->x[(w >> 15) & 31] + ((int32_t)w >> 20), n = 1u << (f3 & 3);
+        uint32_t addr = s->x[rs1] + ((int32_t)w >> 20), n = 1u << (f3 & 3);
         if (addr & (n - 1)) { s->trap |= T_LMIS; s->mtval = addr; }
         else if (rd) {
             uint32_t v = memload(addr, n);
@@ -261,15 +249,16 @@ static void exec(RiscvEmulatorState_t *s, uint32_t w) {
     }
     case STORE: {
         if (f3 > 2) { s->trap |= T_ILL; break; }
-        uint32_t b = s->x[(w >> 20) & 31], n = 1u << f3;
-        uint32_t addr = s->x[(w >> 15) & 31] + (uint32_t)(((int32_t)w >> 25 << 5) | ((w >> 7) & 0x1f));
+        uint32_t addr = s->x[rs1] + (uint32_t)(((int32_t)w >> 25 << 5) | ((w >> 7) & 0x1f)), n = 1u << f3;
+        b = s->x[rs2];
         if (addr & (n - 1)) { s->trap |= T_SMIS; s->mtval = addr; }
         else RiscvEmulatorStore(addr, &b, n);
         break;
     }
     case BRANCH: {
-        uint32_t a = s->x[(w >> 15) & 31], b = s->x[(w >> 20) & 31];
+        uint32_t a = s->x[rs1];
         int take;
+        b = s->x[rs2];
         switch (f3) {
         case 0: take = a == b; break;                               /* BEQ  */
         case 1: take = a != b; break;                               /* BNE  */
@@ -289,17 +278,17 @@ static void exec(RiscvEmulatorState_t *s, uint32_t w) {
                               (w >> 20 & 1) << 11 | (w >> 21 & 0x3ff) << 1, 21);
         break;
     case JALR: {
-        uint32_t t = (s->x[(w >> 15) & 31] + ((int32_t)w >> 20)) & ~1u;
+        uint32_t t = (s->x[rs1] + ((int32_t)w >> 20)) & ~1u;
         wr(s, rd, s->npc); s->npc = t;
         break;
     }
     case LUI:   wr(s, rd, w & 0xfffff000); break;
     case AUIPC: wr(s, rd, s->pc + (w & 0xfffff000)); break;
     case MISCMEM:                          /* FENCE / FENCE.I are no-ops here */
-        if (rd || ((w >> 15) & 31) || (f3 != 0 && f3 != 1)) s->trap |= T_ILL;
+        if (rd || rs1 || (f3 != 0 && f3 != 1)) s->trap |= T_ILL;
         break;
     case SYSTEM:
-        if (f3 == 0 && rd == 0 && ((w >> 15) & 31) == 0) {
+        if (f3 == 0 && rd == 0 && rs1 == 0) {
             switch (w >> 20) {
             case 0x000: s->trap |= T_ECALL; RiscvEmulatorHandleECALL(s); break;
             case 0x001: s->trap |= T_EBRK; s->mtval = s->pc; RiscvEmulatorHandleEBREAK(s); break;
@@ -314,7 +303,7 @@ static void exec(RiscvEmulatorState_t *s, uint32_t w) {
         } else {
             uint32_t *csr = RiscvEmulatorGetCSRAddress(s, w >> 20);
             if (s->trap) break;            /* unknown CSR already raised illegal */
-            uint32_t old = *csr, src = f3 & 4 ? (w >> 15) & 31 : s->x[(w >> 15) & 31];
+            uint32_t old = *csr, src = f3 & 4 ? rs1 : s->x[rs1];   /* zimm vs register */
             if (rd) wr(s, rd, old);
             switch (f3 & 3) {
             case 1: *csr = src; break;                             /* CSRRW[I]  */
