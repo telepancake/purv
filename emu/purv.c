@@ -5,13 +5,13 @@
  * map and trap policy and the engine reaches the world only through the hooks in
  * purv.h. The whole thing is one fetch/decode/execute step in RiscvEmulatorLoop.
  *
- * Two ideas keep it small *and* fast:
- *   - Registers are indices into x[32], not pointers. x0 is never written, so it
- *     reads as a hard zero and wr() drops writes to it.
- *   - Both encodings decode into the *same* operand form (a Dec): decode32()
- *     pulls the fields straight out of the word, decode16() fills them straight
- *     from the compressed half-word -- no intermediate re-encoding. exec() then
- *     runs one opcode dispatch over that shared form.
+ * Structure: each opcode -- 32-bit or compressed -- decodes only the operands it
+ * needs straight from the instruction, into a handful of locals, then `goto`s a
+ * shared action body (alu/load/store/branch/...). So the compressed and base
+ * encodings reuse the *same* execution code without any intermediate decoded
+ * form, and no instruction decodes a field it won't use. Registers are indices
+ * into x[32], not pointers; x0 is never written, so it reads as a hard zero and
+ * wr() drops writes to it.
  */
 #include <stdint.h>
 #include <stdlib.h>
@@ -89,132 +89,6 @@ static uint32_t memload(uint32_t addr, uint8_t n) {
     return v;
 }
 
-/* ------------------------------------------------------------------- decoding */
-
-/* One decoded instruction, the shared form both encodings produce. For shifts,
- * rs2 carries the shift amount (the rs2 field is the shamt); op == 0 marks an
- * illegal/reserved encoding, which exec() rejects. */
-typedef struct { uint8_t op, rd, rs1, rs2, f3, f7; int32_t imm; } Dec;
-
-static Dec decode32(uint32_t w) {
-    Dec d;
-    d.op = w & 0x7f;
-    d.rd = (w >> 7) & 31;
-    d.f3 = (w >> 12) & 7;
-    d.rs1 = (w >> 15) & 31;
-    d.rs2 = (w >> 20) & 31;
-    d.f7 = w >> 25;
-    switch (d.op) {                                            /* immediate by format */
-    case STORE: d.imm = ((int32_t)w >> 25 << 5) | ((w >> 7) & 0x1f); break;
-    case BRANCH: d.imm = sext((w >> 31 & 1) << 12 | (w >> 7 & 1) << 11 |
-                              (w >> 25 & 0x3f) << 5 | (w >> 8 & 0xf) << 1, 13); break;
-    case JAL: d.imm = sext((w >> 31 & 1) << 20 | (w >> 12 & 0xff) << 12 |
-                           (w >> 20 & 1) << 11 | (w >> 21 & 0x3ff) << 1, 21); break;
-    case LUI: case AUIPC: d.imm = (int32_t)(w & 0xfffff000u); break;
-    default: d.imm = (int32_t)w >> 20;                         /* I-type (CSR/funct12 in low 12) */
-    }
-    return d;
-}
-
-/* Decompress a 16-bit instruction straight into the same operand form -- no
- * 32-bit round trip. The popular three-bit register fields name x8..x15 (+8). */
-static Dec decode16(uint16_t c) {
-    Dec d = {0};
-    uint8_t rdp = ((c >> 2) & 7) + 8, rsp = ((c >> 7) & 7) + 8;   /* x8..x15 fields */
-    uint8_t rd = (c >> 7) & 31, rs2 = (c >> 2) & 31;
-    uint8_t shamt = ((c >> 2) & 0x1f) | ((c >> 12) & 1) << 5;
-    int32_t ci = sext(shamt, 6);                                 /* CI 6-bit immediate */
-    switch (((c >> 13) & 7) << 2 | (c & 3)) {
-    case 0 << 2 | 0:                          /* C.ADDI4SPN -> addi rd', sp, uimm */
-        d.imm = ((c >> 11) & 3) << 4 | ((c >> 7) & 0xf) << 6 |
-                ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 3;
-        if (d.imm) { d.op = OPIMM; d.rd = rdp; d.rs1 = 2; }
-        break;
-    case 2 << 2 | 0:                          /* C.LW -> lw rd', uimm(rs1') */
-        d.op = LOAD; d.f3 = 2; d.rd = rdp; d.rs1 = rsp;
-        d.imm = ((c >> 10) & 7) << 3 | ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 6;
-        break;
-    case 6 << 2 | 0:                          /* C.SW -> sw rs2', uimm(rs1') */
-        d.op = STORE; d.f3 = 2; d.rs1 = rsp; d.rs2 = rdp;
-        d.imm = ((c >> 10) & 7) << 3 | ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 6;
-        break;
-    case 0 << 2 | 1:                          /* C.ADDI / C.NOP -> addi rd, rd, imm */
-        d.op = OPIMM; d.rd = rd; d.rs1 = rd; d.imm = ci;
-        break;
-    case 1 << 2 | 1:                          /* C.JAL -> jal ra, off (RV32) */
-        d.op = JAL; d.rd = 1; goto cj;
-    case 5 << 2 | 1:                          /* C.J -> jal x0, off */
-        d.op = JAL;
-    cj: d.imm = sext(((c >> 12) & 1) << 11 | ((c >> 11) & 1) << 4 | ((c >> 9) & 3) << 8 |
-                     ((c >> 8) & 1) << 10 | ((c >> 7) & 1) << 6 | ((c >> 6) & 1) << 7 |
-                     ((c >> 3) & 7) << 1 | ((c >> 2) & 1) << 5, 12);
-        break;
-    case 2 << 2 | 1:                          /* C.LI -> addi rd, x0, imm */
-        d.op = OPIMM; d.rd = rd; d.imm = ci;
-        break;
-    case 3 << 2 | 1:                          /* C.LUI / C.ADDI16SP */
-        if (rd == 2) {                        /* addi sp, sp, nzimm */
-            d.imm = sext(((c >> 6) & 1) << 4 | ((c >> 2) & 1) << 5 | ((c >> 5) & 1) << 6 |
-                         ((c >> 3) & 3) << 7 | ((c >> 12) & 1) << 9, 10);
-            if (d.imm) { d.op = OPIMM; d.rd = 2; d.rs1 = 2; }
-        } else {                              /* lui rd, nzimm */
-            d.imm = sext(((c >> 2) & 0x1f) << 12 | ((c >> 12) & 1) << 17, 18);
-            if (d.imm) { d.op = LUI; d.rd = rd; }
-        }
-        break;
-    case 4 << 2 | 1:                          /* C.MISC-ALU */
-        d.rd = rsp; d.rs1 = rsp;
-        switch ((c >> 10) & 3) {
-        case 0: d.op = OPIMM; d.f3 = 5; d.rs2 = shamt; break;             /* C.SRLI */
-        case 1: d.op = OPIMM; d.f3 = 5; d.f7 = 0x20; d.rs2 = shamt; break; /* C.SRAI */
-        case 2: d.op = OPIMM; d.f3 = 7; d.imm = ci; break;               /* C.ANDI */
-        default:
-            if ((c >> 12) & 1) break;         /* C.SUBW/C.ADDW: RV64 only -> illegal */
-            d.op = OP; d.rs2 = rdp;
-            switch ((c >> 5) & 3) {
-            case 0: d.f7 = 0x20; break;       /* C.SUB */
-            case 1: d.f3 = 4; break;          /* C.XOR */
-            case 2: d.f3 = 6; break;          /* C.OR  */
-            default: d.f3 = 7;                /* C.AND */
-            }
-        }
-        break;
-    case 6 << 2 | 1:                          /* C.BEQZ -> beq rs1', x0, off */
-        d.op = BRANCH; d.rs1 = rsp; goto cb;
-    case 7 << 2 | 1:                          /* C.BNEZ -> bne rs1', x0, off */
-        d.op = BRANCH; d.f3 = 1; d.rs1 = rsp;
-    cb: d.imm = sext(((c >> 12) & 1) << 8 | ((c >> 10) & 3) << 3 | ((c >> 5) & 3) << 6 |
-                     ((c >> 3) & 3) << 1 | ((c >> 2) & 1) << 5, 9);
-        break;
-    case 0 << 2 | 2:                          /* C.SLLI -> slli rd, rd, shamt */
-        d.op = OPIMM; d.f3 = 1; d.rd = rd; d.rs1 = rd; d.rs2 = shamt;
-        break;
-    case 2 << 2 | 2:                          /* C.LWSP -> lw rd, uimm(sp) */
-        d.op = LOAD; d.f3 = 2; d.rd = rd; d.rs1 = 2;
-        d.imm = ((c >> 4) & 7) << 2 | ((c >> 2) & 3) << 6 | ((c >> 12) & 1) << 5;
-        break;
-    case 4 << 2 | 2:                          /* C.JR / C.JALR / C.MV / C.ADD / C.EBREAK */
-        if (!((c >> 12) & 1)) {
-            if (rs2 == 0) { d.op = JALR; d.rs1 = rd; }            /* C.JR */
-            else { d.op = OP; d.rd = rd; d.rs2 = rs2; }           /* C.MV -> add rd, x0, rs2 */
-        } else if (rd == 0 && rs2 == 0) {
-            d.op = SYSTEM; d.imm = 1;                             /* C.EBREAK */
-        } else if (rs2 == 0) {
-            d.op = JALR; d.rd = 1; d.rs1 = rd;                   /* C.JALR */
-        } else {
-            d.op = OP; d.rd = rd; d.rs1 = rd; d.rs2 = rs2;       /* C.ADD */
-        }
-        break;
-    case 6 << 2 | 2:                          /* C.SWSP -> sw rs2, uimm(sp) */
-        d.op = STORE; d.f3 = 2; d.rs1 = 2; d.rs2 = rs2;
-        d.imm = ((c >> 9) & 0xf) << 2 | ((c >> 7) & 3) << 6;
-        break;
-    }
-    return d;
-}
-
-/* ---------------------------------------------------------------- execution */
-
 static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) {
     if (i) s->x[i] = v;               /* writes to x0 are discarded */
 }
@@ -235,113 +109,11 @@ static uint32_t muldiv(uint32_t f3, uint32_t a, uint32_t b) {
     }
 }
 
-/* Execute one decoded instruction. Register-immediate ops (OPIMM) are register-
- * register ops (OP) with the second operand swapped for the immediate -- same
- * funct3 -- so they share one ALU via `goto alu`. Effects land in s->x / memory
- * / s->npc; exceptions go to s->trap for Loop's epilogue. */
-static void exec(RiscvEmulatorState_t *s, Dec d) {
-    uint32_t b;
-    switch (d.op) {
-    case OPIMM:                            /* a <op> imm; shifts take shamt from rs2 */
-        if (d.f3 == 1 || d.f3 == 5) b = d.rs2;          /* SLLI/SRLI/SRAI shamt */
-        else { b = (uint32_t)d.imm; d.f7 = 0; }         /* imm; ALU never sees SUB/M */
-        goto alu;
-    case OP:
-        if (d.f7 == 1) { wr(s, d.rd, muldiv(d.f3, s->x[d.rs1], s->x[d.rs2])); break; } /* RV32M */
-        b = s->x[d.rs2];
-    alu: {
-        uint32_t a = s->x[d.rs1], r;
-        switch (d.f3) {
-        case 0: r = d.f7 == 0x20 ? a - b : a + b; break;           /* ADD / SUB         */
-        case 1: r = a << (b & 31); break;                          /* SLL               */
-        case 2: r = (int32_t)a < (int32_t)b; break;                /* SLT               */
-        case 3: r = a < b; break;                                  /* SLTU              */
-        case 4: r = a ^ b; break;                                  /* XOR               */
-        case 5: r = d.f7 == 0x20 ? (uint32_t)((int32_t)a >> (b & 31)) : a >> (b & 31); break; /* SRL/SRA */
-        case 6: r = a | b; break;                                  /* OR                */
-        default: r = a & b; break;                                 /* AND               */
-        }
-        wr(s, d.rd, r);
-    } break;
-    case LOAD: {
-        if (d.f3 == 3 || d.f3 > 5) { s->trap |= T_ILL; break; }
-        uint32_t addr = s->x[d.rs1] + d.imm, n = 1u << (d.f3 & 3);
-        if (addr & (n - 1)) { s->trap |= T_LMIS; s->mtval = addr; }
-        else if (d.rd) {
-            uint32_t v = memload(addr, n);
-            wr(s, d.rd, d.f3 & 4 ? v : (uint32_t)sext(v, 8 << (d.f3 & 3)));  /* sign-ext unless LBU/LHU */
-        }
-        break;
-    }
-    case STORE: {
-        if (d.f3 > 2) { s->trap |= T_ILL; break; }
-        uint32_t addr = s->x[d.rs1] + d.imm, n = 1u << d.f3;
-        b = s->x[d.rs2];
-        if (addr & (n - 1)) { s->trap |= T_SMIS; s->mtval = addr; }
-        else RiscvEmulatorStore(addr, &b, n);
-        break;
-    }
-    case BRANCH: {
-        uint32_t a = s->x[d.rs1];
-        int take;
-        b = s->x[d.rs2];
-        switch (d.f3) {
-        case 0: take = a == b; break;                               /* BEQ  */
-        case 1: take = a != b; break;                               /* BNE  */
-        case 4: take = (int32_t)a < (int32_t)b; break;              /* BLT  */
-        case 5: take = (int32_t)a >= (int32_t)b; break;             /* BGE  */
-        case 6: take = a < b; break;                                /* BLTU */
-        case 7: take = a >= b; break;                               /* BGEU */
-        default: s->trap |= T_ILL; return;
-        }
-        if (take) s->npc = s->pc + d.imm;
-        break;
-    }
-    case JAL:   wr(s, d.rd, s->npc); s->npc = s->pc + d.imm; break;
-    case JALR: { uint32_t t = (s->x[d.rs1] + d.imm) & ~1u; wr(s, d.rd, s->npc); s->npc = t; } break;
-    case LUI:   wr(s, d.rd, (uint32_t)d.imm); break;
-    case AUIPC: wr(s, d.rd, s->pc + (uint32_t)d.imm); break;
-    case MISCMEM:                          /* FENCE / FENCE.I are no-ops here */
-        if (d.rd || d.rs1 || (d.f3 != 0 && d.f3 != 1)) s->trap |= T_ILL;
-        break;
-    case SYSTEM:
-        if (d.f3 == 0 && d.rd == 0 && d.rs1 == 0) {
-            switch ((uint32_t)d.imm & 0xfff) {
-            case 0x000: s->trap |= T_ECALL; RiscvEmulatorHandleECALL(s); break;
-            case 0x001: s->trap |= T_EBRK; s->mtval = s->pc; RiscvEmulatorHandleEBREAK(s); break;
-            case 0x302:                    /* MRET */
-                s->mstatush &= ~(1u << 7);                          /* mpv = 0 */
-                s->mstatus &= ~(3u << 11);                          /* mpp = 0 */
-                s->mstatus = (s->mstatus & ~(1u << 3)) | ((s->mstatus >> 7 & 1) << 3); /* mie=mpie */
-                s->mstatus |= 1u << 7;                              /* mpie = 1 */
-                s->npc = s->mepc; break;
-            default: s->trap |= T_ILL;
-            }
-        } else {
-            uint32_t *csr = RiscvEmulatorGetCSRAddress(s, (uint32_t)d.imm & 0xfff);
-            if (s->trap) break;            /* unknown CSR already raised illegal */
-            uint32_t old = *csr, src = d.f3 & 4 ? d.rs1 : s->x[d.rs1];   /* zimm vs register */
-            if (d.rd) wr(s, d.rd, old);
-            switch (d.f3 & 3) {
-            case 1: *csr = src; break;                             /* CSRRW[I]  */
-            case 2: if (src) *csr = old | src; break;              /* CSRRS[I]  */
-            case 3: if (src) *csr = old & ~src; break;             /* CSRRC[I]  */
-            default: s->trap |= T_ILL;
-            }
-        }
-        break;
-    default: s->trap |= T_ILL;
-    }
-}
-
-/* ----------------------------------------------------------------- the VM */
-
 /* Fetch one instruction half-word at addr. The common case -- addr inside the
  * cached fetch window -- is two byte reads from a host pointer, no call. On a
  * miss we ask the host for a window covering addr (if it implements the optional
  * hook); failing that we fall back to the load hook. Half-word granularity keeps
- * RVC working and means a 32-bit op straddling the window's end still resolves
- * (each half is fetched independently). */
+ * RVC working and means a 32-bit op straddling the window's end still resolves. */
 static inline uint16_t fetch16(RiscvEmulatorState_t *s, uint32_t addr) {
     if (s->fptr && addr >= s->fbase_lo && addr + 2 <= s->fbase_hi) {
         const uint8_t *p = s->fptr + (addr - s->fbase_lo);
@@ -361,25 +133,226 @@ static inline uint16_t fetch16(RiscvEmulatorState_t *s, uint32_t addr) {
     return (uint16_t)memload(addr, 2);
 }
 
+/* ----------------------------------------------------------------- the VM */
+
 uint32_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint32_t pc) {
     s->pc = pc;
 
-    /* Fetch 16 bits, plus another 16 for a 32-bit op; decode either encoding into
-     * the shared operand form, then execute. */
+    /* Operands the shared action bodies consume. Each decode arm fills only the
+     * ones its action reads (defaults keep the rest harmless), then goto's it.
+     * For shifts, b is the shift amount; for SUB/SRA, f7 == 0x20. */
+    uint32_t rd = 0, rs1 = 0, a = 0, b = 0, f3 = 0, f7 = 0, imm = 0, r, addr, n;
+
     uint16_t lo = fetch16(s, pc);
-    Dec d;
-    if ((lo & 3) == 3) {
-        s->inst = lo | (uint32_t)fetch16(s, pc + 2) << 16;
+    if ((lo & 3) == 3) {                                  /* ---- 32-bit ---- */
+        uint32_t w = lo | (uint32_t)fetch16(s, pc + 2) << 16;
+        s->inst = w;
         s->npc = pc + 4;
-        d = decode32(s->inst);
-    } else {
+        rd = (w >> 7) & 31; rs1 = (w >> 15) & 31; f3 = (w >> 12) & 7;
+        switch (w & 0x7f) {
+        case OPIMM:                                       /* reg-immediate */
+            a = s->x[rs1];
+            if (f3 == 1 || f3 == 5) { b = (w >> 20) & 31; f7 = w >> 25; }  /* shamt + funct7 */
+            else b = (uint32_t)((int32_t)w >> 20);                          /* I-immediate */
+            goto alu;
+        case OP:                                          /* reg-register */
+            a = s->x[rs1]; b = s->x[(w >> 20) & 31]; f7 = w >> 25;
+            if (f7 == 1) goto mul;
+            goto alu;
+        case LOAD:
+            a = s->x[rs1]; imm = (uint32_t)((int32_t)w >> 20); goto load;
+        case STORE:
+            a = s->x[rs1]; b = s->x[(w >> 20) & 31];
+            imm = (uint32_t)(((int32_t)w >> 25 << 5) | ((w >> 7) & 0x1f)); goto store;
+        case BRANCH:
+            a = s->x[rs1]; b = s->x[(w >> 20) & 31];
+            imm = sext((w >> 31 & 1) << 12 | (w >> 7 & 1) << 11 |
+                       (w >> 25 & 0x3f) << 5 | (w >> 8 & 0xf) << 1, 13); goto branch;
+        case JAL:
+            imm = sext((w >> 31 & 1) << 20 | (w >> 12 & 0xff) << 12 |
+                       (w >> 20 & 1) << 11 | (w >> 21 & 0x3ff) << 1, 21); goto jal;
+        case JALR:
+            a = s->x[rs1]; imm = (uint32_t)((int32_t)w >> 20); goto jalr;
+        case LUI:   imm = w & 0xfffff000; goto lui;
+        case AUIPC: imm = w & 0xfffff000; goto auipc;
+        case MISCMEM:                                     /* FENCE / FENCE.I -> nop */
+            if (rd || rs1 || (f3 != 0 && f3 != 1)) goto illegal;
+            goto done;
+        case SYSTEM:
+            a = s->x[rs1]; imm = (w >> 20) & 0xfff; goto system;
+        default: goto illegal;
+        }
+    } else {                                              /* ---- compressed ---- */
+        uint16_t c = lo;
+        uint32_t rdp = ((c >> 2) & 7) + 8, rsp = ((c >> 7) & 7) + 8;  /* x8..x15 fields */
+        uint32_t shamt = ((c >> 2) & 0x1f) | ((c >> 12) & 1) << 5;
+        int32_t  ci = sext(shamt, 6);                                 /* CI 6-bit imm */
         s->inst = lo;
         s->npc = pc + 2;
-        d = decode16(lo);
+        rd = (c >> 7) & 31;
+        switch (((c >> 13) & 7) << 2 | (c & 3)) {
+        case 0 << 2 | 0:                          /* C.ADDI4SPN -> addi rd', sp, uimm */
+            imm = ((c >> 11) & 3) << 4 | ((c >> 7) & 0xf) << 6 |
+                  ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 3;
+            if (!imm) goto illegal;               /* reserved */
+            rd = rdp; a = s->x[2]; b = imm; goto alu;
+        case 2 << 2 | 0:                          /* C.LW -> lw rd', uimm(rs1') */
+            rd = rdp; a = s->x[rsp]; f3 = 2;
+            imm = ((c >> 10) & 7) << 3 | ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 6; goto load;
+        case 6 << 2 | 0:                          /* C.SW -> sw rs2', uimm(rs1') */
+            a = s->x[rsp]; b = s->x[rdp]; f3 = 2;
+            imm = ((c >> 10) & 7) << 3 | ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 6; goto store;
+        case 0 << 2 | 1:                          /* C.ADDI / C.NOP -> addi rd, rd, imm */
+            a = s->x[rd]; b = ci; goto alu;
+        case 1 << 2 | 1: rd = 1;                  /* C.JAL -> jal ra, off */
+            goto cj;
+        case 5 << 2 | 1: rd = 0;                  /* C.J -> jal x0, off */
+        cj: imm = sext(((c >> 12) & 1) << 11 | ((c >> 11) & 1) << 4 | ((c >> 9) & 3) << 8 |
+                       ((c >> 8) & 1) << 10 | ((c >> 7) & 1) << 6 | ((c >> 6) & 1) << 7 |
+                       ((c >> 3) & 7) << 1 | ((c >> 2) & 1) << 5, 12);
+            goto jal;
+        case 2 << 2 | 1:                          /* C.LI -> addi rd, x0, imm */
+            b = ci; goto alu;                     /* a defaults to 0 */
+        case 3 << 2 | 1:                          /* C.LUI / C.ADDI16SP */
+            if (rd == 2) {                        /* addi sp, sp, nzimm */
+                imm = sext(((c >> 6) & 1) << 4 | ((c >> 2) & 1) << 5 | ((c >> 5) & 1) << 6 |
+                           ((c >> 3) & 3) << 7 | ((c >> 12) & 1) << 9, 10);
+                if (!imm) goto illegal;
+                a = s->x[2]; b = imm; goto alu;
+            }
+            imm = sext(((c >> 2) & 0x1f) << 12 | ((c >> 12) & 1) << 17, 18);  /* lui rd, nzimm */
+            if (!imm) goto illegal;
+            goto lui;
+        case 4 << 2 | 1:                          /* C.MISC-ALU */
+            rd = rsp; a = s->x[rsp];
+            switch ((c >> 10) & 3) {
+            case 0: f3 = 5; b = shamt; goto alu;              /* C.SRLI */
+            case 1: f3 = 5; f7 = 0x20; b = shamt; goto alu;   /* C.SRAI */
+            case 2: f3 = 7; b = ci; goto alu;                 /* C.ANDI */
+            default:
+                if ((c >> 12) & 1) goto illegal;  /* C.SUBW/C.ADDW: RV64 only */
+                b = s->x[rdp];
+                switch ((c >> 5) & 3) {
+                case 0: f7 = 0x20; goto alu;      /* C.SUB */
+                case 1: f3 = 4; goto alu;         /* C.XOR */
+                case 2: f3 = 6; goto alu;         /* C.OR  */
+                default: f3 = 7; goto alu;        /* C.AND */
+                }
+            }
+        case 6 << 2 | 1: a = s->x[rsp];           /* C.BEQZ -> beq rs1', x0, off */
+            goto cb;
+        case 7 << 2 | 1: a = s->x[rsp]; f3 = 1;   /* C.BNEZ -> bne rs1', x0, off */
+        cb: imm = sext(((c >> 12) & 1) << 8 | ((c >> 10) & 3) << 3 | ((c >> 5) & 3) << 6 |
+                       ((c >> 3) & 3) << 1 | ((c >> 2) & 1) << 5, 9);
+            goto branch;                          /* b defaults to 0 */
+        case 0 << 2 | 2:                          /* C.SLLI -> slli rd, rd, shamt */
+            a = s->x[rd]; f3 = 1; b = shamt; goto alu;
+        case 2 << 2 | 2:                          /* C.LWSP -> lw rd, uimm(sp) */
+            a = s->x[2]; f3 = 2;
+            imm = ((c >> 4) & 7) << 2 | ((c >> 2) & 3) << 6 | ((c >> 12) & 1) << 5; goto load;
+        case 4 << 2 | 2: {                        /* C.JR / C.JALR / C.MV / C.ADD / C.EBREAK */
+            uint32_t rs2 = (c >> 2) & 31;
+            if (!((c >> 12) & 1)) {
+                if (rs2 == 0) { a = s->x[rd]; rd = 0; goto jalr; }   /* C.JR */
+                b = s->x[rs2]; rd = (c >> 7) & 31; goto alu;          /* C.MV -> add rd, x0, rs2 */
+            }
+            if (rd == 0 && rs2 == 0) goto ebreak;                    /* C.EBREAK */
+            if (rs2 == 0) { a = s->x[rd]; rd = 1; goto jalr; }        /* C.JALR */
+            a = s->x[rd]; b = s->x[rs2]; goto alu;                    /* C.ADD */
+        }
+        case 6 << 2 | 2:                          /* C.SWSP -> sw rs2, uimm(sp) */
+            a = s->x[2]; b = s->x[(c >> 2) & 31]; f3 = 2;
+            imm = ((c >> 9) & 0xf) << 2 | ((c >> 7) & 3) << 6; goto store;
+        default: goto illegal;
+        }
     }
 
-    exec(s, d);
-
+    /* ---- shared action bodies (both encodings goto these) ---- */
+alu:
+    switch (f3) {
+    case 0: r = f7 == 0x20 ? a - b : a + b; break;                 /* ADD / SUB */
+    case 1: r = a << (b & 31); break;                              /* SLL       */
+    case 2: r = (int32_t)a < (int32_t)b; break;                    /* SLT       */
+    case 3: r = a < b; break;                                      /* SLTU      */
+    case 4: r = a ^ b; break;                                      /* XOR       */
+    case 5: r = f7 == 0x20 ? (uint32_t)((int32_t)a >> (b & 31)) : a >> (b & 31); break; /* SRL/SRA */
+    case 6: r = a | b; break;                                      /* OR        */
+    default: r = a & b; break;                                     /* AND       */
+    }
+    wr(s, rd, r);
+    goto done;
+mul:
+    wr(s, rd, muldiv(f3, a, b));
+    goto done;
+load:
+    if (f3 == 3 || f3 > 5) goto illegal;
+    addr = a + imm; n = 1u << (f3 & 3);
+    if (addr & (n - 1)) { s->trap |= T_LMIS; s->mtval = addr; }
+    else if (rd) {
+        uint32_t v = memload(addr, n);
+        wr(s, rd, f3 & 4 ? v : (uint32_t)sext(v, 8 << (f3 & 3)));  /* sign-ext unless LBU/LHU */
+    }
+    goto done;
+store:
+    if (f3 > 2) goto illegal;
+    addr = a + imm; n = 1u << f3;
+    if (addr & (n - 1)) { s->trap |= T_SMIS; s->mtval = addr; }
+    else RiscvEmulatorStore(addr, &b, n);
+    goto done;
+branch: {
+    int take;
+    switch (f3) {
+    case 0: take = a == b; break;                                  /* BEQ  */
+    case 1: take = a != b; break;                                  /* BNE  */
+    case 4: take = (int32_t)a < (int32_t)b; break;                 /* BLT  */
+    case 5: take = (int32_t)a >= (int32_t)b; break;                /* BGE  */
+    case 6: take = a < b; break;                                   /* BLTU */
+    case 7: take = a >= b; break;                                  /* BGEU */
+    default: goto illegal;
+    }
+    if (take) s->npc = s->pc + imm;
+    goto done;
+}
+jal:
+    wr(s, rd, s->npc); s->npc = s->pc + imm; goto done;
+jalr:
+    addr = (a + imm) & ~1u; wr(s, rd, s->npc); s->npc = addr; goto done;
+lui:
+    wr(s, rd, imm); goto done;
+auipc:
+    wr(s, rd, s->pc + imm); goto done;
+ebreak:
+    s->trap |= T_EBRK; s->mtval = s->pc; RiscvEmulatorHandleEBREAK(s); goto done;
+system:
+    if (f3 == 0 && rd == 0 && rs1 == 0) {                          /* ECALL/EBREAK/MRET */
+        switch (imm) {
+        case 0x000: s->trap |= T_ECALL; RiscvEmulatorHandleECALL(s); break;
+        case 0x001: goto ebreak;
+        case 0x302:                                                /* MRET */
+            s->mstatush &= ~(1u << 7);                             /* mpv = 0 */
+            s->mstatus &= ~(3u << 11);                             /* mpp = 0 */
+            s->mstatus = (s->mstatus & ~(1u << 3)) | ((s->mstatus >> 7 & 1) << 3); /* mie=mpie */
+            s->mstatus |= 1u << 7;                                 /* mpie = 1 */
+            s->npc = s->mepc; break;
+        default: goto illegal;
+        }
+        goto done;
+    } else {                                                       /* CSR access */
+        uint32_t *csr = RiscvEmulatorGetCSRAddress(s, imm);
+        if (s->trap) goto done;            /* unknown CSR already raised illegal */
+        uint32_t old = *csr, src = f3 & 4 ? rs1 : a;   /* zimm (rs1 field) vs register */
+        if (rd) wr(s, rd, old);
+        switch (f3 & 3) {
+        case 1: *csr = src; break;                                 /* CSRRW[I]  */
+        case 2: if (src) *csr = old | src; break;                  /* CSRRS[I]  */
+        case 3: if (src) *csr = old & ~src; break;                 /* CSRRC[I]  */
+        default: goto illegal;
+        }
+        goto done;
+    }
+illegal:
+    s->trap |= T_ILL;
+done:
     if (s->trap) {
         uint32_t code = s->trap & T_EBRK ? 3 : s->trap & T_LMIS ? 4
                       : s->trap & T_SMIS ? 6 : s->trap & T_ECALL ? 11 : 0;
