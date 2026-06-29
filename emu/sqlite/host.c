@@ -219,18 +219,46 @@ static uint32_t load_elf(const char *path) {
     return eh.e_entry;
 }
 
+/* A flat (headerless) image: just bytes, loaded at `base`, entry = base (the
+ * linker put _start first). The leanest possible -- zero load overhead. Selected
+ * explicitly with --flat; never auto-detected. */
+static uint32_t load_flat(const char *path, uint32_t base) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno)); exit(2); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0 || !in_ram(base, (uint32_t)n)) { fprintf(stderr, "bad flat image\n"); exit(2); }
+    if (fread(&g_ram[base - RAM_ORIGIN], 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "read failed\n"); exit(2); }
+    fclose(f);
+    g_image_end = base + (uint32_t)n;
+    return base;
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <guest.elf> [--max-insns=N]\n", argv[0]); return 2; }
     uint64_t max_insns = 20000ull * 1000 * 1000;       /* generous cap */
-    for (int i = 2; i < argc; i++)
-        if (!strncmp(argv[i], "--max-insns=", 12)) max_insns = strtoull(argv[i] + 12, 0, 0);
+    const char *image = NULL;
+    int flat = 0;                                       /* explicit; no auto-detect */
+    uint32_t flat_base = RAM_ORIGIN;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--flat")) flat = 1;
+        else if (!strncmp(a, "--flat=", 7)) { flat = 1; flat_base = (uint32_t)strtoul(a + 7, 0, 0); }
+        else if (!strncmp(a, "--max-insns=", 12)) max_insns = strtoull(a + 12, 0, 0);
+        else if (a[0] == '-') { fprintf(stderr, "unknown option %s\n", a); return 2; }
+        else image = a;
+    }
+    if (!image) {
+        fprintf(stderr, "usage: %s [--flat[=ADDR]] [--max-insns=N] <image>\n"
+                        "  default: image is an ELF; --flat: raw binary loaded at ADDR (default 0x%08x)\n",
+                argv[0], RAM_ORIGIN);
+        return 2;
+    }
 
     g_ram = calloc(1, RAM_BYTES);
     if (!g_ram) { fprintf(stderr, "OOM\n"); return 2; }
 
-    uint32_t entry = load_elf(argv[1]);
+    uint32_t entry = flat ? load_flat(image, flat_base) : load_elf(image);
 
     /* Heap arena: from just past the loaded image up to a stack reserve below
      * the top of RAM. Grows on demand via the malloc host calls. */

@@ -14,21 +14,33 @@ GUEST := clang --target=riscv32 -march=rv32imc -mabi=ilp32 -mcmodel=medany -Os \
          -fno-unwind-tables -fno-asynchronous-unwind-tables \
          -nostdinc -isystem $(RES) -I../sqlite
 
-.PHONY: all run size clean
-all: mandelbrot.elf host
+.PHONY: all run run-flat size clean
+all: mandelbrot.elf mandelbrot.bin host
 
-mandelbrot.elf: mandelbrot.c link.ld ../sqlite/hostcalls.h tinyelf.py
+mandelbrot.o: mandelbrot.c ../sqlite/hostcalls.h
 	$(GUEST) -c mandelbrot.c -o mandelbrot.o
+
+# Tiny ELF: headers folded into one segment, then section headers stripped.
+mandelbrot.elf: mandelbrot.o link.ld tinyelf.py
 	ld.lld -T link.ld --gc-sections -e _start -s -o mandelbrot.elf mandelbrot.o
 	@python3 tinyelf.py mandelbrot.elf            # drop the unused section headers
+
+# Flat image: no headers at all -- raw code+rodata, _start at offset 0.
+mandelbrot.bin: mandelbrot.o link-flat.ld
+	ld.lld -T link-flat.ld --gc-sections -e _start -s -o mandelbrot_flat.elf mandelbrot.o
+	llvm-objcopy-18 -O binary mandelbrot_flat.elf mandelbrot.bin
+	@echo "flat image: $$(stat -c%s mandelbrot.bin) bytes (vs ELF $$(stat -c%s mandelbrot.elf 2>/dev/null || echo '?'))"
 
 # Reuse the emu/sqlite host verbatim (same engine, same host-call servicing).
 host: ../sqlite/host.c ../purv.c
 	gcc -std=c11 -O2 -Wall -Wextra -Wno-packed-bitfield-compat \
 	    ../sqlite/host.c ../purv.c -o host
 
-run: all
+run: mandelbrot.elf host
 	./host mandelbrot.elf
+
+run-flat: mandelbrot.bin host
+	./host --flat mandelbrot.bin
 
 size: mandelbrot.elf
 	@echo "ELF bytes: $$(stat -c%s mandelbrot.elf)"

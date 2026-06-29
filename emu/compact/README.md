@@ -42,6 +42,23 @@ A larger program would still need the `mem*` four, but nothing here triggers the
 
 So ~84 bytes of unavoidable ELF structure and the rest is the actual program.
 
+## Even leaner: a flat binary (363 bytes, no headers)
+
+ELF isn't the floor. `make` also produces `mandelbrot.bin`, a **raw flat image**
+(`link-flat.ld` puts `_start` first, then `objcopy -O binary`): no ELF header, no
+program header, no section headers — just the 300 bytes of code + 63 bytes of
+strings. The host loads it at `0x80000000` and jumps to offset 0:
+
+```sh
+make run-flat        # ./host --flat mandelbrot.bin
+```
+
+`--flat` is **explicit** — the host never sniffs the file; an ELF without `--flat`
+is parsed as ELF, a flat image without `--flat` is rejected. (For reference, the
+old Unix `a.out` is both heavier — a 32-byte exec header — and unsupported by the
+riscv toolchain; a flat binary is leaner than either.) At 363 bytes the file *is*
+the program: every byte is code or data you wrote.
+
 ## Files
 
 ```

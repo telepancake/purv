@@ -71,6 +71,10 @@ script with a single `PT_LOAD` that folds in the ELF/program headers (no
 padding), and a post-link pass to drop the section-header table (a loader only
 reads program headers). `emu/compact` does all of this — 447 bytes.
 
+Leaner still: a **flat binary** (`link-flat.ld` with `_start` first, then
+`objcopy -O binary`) drops *all* headers — 363 bytes, every byte program. The
+host loads it explicitly with `--flat` (it never auto-detects the format).
+
 ## The escape hatch
 
 If you would rather *use* floats/atomics than avoid them, extend purv with the

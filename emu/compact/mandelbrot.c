@@ -71,9 +71,12 @@ int cmain(void) {
     return 0;
 }
 
-/* Entry: the host sets sp; call cmain, then exit(a0) via the host-call ABI. */
+/* Entry: the host sets sp; call cmain, then exit(a0) via the host-call ABI.
+ * Placed in its own section so the linker can put it first -- for the flat-binary
+ * build the entry point must be at offset 0 of the image. */
 extern int cmain(void);
 __asm__(
+    ".section .text._start,\"ax\",@progbits\n"
     ".globl _start\n"
     "_start:\n"
     "  call cmain\n"
