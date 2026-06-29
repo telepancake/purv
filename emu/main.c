@@ -388,7 +388,7 @@ int main(int argc, char **argv) {
 
     uint32_t entry = load_elf(elf);
 
-    RiscvEmulatorState_t *st = RiscvEmulatorCreate(g_ram_size);
+    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + g_ram_size);  /* sp = top of RAM */
     if (!st) { fprintf(stderr, "purv: cannot allocate emulator state\n"); return 2; }
 
     uint32_t start = entry;

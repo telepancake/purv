@@ -127,9 +127,9 @@ GLUE = """\
 
 /* ------------------------------------------------------------ public API glue */
 
-RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t ram_length) {
+RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp) {
     RiscvEmulatorState_t *state = calloc(1, sizeof *state);
-    if (state) RiscvEmulatorInit(state, ram_length);
+    if (state) RiscvEmulatorInit(state, initial_sp);
     return state;
 }
 void RiscvEmulatorDestroy(RiscvEmulatorState_t *state) { free(state); }
@@ -192,6 +192,13 @@ assert n == 1, f"expected exactly one RiscvEmulatorState typedef, found {n}"
 text = text.replace("static inline ", "static ")
 text = text.replace("static void RiscvEmulatorInit(", "void RiscvEmulatorInit(")
 text = text.replace("static void RiscvEmulatorLoop(", "void RiscvEmulatorLoop(")
+
+# Upstream's Init takes a "ram_length" and sets sp to RAM_ORIGIN + that, baking
+# the host's RAM layout into the engine. Rename the parameter to initial_sp and
+# set sp to it directly: the engine has no business knowing the RAM size, it just
+# needs where the stack starts. The host now passes the absolute sp it wants.
+text = text.replace("uint32_t ram_length)", "uint32_t initial_sp)")
+text = text.replace("state->reg.sp = RAM_ORIGIN + ram_length;", "state->reg.sp = initial_sp;")
 
 with open(os.path.join(OUTDIR, "purv.c"), "w") as f:
     f.write(text)

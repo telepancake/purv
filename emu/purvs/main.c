@@ -312,7 +312,7 @@ int main(int argc, char **argv) {
     if (!g_ram || !g_mem_tag) { fprintf(stderr, "purvs: OOM\n"); return 2; }
 
     uint32_t entry = load_elf(gargv[0]);
-    RiscvEmulatorState_t *st = RiscvEmulatorCreate(g_ram_size);
+    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + g_ram_size);  /* sp = top of RAM */
     if (!st) { fprintf(stderr, "purvs: cannot create state\n"); return 2; }
     RiscvEmulatorSetRegister(st, 2, setup_stack(gargc, gargv));   /* sp (NOTAG) */
     RiscvEmulatorSetProgramCounter(st, entry);

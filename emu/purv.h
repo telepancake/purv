@@ -19,9 +19,12 @@
 typedef struct RiscvEmulatorState RiscvEmulatorState_t;
 
 /* ---- Lifecycle ---- */
-RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t ram_length);  /* alloc + init */
+/* initial_sp is the absolute value the stack pointer starts at (typically the
+ * top of the host's RAM region); the engine sets sp to it verbatim and otherwise
+ * knows nothing of the host's memory size or layout. */
+RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp);  /* alloc + init */
 void                  RiscvEmulatorDestroy(RiscvEmulatorState_t *state);
-void                  RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t ram_length);
+void                  RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp);
 
 /* ---- The VM: execute one instruction. ---- */
 void RiscvEmulatorLoop(RiscvEmulatorState_t *state);

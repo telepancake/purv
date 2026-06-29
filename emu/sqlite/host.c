@@ -238,7 +238,7 @@ int main(int argc, char **argv) {
     uint32_t heap_base = (g_image_end + 15u) & ~15u;
     heap_init(heap_base, RAM_ORIGIN + RAM_BYTES - STACK_RESERVE);
 
-    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_BYTES);
+    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
     RiscvEmulatorSetRegister(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of RAM */
     RiscvEmulatorSetProgramCounter(st, entry);

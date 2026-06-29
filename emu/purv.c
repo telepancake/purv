@@ -927,9 +927,9 @@ static void *RiscvEmulatorGetCSRAddress(RiscvEmulatorState_t *state, const uint1
     return address;
 }
 
-void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t ram_length) {
+void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp) {
     // Initialize stack pointer.
-    state->reg.sp = RAM_ORIGIN + ram_length;
+    state->reg.sp = initial_sp;
 
     // Initialize program counter.
     state->programcounter = ROM_ORIGIN;
@@ -1685,9 +1685,9 @@ void RiscvEmulatorLoop(RiscvEmulatorState_t *state) {
 
 /* ------------------------------------------------------------ public API glue */
 
-RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t ram_length) {
+RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp) {
     RiscvEmulatorState_t *state = calloc(1, sizeof *state);
-    if (state) RiscvEmulatorInit(state, ram_length);
+    if (state) RiscvEmulatorInit(state, initial_sp);
     return state;
 }
 void RiscvEmulatorDestroy(RiscvEmulatorState_t *state) {

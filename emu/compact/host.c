@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
     uint32_t entry = load_flat(argv[1]);
     heap_init((g_image_end + 15u) & ~15u, RAM_ORIGIN + RAM_BYTES - 1024u * 1024u);
 
-    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_BYTES);
+    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
     if (!st) { fprintf(stderr, "compact: cannot create state\n"); return 2; }
     RiscvEmulatorSetRegister(st, 2, RAM_ORIGIN + RAM_BYTES);    /* sp */
     RiscvEmulatorSetProgramCounter(st, entry);
