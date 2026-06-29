@@ -2,6 +2,7 @@
 #
 #   make            build the host emulator binary `purv`
 #   make test       build + run the examples (wasm-style call + signature dump)
+#   make sqlite      build + run freestanding SQLite on purv (see sqlite/README.md)
 #   make regen      regenerate purv.h from the atoom submodule (needs it checked out)
 #   make clean
 #
@@ -23,8 +24,13 @@ LDFLAGS  ?= -m elf32lriscv --image-base=0x80000000
 ATOOM_INC ?= ../third_party/atoomnetmarc-rv/include
 OUTDIR    ?= .
 
-.PHONY: all test conformance regen clean
+.PHONY: all test conformance sqlite regen clean
 all: purv
+
+# Freestanding SQLite running on purv: fetches the amalgamation, builds the
+# guest + host, and runs the SQL demo. Self-contained; see sqlite/README.md.
+sqlite:
+	$(MAKE) -C sqlite run
 
 # Real conformance: the self-checking riscv-tests ISA suite (needs network +
 # clang; uses spike only if present). See README "Running the real conformance
