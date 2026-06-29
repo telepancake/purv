@@ -31,7 +31,7 @@ LDFLAGS  ?= -m elf32lriscv --image-base=0x80000000
 ATOOM_INC ?= ../third_party/atoomnetmarc-rv/include
 OUTDIR    ?= .
 
-.PHONY: all test conformance sqlite benchmark compact regen clean
+.PHONY: all test conformance act sqlite benchmark compact regen clean
 all: purv
 
 # Freestanding SQLite running on purv: fetches the amalgamation, builds the
@@ -56,6 +56,13 @@ compact:
 # suite" and selfcheck.sh.
 conformance: purv
 	./selfcheck.sh
+
+# Userspace ACT conformance: diff purv's RV32IMC+Zifencei result signatures
+# against golden signatures cooked from Spike (an independent reference) and
+# vendored under act/golden/. Needs a RISC-V cross-assembler; not Spike. See
+# act/README.md. Regenerate goldens with: REGEN=1 SPIKE=/path/to/spike act/run.sh
+act: purv
+	./act/run.sh
 
 # Optional GDB stub: `make GDB=1` compiles gdbstub.c (guarded by PURV_GDBSTUB)
 # into the binary, adding `--gdb=FD` so gdb can drive the emulator over a
