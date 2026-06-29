@@ -6,12 +6,12 @@ header + implementation library, a separate host, ISA flags baked in:
 **RV32IMC + Zifencei**. It is a *userspace* engine — a program runner, not a
 machine: no CSRs, no privileged modes, no trap-to-`mtvec`. `ecall` (a syscall),
 `ebreak` (a debugger trap), and an illegal instruction are handed straight to
-the host hooks; nothing vectors anywhere.
+the handlers you put in the state; nothing vectors anywhere.
 
 ```
 emu/
-  purv.h      public interface — opaque state + the calls you need (~105 lines)
-  purv.c      the whole engine, hidden behind purv.h (hand-written, ~380 lines)
+  purv.h      public interface — the state struct + the calls you need (~90 lines)
+  purv.c      the whole engine behind purv.h (hand-written, ~325 lines)
   act/        userspace ACT conformance vs Spike golden signatures (make act)
   purg.c/.h   the earlier engine, mechanically generated from atoom (g = generated;
               kept for reference, not built — see "How the engine is organized")
@@ -23,33 +23,35 @@ emu/
   examples/   fn.c (bare functions), sigtest.S (signature demo), loop.c (gdb reverse-exec)
 ```
 
-`purv.h` is the entire public surface: the VM state is an **opaque fixed-size
-value** (the `struct sockaddr` pattern — a complete type you can keep on the
-stack or copy as a blob, but whose bytes are private). The implementation —
-every instruction body — lives in `purv.c` and is invisible to callers. `main.c`
-is just one host; write your own and link against the engine.
+`purv.h` is the entire public surface: the VM state is a **plain struct** you
+read and write directly (`pc`, `x[32]`, the memory map, the handlers). The
+implementation — every instruction body — lives in `purv.c`. `main.c` is just one
+host; write your own and link against the engine.
 
-The engine is **self-contained: no link-time host hooks**. Everything it touches
-lives in the state. You map memory regions into it and assign the handlers it
-calls, then set the pc and run a batch:
+The engine is **self-contained: no link-time host hooks**. The state struct is
+public, so you set it up by writing its fields -- there are no trivial get/set
+wrappers. Map memory, assign the handlers it calls, set the pc, and run a batch:
 
 ```c
-RiscvEmulatorState_t *st = RiscvEmulatorCreate(sp_top);
-RiscvEmulatorSetMemory(st, 0, ram, ram_len, /*writable=*/1);   /* region 0 @ 0x80000000 */
-RiscvEmulatorSetEcallHandler  (st, on_ecall);    /* int (*)(state): nonzero -> stop */
-RiscvEmulatorSetEbreakHandler (st, on_ebreak);
-RiscvEmulatorSetIllegalHandler(st, on_illegal);
-RiscvEmulatorSetProgramCounter(st, entry);
-uint64_t ran = RiscvEmulatorLoop(st, code, code_len, code_base, max);  /* runs a batch */
+RiscvEmulatorState_t *st = RiscvEmulatorCreate(sp_top);   /* or a plain stack value */
+st->mem[0]  = (RiscvEmulatorRegion_t){ ram, ram_len, /*writable=*/1 };  /* region 0 */
+st->ecall   = on_ecall;        /* int (*)(state): nonzero -> stop the run loop */
+st->ebreak  = on_ebreak;
+st->illegal = on_illegal;
+st->pc      = entry;
+uint64_t ran = RiscvEmulatorLoop(st, code, code_len, code_base, max);   /* runs a batch */
 ```
 
-The address space is **8 evenly spaced regions**, each up to 256 MiB, based at
-`0x80000000`, `0x90000000`, … `0xF0000000`; `SetMemory(st, i, …)` maps region
-`i`. A data load from an unmapped/out-of-bounds address reads zero; a store to a
-read-only or out-of-bounds address is dropped. Instruction *fetch* comes from the
-code window passed to `RiscvEmulatorLoop` (`code`/`code_len`/`code_base`); a pc
-outside it ends the batch. `ecall`/`ebreak`/`illegal` are the only handlers, and
-each returns nonzero to stop the run loop.
+The address space is **8 evenly spaced regions** (`st->mem[0..7]`), each up to
+256 MiB, based at `0x80000000`, `0x90000000`, … `0xF0000000`. A data load from an
+unmapped/out-of-bounds address reads zero; a store to a read-only or
+out-of-bounds address is dropped. Instruction *fetch* comes from the code window
+passed to `RiscvEmulatorLoop` (`code`/`code_len`/`code_base`); a pc outside it
+ends the batch. `ecall`/`ebreak`/`illegal` are the only handlers, and each
+returns nonzero to stop the run loop. The engine offers functions only for real
+work: `RiscvEmulatorLoop`, `RiscvEmulatorRead/WriteMemory`, and Create/Destroy/Init.
+The state struct is also naturally sized per target -- smaller on a 32-bit host,
+where its pointers are 4 bytes -- and the engine builds and runs on both.
 
 ## Build
 
@@ -93,9 +95,9 @@ make examples/args.elf  && ./purv --user examples/args.elf one two
 
 This is the design pattern for purv: the engine stays minimal and the host owns
 policy. The engine bakes in no syscall ABI — an `ecall` simply calls the handler
-assigned with `RiscvEmulatorSetEcallHandler`, which services the call and returns
-0 to resume in place (it is a service request to the execution environment, so it
-returns straight to the caller). Without `--user` that handler ignores it.
+in `st->ecall`, which services the call and returns 0 to resume in place (it is a
+service request to the execution environment, so it returns straight to the
+caller). Without `--user` that handler ignores it.
 
 ## Debug with gdb
 
@@ -209,7 +211,7 @@ applies; ACT is the conformance path.
 ## Memory map
 
 The engine's address space is 8 regions of up to 256 MiB, based 256 MiB apart
-from `0x80000000`; the host maps host storage into them with `SetMemory`.
+from `0x80000000`; the host maps host storage into them by writing `st->mem[i]`.
 
 | region | base address | `main.c` use                                |
 |-------:|--------------|---------------------------------------------|
@@ -225,7 +227,7 @@ silently dropped; such loads read zero.
 
 `purv.c` is hand-written (so are `purv.h` and `main.c`). It keeps atoom's premise
 — the host owns the memory map; the engine reaches the world only through the
-hooks above — but trims the redundancy of the original, in ~380 lines. Two ideas
+hooks above — but trims the redundancy of the original, in ~325 lines. Two ideas
 do most of that:
 
 - **Registers are indices into `x[32]`, not pointers.** `x0` is never written, so

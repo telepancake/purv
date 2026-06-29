@@ -3,9 +3,9 @@
  *
  * Built only when PURV_GDBSTUB is defined. It serves the RSP on a connected fd
  * handed in by a launcher (no listening here) and drives the engine through the
- * public purv.h surface: registers and PC via the accessors, memory via the same
- * RiscvEmulatorLoad/Store hooks the engine uses, execution one instruction at a
- * time via RiscvEmulatorLoop. Software breakpoints are tracked here (gdb's Z0/z0)
+ * public purv.h surface: registers and PC via the state struct's fields, memory
+ * via RiscvEmulatorRead/WriteMemory, execution one instruction at a time via
+ * RiscvEmulatorLoop. Software breakpoints are tracked here (gdb's Z0/z0)
  * rather than by patching guest code. A target description is served so a stock
  * riscv:rv32 gdb knows the 33-register layout (x0..x31, pc) without extra setup.
  */
@@ -141,14 +141,13 @@ static void reg_to_hex(char *o, uint32_t v) {
 
 static uint32_t reg_get(RiscvEmulatorState_t *st, uint32_t i) {
     /* gdb's pc is where execution is paused = the next instruction to run, which
-     * is the engine's "next" program counter (Get/SetProgramCounter both seed it). */
-    return i < 32 ? RiscvEmulatorGetRegister(st, (int)i)
-                  : RiscvEmulatorGetNextProgramCounter(st);
+     * the engine keeps in state->pc (the run loop resumes there). */
+    return i < 32 ? st->x[i & 31] : st->pc;
 }
 
 static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
-    if (i < 32) RiscvEmulatorSetRegister(st, (int)i, v);
-    else        RiscvEmulatorSetProgramCounter(st, v);
+    if (i >= 32) st->pc = st->npc = v;      /* seed both so the next step resumes here */
+    else if (i)  st->x[i] = v;              /* x0 stays zero */
 }
 
 /* -------------------------------------------------------------- breakpoints */
@@ -213,8 +212,8 @@ static void step_record(RiscvEmulatorState_t *st) {
     Frame *f = &g_hist[(g_head + g_count) % HIST_FRAMES];
     if (g_count == HIST_FRAMES) g_head = (g_head + 1) % HIST_FRAMES;
     else g_count++;
-    for (int i = 0; i < 32; i++) f->reg[i] = RiscvEmulatorGetRegister(st, i);
-    f->reg[32] = RiscvEmulatorGetNextProgramCounter(st);
+    for (int i = 0; i < 32; i++) f->reg[i] = st->x[i];
+    f->reg[32] = st->pc;
     f->nw = 0; f->overflow = 0;
     g_cur = f;
     step_one(st);
@@ -228,8 +227,8 @@ static int step_reverse(RiscvEmulatorState_t *st) {
     if (f->overflow) { g_count--; return -1; }   /* can't faithfully undo */
     for (int i = f->nw - 1; i >= 0; i--)         /* restore memory (g_cur NULL: not re-recorded) */
         RiscvEmulatorWriteMemory(st, f->w[i].addr, f->w[i].old, f->w[i].len);
-    for (int i = 1; i < 32; i++) RiscvEmulatorSetRegister(st, i, f->reg[i]);
-    RiscvEmulatorSetProgramCounter(st, f->reg[32]);
+    for (int i = 1; i < 32; i++) st->x[i] = f->reg[i];
+    st->pc = st->npc = f->reg[32];
     g_count--;
     return 1;
 }
@@ -285,7 +284,7 @@ static int gdb_run(RiscvEmulatorState_t *st, int fd, int cont, const int *halted
         step_record(st);
         if (*halted) return STOP_EXIT;
         if (!cont) return STOP_TRAP;
-        if (bp_hit(RiscvEmulatorGetNextProgramCounter(st))) return STOP_TRAP;
+        if (bp_hit(st->pc)) return STOP_TRAP;
         if ((++tick & 0x3ff) == 0 && gdb_pollin(fd) && gdb_read_byte(fd) == 0x03)
             return STOP_INT;
     }
@@ -297,7 +296,7 @@ static int gdb_reverse(RiscvEmulatorState_t *st, int cont) {
     for (;;) {
         if (step_reverse(st) == 0) return STOP_TRAP;   /* start of history */
         if (!cont) return STOP_TRAP;
-        if (bp_hit(RiscvEmulatorGetNextProgramCounter(st))) return STOP_TRAP;
+        if (bp_hit(st->pc)) return STOP_TRAP;
     }
 }
 
@@ -422,7 +421,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
         case 'c':                            /* continue [addr] */
         case 's': {                          /* step [addr] */
             if (exited) { gdb_send(fd, wmsg); break; }
-            if (buf[1]) { const char *p = buf + 1; RiscvEmulatorSetProgramCounter(st, parse_hex(&p)); }
+            if (buf[1]) { const char *p = buf + 1; st->pc = st->npc = parse_hex(&p); }
             int r = gdb_run(st, fd, buf[0] == 'c', halted);
             if (r == STOP_EXIT) {
                 exited = 1;

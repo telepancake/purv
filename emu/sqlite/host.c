@@ -167,20 +167,36 @@ void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *st, uint16_t csr) {
  * continues inside the engine loop; only exit (which sets g_halt) returns 1. */
 static int on_illegal(RiscvEmulatorState_t *st) {
     fprintf(stderr, "purv-sqlite: illegal instruction 0x%08x at pc=0x%08x\n",
-            RiscvEmulatorGetInstruction(st), RiscvEmulatorGetProgramCounter(st));
+            st->inst, st->pc);
     g_halt = 1; g_exit = 1; return 1;
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 static int on_ecall(RiscvEmulatorState_t *st) { service_hostcall(st); return g_halt; }
 #endif
 
+/* Register / pc access. purv exposes the state struct (use fields); purvs keeps
+ * the accessor functions. The shared code below goes through these shims. */
+#ifdef PURV_TAGGED
+static inline uint32_t rget(const RiscvEmulatorState_t *s, int i)   { return RiscvEmulatorGetRegister(s, i); }
+static inline void     rset(RiscvEmulatorState_t *s, int i, uint32_t v) { RiscvEmulatorSetRegister(s, i, v); }
+static inline void     spc(RiscvEmulatorState_t *s, uint32_t v)    { RiscvEmulatorSetProgramCounter(s, v); }
+static inline uint32_t gpc(const RiscvEmulatorState_t *s)          { return RiscvEmulatorGetProgramCounter(s); }
+static inline uint32_t gnpc(const RiscvEmulatorState_t *s)         { return RiscvEmulatorGetNextProgramCounter(s); }
+#else
+static inline uint32_t rget(const RiscvEmulatorState_t *s, int i)   { return s->x[i]; }
+static inline void     rset(RiscvEmulatorState_t *s, int i, uint32_t v) { s->x[i] = v; }
+static inline void     spc(RiscvEmulatorState_t *s, uint32_t v)    { s->pc = v; }
+static inline uint32_t gpc(const RiscvEmulatorState_t *s)          { return s->pc; }
+static inline uint32_t gnpc(const RiscvEmulatorState_t *s)         { return s->npc; }
+#endif
+
 /* ------------------------------------------------ host-function service loop */
 
 static void service_hostcall(RiscvEmulatorState_t *st) {
-    uint32_t fn = RiscvEmulatorGetRegister(st, 17);    /* a7 */
-    uint32_t a0 = RiscvEmulatorGetRegister(st, 10);
-    uint32_t a1 = RiscvEmulatorGetRegister(st, 11);
-    uint32_t a2 = RiscvEmulatorGetRegister(st, 12);
+    uint32_t fn = rget(st, 17);    /* a7 */
+    uint32_t a0 = rget(st, 10);
+    uint32_t a1 = rget(st, 11);
+    uint32_t a2 = rget(st, 12);
     uint32_t ret = 0;
 
     switch (fn) {
@@ -216,7 +232,7 @@ static void service_hostcall(RiscvEmulatorState_t *st) {
         g_halt = 1; g_exit = 1;
         break;
     }
-    RiscvEmulatorSetRegister(st, 10, ret);             /* result in a0 */
+    rset(st, 10, ret);                                 /* result in a0 */
 }
 
 /* ------------------------------------------------------------- ELF32 loader */
@@ -278,13 +294,13 @@ int main(int argc, char **argv) {
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
 #ifndef PURV_TAGGED
     /* purv: map the flat RAM as region 0 and assign the trap handlers. */
-    RiscvEmulatorSetMemory(st, 0, g_ram, RAM_BYTES, 1);
-    RiscvEmulatorSetEcallHandler(st, on_ecall);
-    RiscvEmulatorSetEbreakHandler(st, on_ebreak);
-    RiscvEmulatorSetIllegalHandler(st, on_illegal);
+    st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, RAM_BYTES, 1 };
+    st->ecall = on_ecall;
+    st->ebreak = on_ebreak;
+    st->illegal = on_illegal;
 #endif
-    RiscvEmulatorSetRegister(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of RAM */
-    RiscvEmulatorSetProgramCounter(st, entry);
+    rset(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of RAM */
+    spc(st, entry);
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -294,7 +310,7 @@ int main(int argc, char **argv) {
     uint32_t pc = entry;
     for (; i < max_insns && !g_halt; i++) {
         pc = RiscvEmulatorLoop(st, pc);
-        if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); pc = RiscvEmulatorGetNextProgramCounter(st); }
+        if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); pc = gnpc(st); }
     }
 #else
     /* purv: the pc lives in the state; run in slices, fetching from the flat RAM
@@ -308,8 +324,7 @@ int main(int argc, char **argv) {
         i += ran;
         if (g_halt) break;
         if (ran < budget) {                  /* pc left RAM: stray fetch */
-            fprintf(stderr, "purv-sqlite: fetch outside RAM at pc=0x%08x\n",
-                    RiscvEmulatorGetProgramCounter(st));
+            fprintf(stderr, "purv-sqlite: fetch outside RAM at pc=0x%08x\n", gpc(st));
             g_halt = 1; g_exit = 1; break;
         }
     }

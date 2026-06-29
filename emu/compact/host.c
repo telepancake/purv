@@ -76,7 +76,7 @@ static void host_free(uint32_t ap) {
 static void service(RiscvEmulatorState_t *st);
 static int on_illegal(RiscvEmulatorState_t *st) {
     fprintf(stderr, "compact: illegal instruction 0x%08x at pc=0x%08x\n",
-            RiscvEmulatorGetInstruction(st), RiscvEmulatorGetProgramCounter(st));
+            st->inst, st->pc);
     g_halt = 1; g_exit = 1; return 1;
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
@@ -84,10 +84,10 @@ static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 static int on_ecall(RiscvEmulatorState_t *st) { service(st); return g_halt; }
 
 static void service(RiscvEmulatorState_t *st) {
-    uint32_t fn = RiscvEmulatorGetRegister(st, 17);
-    uint32_t a0 = RiscvEmulatorGetRegister(st, 10);
-    uint32_t a1 = RiscvEmulatorGetRegister(st, 11);
-    uint32_t a2 = RiscvEmulatorGetRegister(st, 12);
+    uint32_t fn = st->x[17];
+    uint32_t a0 = st->x[10];
+    uint32_t a1 = st->x[11];
+    uint32_t a2 = st->x[12];
     uint32_t ret = 0;
     switch (fn) {
     case HOSTCALL_WRITE:
@@ -103,7 +103,7 @@ static void service(RiscvEmulatorState_t *st) {
     case HOSTCALL_FREE:   if (a0) host_free(a0); ret = 0; break;
     default: fprintf(stderr, "compact: unknown host call %u\n", fn); g_halt = 1; g_exit = 1; break;
     }
-    RiscvEmulatorSetRegister(st, 10, ret);
+    st->x[10] = ret;
 }
 
 /* ----------------------------------------------------------- flat image load */
@@ -129,12 +129,12 @@ int main(int argc, char **argv) {
 
     RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
     if (!st) { fprintf(stderr, "compact: cannot create state\n"); return 2; }
-    RiscvEmulatorSetMemory(st, 0, g_ram, RAM_BYTES, 1);        /* flat image -> region 0 */
-    RiscvEmulatorSetEcallHandler(st, on_ecall);
-    RiscvEmulatorSetEbreakHandler(st, on_ebreak);
-    RiscvEmulatorSetIllegalHandler(st, on_illegal);
-    RiscvEmulatorSetRegister(st, 2, RAM_ORIGIN + RAM_BYTES);    /* sp */
-    RiscvEmulatorSetProgramCounter(st, entry);
+    st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, RAM_BYTES, 1 };  /* flat image -> region 0 */
+    st->ecall = on_ecall;
+    st->ebreak = on_ebreak;
+    st->illegal = on_illegal;
+    st->x[2] = RAM_ORIGIN + RAM_BYTES;                          /* sp */
+    st->pc = entry;
 
     /* pc lives in the state; run in slices off the flat RAM image. */
     const uint64_t CAP = 1000ull * 1000 * 1000, SLICE = 1u << 16;
@@ -146,8 +146,7 @@ int main(int argc, char **argv) {
         i += ran;
         if (g_halt) break;
         if (ran < budget) {                  /* pc left RAM: stray fetch */
-            fprintf(stderr, "compact: fetch outside RAM at pc=0x%08x\n",
-                    RiscvEmulatorGetProgramCounter(st));
+            fprintf(stderr, "compact: fetch outside RAM at pc=0x%08x\n", st->pc);
             g_halt = 1; g_exit = 1; break;
         }
     }

@@ -62,7 +62,7 @@ static int on_illegal(RiscvEmulatorState_t *state) {
     /* A userspace program cannot self-handle an illegal instruction, so report
      * it and stop. */
     fprintf(stderr, "purv: illegal instruction 0x%08x at pc=0x%08x\n",
-            RiscvEmulatorGetInstruction(state), RiscvEmulatorGetProgramCounter(state));
+            state->inst, state->pc);
     g_halt = 1;
     g_exit = 1;
     return 1;
@@ -74,10 +74,10 @@ static int on_illegal(RiscvEmulatorState_t *state) {
  * continues (the signature-dump suites halt via the tohost word we poll). */
 static int on_ecall(RiscvEmulatorState_t *state) {
     if (!g_user_mode) return 0;          /* no syscall ABI requested: keep running */
-    uint32_t num = RiscvEmulatorGetRegister(state, 17);   /* a7 */
-    uint32_t a0  = RiscvEmulatorGetRegister(state, 10);
-    uint32_t a1  = RiscvEmulatorGetRegister(state, 11);
-    uint32_t a2  = RiscvEmulatorGetRegister(state, 12);
+    uint32_t num = state->x[17];         /* a7 */
+    uint32_t a0  = state->x[10];
+    uint32_t a1  = state->x[11];
+    uint32_t a2  = state->x[12];
     uint32_t ret;
     switch (num) {
     case 64:                              /* write(fd, buf, len) */
@@ -104,7 +104,7 @@ static int on_ecall(RiscvEmulatorState_t *state) {
         ret = (uint32_t)-38;              /* -ENOSYS */
         break;
     }
-    RiscvEmulatorSetRegister(state, 10, ret);
+    state->x[10] = ret;                  /* result in a0 */
     return g_halt;                        /* exit halts; otherwise keep running in place */
 }
 static int on_ebreak(RiscvEmulatorState_t *state) { (void)state; return 1; }
@@ -308,28 +308,28 @@ int main(int argc, char **argv) {
 
     /* Map the flat RAM as region 0 and assign the trap handlers; the engine
      * reaches the outside world only through these. */
-    RiscvEmulatorSetMemory(st, 0, g_ram, g_ram_size, 1);
-    RiscvEmulatorSetEcallHandler(st, on_ecall);
-    RiscvEmulatorSetEbreakHandler(st, on_ebreak);
-    RiscvEmulatorSetIllegalHandler(st, on_illegal);
+    st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, g_ram_size, 1 };
+    st->ecall = on_ecall;
+    st->ebreak = on_ebreak;
+    st->illegal = on_illegal;
 
     uint32_t start = entry;
     if (invoke) {
         if (!sym_lookup(invoke, &start)) {
             fprintf(stderr, "purv: symbol '%s' not found\n", invoke); return 2;
         }
-        RiscvEmulatorSetRegister(st, 1, MAGIC_RET);           /* ra: ret -> stop */
+        st->x[1] = MAGIC_RET;                                 /* ra: ret -> stop */
         for (int i = 0; i < nargs; i++)
-            RiscvEmulatorSetRegister(st, 10 + i, args[i]);    /* a0.. */
+            st->x[10 + i] = args[i];                          /* a0.. */
     } else if (g_user_mode) {
-        RiscvEmulatorSetRegister(st, 2, setup_user_stack(gargc, gargv));  /* sp */
+        st->x[2] = setup_user_stack(gargc, gargv);            /* sp */
     } else {
         g_have_tohost   = sym_lookup("tohost", &g_tohost);
         g_have_sig      = sym_lookup("begin_signature", &g_begin_sig) &
                           sym_lookup("end_signature", &g_end_sig);
     }
 
-    RiscvEmulatorSetProgramCounter(st, start);
+    st->pc = start;
 
 #ifdef PURV_GDBSTUB
     if (g_gdb_fd >= 0) {
@@ -362,7 +362,7 @@ int main(int argc, char **argv) {
             if (v) { g_exit = (v == 1) ? 0 : 1; g_halt = 1; break; }  /* 1 -> PASS */
         }
         if (ran < budget) {                      /* pc left the mapped code */
-            uint32_t pc = RiscvEmulatorGetProgramCounter(st);
+            uint32_t pc = st->pc;
             if (invoke && pc == MAGIC_RET) break;   /* invoked function returned */
             fprintf(stderr, "purv: fetch outside RAM at pc=0x%08x\n", pc);
             g_halt = 1; g_exit = 1;
@@ -372,7 +372,7 @@ int main(int argc, char **argv) {
 
     if (invoke) {
         if (i >= max_insns) { fprintf(stderr, "purv: instruction cap reached\n"); return 2; }
-        uint32_t a0 = RiscvEmulatorGetRegister(st, 10);
+        uint32_t a0 = st->x[10];
         printf("%d (0x%08x)\n", (int32_t)a0, a0);
         RiscvEmulatorDestroy(st);
         return 0;
