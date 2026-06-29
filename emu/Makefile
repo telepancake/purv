@@ -84,12 +84,16 @@ test: purv examples/fn.elf examples/sigtest.elf examples/hello.elf examples/args
 	@./purv --signature=examples/out.sig examples/sigtest.elf && \
 	  echo "signature:" && sed 's/^/  /' examples/out.sig
 
-# Regenerate purv.c from the upstream submodule, then compact it (the flattener
-# emits very sparse C; tools/compact.py reflows it without changing meaning).
+# Regenerate purv.c from the upstream submodule and post-process it into the
+# checked-in form: inline the single-call-site handler tree into the public
+# functions (tools/inline.py), then reflow (tools/compact.py). Both are
+# behavior-preserving; the result is verified by `make conformance`.
 regen:
 	python3 tools/flatten.py $(ATOOM_INC) $(OUTDIR)
 	python3 tools/compact.py $(OUTDIR)/purv.c
-	@echo "regenerated + compacted purv.c from $(ATOOM_INC) (purv.h is hand-written)"
+	python3 tools/inline.py  $(OUTDIR)/purv.c
+	python3 tools/compact.py $(OUTDIR)/purv.c
+	@echo "regenerated purv.c from $(ATOOM_INC): inlined + compacted (purv.h is hand-written)"
 
 clean:
 	rm -f purv purv_clang examples/*.o examples/*.elf examples/out.sig

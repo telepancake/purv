@@ -7,12 +7,12 @@ header + implementation library, with a separate host, ISA flags baked in:
 ```
 emu/
   purv.h      public interface — opaque state + the calls you need (~50 lines)
-  purv.c      the whole engine, hidden behind purv.h (generated, ~4000 lines)
+  purv.c      the whole engine, hidden behind purv.h (generated, ~1700 lines)
   main.c      the host/driver: memory map + hooks + ELF loader + two run modes
   runfn.sh    compile a bare function and run it, wasm style
   gdbstub.c   optional GDB Remote Serial Protocol server (build with GDB=1)
   gdbserve.py launcher that brokers a gdb connection and hands purv the fd
-  tools/      flatten.py — regenerates purv.c from the upstream submodule
+  tools/      flatten.py / inline.py / compact.py — regenerate purv.c (see below)
   examples/   fn.c (bare functions), sigtest.S (signature demo), loop.c (gdb reverse-exec)
 ```
 
@@ -209,12 +209,27 @@ for the ACT4 framework only when you need its exhaustive coverage.
 ## Regenerating the engine
 
 `purv.c` is generated, not hand-edited (`purv.h` and `main.c` are hand-written).
-`tools/flatten.py` inlines atoom's ~45 headers in dependency order, evaluating
-the baked `RVE_E_*` flags so disabled extensions and the `RVE_E_HOOK`
-instrumentation are stripped out entirely. It emits the internal types and every
-instruction body as plain `static` functions into `purv.c`, turns atoom's state
-typedef into the tagged `struct RiscvEmulatorState` that completes the opaque
-type, and exposes only the public API.
+`make regen` runs a three-stage, all-mechanical pipeline:
+
+1. **`tools/flatten.py`** inlines atoom's ~45 headers in dependency order,
+   evaluating the baked `RVE_E_*` flags so disabled extensions and the
+   `RVE_E_HOOK` instrumentation are stripped out. It emits the internal types and
+   every instruction body as plain `static` functions, turns atoom's state typedef
+   into the tagged `struct RiscvEmulatorState` that completes the opaque type, and
+   exposes only the public API.
+2. **`tools/inline.py`** collapses the call tree. atoom's engine is a forest of
+   single-call-site `static` handlers (the Loop dispatches down two or three
+   levels of one-line functions); this inlines each handler into its caller —
+   substituting arguments for parameters (casting scalars to the parameter type),
+   inverting the `x0` guard or routing a nested return through a `goto` — until
+   only the ~13 public functions remain. Reading `RiscvEmulatorLoop` top-down now
+   shows the whole decode/dispatch/execute in one place, no hunting.
+3. **`tools/compact.py`** reflows the result (clang-format with a dense style,
+   removing redundant single-statement braces and collapsing one-line structs).
+
+All three are behavior-preserving, and the result is **verified by the riscv-tests
+conformance suite** (`make conformance` / `./selfcheck.sh`, 50/51 — the one skip
+is the misaligned-access `ma_data` test).
 
 ```sh
 make regen      # reads ../third_party/atoomnetmarc-rv/include
