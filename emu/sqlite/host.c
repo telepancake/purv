@@ -278,9 +278,10 @@ int main(int argc, char **argv) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint64_t i = 0;
+    uint32_t pc = entry;
     for (; i < max_insns && !g_halt; i++) {
-        RiscvEmulatorLoop(st);
-        if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); }
+        pc = RiscvEmulatorLoop(st, pc);
+        if (g_ecall_pending) { g_ecall_pending = 0; service_hostcall(st); pc = RiscvEmulatorGetNextProgramCounter(st); }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (i >= max_insns) { fprintf(stderr, "purv-sqlite: instruction cap reached\n"); g_exit = 3; }

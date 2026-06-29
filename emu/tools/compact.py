@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compact a generated engine source (purv.c) in place, without changing meaning.
+"""Compact a generated engine source (purg.c) in place, without changing meaning.
 
 The flattener (and inliner) emit very sparse C -- one struct field per line, lots
 of blank lines, three-line guard blocks, braces around single statements. This

@@ -63,7 +63,7 @@ conformance: purv
 GDB_SRC := $(if $(filter 1,$(GDB)),gdbstub.c)
 GDB_DEF := $(if $(filter 1,$(GDB)),-DPURV_GDBSTUB)
 
-# purv.c is the generated engine; main.c is the host/driver. Separate TUs.
+# purv.c is the hand-written engine; main.c is the host/driver. Separate TUs.
 purv: purv.c main.c purv.h $(GDB_SRC) $(if $(GDB_SRC),gdbstub.h)
 	$(CC) $(CFLAGS) $(GDB_DEF) purv.c main.c $(GDB_SRC) -o $@
 
@@ -94,16 +94,16 @@ test: purv examples/fn.elf examples/sigtest.elf examples/hello.elf examples/args
 	@./purv --signature=examples/out.sig examples/sigtest.elf && \
 	  echo "signature:" && sed 's/^/  /' examples/out.sig
 
-# Regenerate purv.c from the upstream submodule and post-process it into the
-# checked-in form: inline the single-call-site handler tree into the public
-# functions (tools/inline.py), then reflow (tools/compact.py). Both are
-# behavior-preserving; the result is verified by `make conformance`.
+# Historical: mechanically distill the upstream atoom engine into purg.c
+# (purg = "generated"). The build uses the hand-written purv.c/purv.h; purg is
+# kept regenerable as a reference for where purv came from. purg.h is the
+# generated engine's hand-written header (its API predates purv's pc-threading).
 regen:
 	python3 tools/flatten.py $(ATOOM_INC) $(OUTDIR)
-	python3 tools/compact.py $(OUTDIR)/purv.c
-	python3 tools/inline.py  $(OUTDIR)/purv.c
-	python3 tools/compact.py $(OUTDIR)/purv.c
-	@echo "regenerated purv.c from $(ATOOM_INC): inlined + compacted (purv.h is hand-written)"
+	python3 tools/compact.py $(OUTDIR)/purg.c
+	python3 tools/inline.py  $(OUTDIR)/purg.c
+	python3 tools/compact.py $(OUTDIR)/purg.c
+	@echo "regenerated purg.c from $(ATOOM_INC): inlined + compacted (purg.h is hand-written; purv.c/.h untouched)"
 
 clean:
 	rm -f purv purv_clang examples/*.o examples/*.elf examples/out.sig

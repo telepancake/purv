@@ -1,14 +1,13 @@
 /*
- * purv.h - RISC-V (RV32IMC + Zicsr/Zifencei) emulator: public interface.
+ * purg.h - RISC-V (RV32IMC + Zicsr/Zifencei) emulator: public interface (generated).
  *
- * A small, hand-written engine in the spirit of atoomnetmarc/RISC-V-emulator
- * (Apache-2.0, (c) Marc Ketel): the host owns all policy and reaches the engine
- * only through the hooks below; the engine knows nothing of the memory map. The
- * VM state is opaque (its layout lives in purv.c) and this header is the entire
- * public surface.
+ * The implementation is purg.c (generated from atoomnetmarc/RISC-V-emulator,
+ * Apache-2.0, (c) Marc Ketel). This header is the entire public surface: an
+ * opaque VM state, the run loop, register/PC access, and the memory/trap hooks
+ * you implement. None of the engine's internal types are exposed.
  */
-#ifndef PURV_H_
-#define PURV_H_
+#ifndef PURG_H_
+#define PURG_H_
 
 #include <stdint.h>
 
@@ -16,7 +15,7 @@
 #define RAM_ORIGIN 0x80000000u
 
 /* Opaque emulator state. Create it with RiscvEmulatorCreate(); the layout is
- * private to purv.c. */
+ * private to purg.c. */
 typedef struct RiscvEmulatorState RiscvEmulatorState_t;
 
 /* ---- Lifecycle ---- */
@@ -27,8 +26,8 @@ RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp);  /* alloc + init
 void                  RiscvEmulatorDestroy(RiscvEmulatorState_t *state);
 void                  RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp);
 
-/* ---- The VM: execute the instruction at pc, return the next pc. ---- */
-uint32_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint32_t pc);
+/* ---- The VM: execute one instruction. ---- */
+void RiscvEmulatorLoop(RiscvEmulatorState_t *state);
 
 /* ---- Register / program-counter access (x0..x31; x0 reads 0, ignores writes) ---- */
 uint32_t RiscvEmulatorGetRegister(const RiscvEmulatorState_t *state, int index);
@@ -56,4 +55,4 @@ void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *state, uint16_t csrnum);
 void RiscvEmulatorHandleECALL(RiscvEmulatorState_t *state);
 void RiscvEmulatorHandleEBREAK(RiscvEmulatorState_t *state);
 
-#endif /* PURV_H_ */
+#endif /* PURG_H_ */

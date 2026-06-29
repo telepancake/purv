@@ -142,9 +142,10 @@ int main(int argc, char **argv) {
     RiscvEmulatorSetRegister(st, 2, RAM_ORIGIN + RAM_BYTES);    /* sp */
     RiscvEmulatorSetProgramCounter(st, entry);
 
+    uint32_t pc = entry;
     for (uint64_t i = 0; i < 1000ull * 1000 * 1000 && !g_halt; i++) {
-        RiscvEmulatorLoop(st);
-        if (g_ecall) { g_ecall = 0; service(st); }
+        pc = RiscvEmulatorLoop(st, pc);
+        if (g_ecall) { g_ecall = 0; service(st); pc = RiscvEmulatorGetNextProgramCounter(st); }
     }
     RiscvEmulatorDestroy(st);
     return g_exit;

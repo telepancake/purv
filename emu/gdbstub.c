@@ -200,7 +200,7 @@ void RiscvEmulatorGdbRecordStore(uint32_t address, const void *old_bytes, uint8_
 
 /* Step one instruction while recording it into the history ring. */
 static void step_record(RiscvEmulatorState_t *st) {
-    if (!g_hist) { RiscvEmulatorLoop(st); return; }   /* no history: just step */
+    if (!g_hist) { RiscvEmulatorLoop(st, RiscvEmulatorGetNextProgramCounter(st)); return; }   /* no history: just step */
     Frame *f = &g_hist[(g_head + g_count) % HIST_FRAMES];
     if (g_count == HIST_FRAMES) g_head = (g_head + 1) % HIST_FRAMES;
     else g_count++;
@@ -208,7 +208,7 @@ static void step_record(RiscvEmulatorState_t *st) {
     f->reg[32] = RiscvEmulatorGetNextProgramCounter(st);
     f->nw = 0; f->overflow = 0;
     g_cur = f;
-    RiscvEmulatorLoop(st);
+    RiscvEmulatorLoop(st, RiscvEmulatorGetNextProgramCounter(st));
     g_cur = NULL;
 }
 

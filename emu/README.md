@@ -1,27 +1,30 @@
 # purv — RISC-V emulator
 
-A copy of [atoomnetmarc/RISC-V-emulator][atoom] flattened into a conventional
-header + implementation library, with a separate host, ISA flags baked in:
+A small, hand-written RISC-V emulator in the spirit of
+[atoomnetmarc/RISC-V-emulator][atoom] — same hook-based premise, a conventional
+header + implementation library, a separate host, ISA flags baked in:
 **RV32IMC + Zicsr + Zifencei**.
 
 ```
 emu/
-  purv.h      public interface — opaque state + the calls you need (~50 lines)
-  purv.c      the whole engine, hidden behind purv.h (generated, ~1700 lines)
+  purv.h      public interface — opaque state + the calls you need (~60 lines)
+  purv.c      the whole engine, hidden behind purv.h (hand-written, ~420 lines)
+  purg.c/.h   the earlier engine, mechanically generated from atoom (g = generated;
+              kept for reference, not built — see "How the engine is organized")
   main.c      the host/driver: memory map + hooks + ELF loader + two run modes
   runfn.sh    compile a bare function and run it, wasm style
   gdbstub.c   optional GDB Remote Serial Protocol server (build with GDB=1)
   gdbserve.py launcher that brokers a gdb connection and hands purv the fd
-  tools/      flatten.py / inline.py / compact.py — regenerate purv.c (see below)
+  tools/      flatten.py / inline.py / compact.py — the atoom-distilling pipeline (history)
   examples/   fn.c (bare functions), sigtest.S (signature demo), loop.c (gdb reverse-exec)
 ```
 
 `purv.h` is the entire public surface: the VM state is an **opaque type**, so
-none of the engine's internal instruction-format / CSR structs leak out. You
-`#include "purv.h"`, create a state, call `RiscvEmulatorLoop()` to step it, and
-read registers through accessors. The implementation — every instruction body —
-lives in `purv.c` and is invisible to callers. `main.c` is just one host; write
-your own and link against the engine.
+none of the engine's internals leak out. You `#include "purv.h"`, create a state,
+and step it with `RiscvEmulatorLoop(state, pc)` — it executes the instruction at
+`pc` and returns the next `pc` — reading registers through accessors. The
+implementation — every instruction body — lives in `purv.c` and is invisible to
+callers. `main.c` is just one host; write your own and link against the engine.
 
 atoom's appeal is that it has essentially *no API*: you define a handful of hook
 functions and the engine reaches your memory map only through them (defined in
@@ -206,35 +209,36 @@ for the ACT4 framework only when you need its exhaustive coverage.
 | UART   | `0x10000000` | byte store → stdout; `+5` reads tx-ready   |
 | SYSCON | `0x11100000` | store `0x5555` → exit 0 (PASS)             |
 
-## Regenerating the engine
+## How the engine is organized
 
-`purv.c` is generated, not hand-edited (`purv.h` and `main.c` are hand-written).
-`make regen` runs a three-stage, all-mechanical pipeline:
+`purv.c` is hand-written (so are `purv.h` and `main.c`). It keeps atoom's premise
+— the host owns the memory map and trap policy; the engine reaches the world only
+through the hooks above — but trims the redundancy of the original, in ~420 lines.
+Two ideas do most of that:
 
-1. **`tools/flatten.py`** inlines atoom's ~45 headers in dependency order,
-   evaluating the baked `RVE_E_*` flags so disabled extensions and the
-   `RVE_E_HOOK` instrumentation are stripped out. It emits the internal types and
-   every instruction body as plain `static` functions, turns atoom's state typedef
-   into the tagged `struct RiscvEmulatorState` that completes the opaque type, and
-   exposes only the public API.
-2. **`tools/inline.py`** collapses the call tree. atoom's engine is a forest of
-   single-call-site `static` handlers (the Loop dispatches down two or three
-   levels of one-line functions); this inlines each handler into its caller —
-   substituting arguments for parameters (casting scalars to the parameter type),
-   inverting the `x0` guard or routing a nested return through a `goto` — until
-   only the ~13 public functions remain. Reading `RiscvEmulatorLoop` top-down now
-   shows the whole decode/dispatch/execute in one place, no hunting.
-3. **`tools/compact.py`** reflows the result (clang-format with a dense style,
-   removing redundant single-statement braces and collapsing one-line structs).
+- **Registers are indices into `x[32]`, not pointers.** `x0` is never written, so
+  it reads as a hard zero and `wr()` simply drops writes to it. No `void *rd`
+  juggling, no per-instruction `x0` guard.
+- **Compressed instructions are decompressed, not separately executed.** A 16-bit
+  instruction is decoded into the *same* `Decoded` form a 32-bit instruction
+  produces (`decode16` / `decode32`), so `execute()` never sees "C" — there is a
+  single executor for both encodings. All the per-encoding bit-shuffling lives in
+  the two decoders; reserved/illegal compressed encodings come back as `op == 0`,
+  which `execute()` rejects like any other illegal opcode.
 
-All three are behavior-preserving, and the result is **verified by the riscv-tests
-conformance suite** (`make conformance` / `./selfcheck.sh`, 50/51 — the one skip
-is the misaligned-access `ma_data` test).
+`RiscvEmulatorLoop(state, pc)` is one fetch → decode → execute → trap-epilogue
+step: it takes the `pc` to run and returns the next `pc`.
 
-```sh
-make regen      # reads ../third_party/atoomnetmarc-rv/include
-```
+Correctness is **verified by the riscv-tests conformance suite** (`make
+conformance` / `./selfcheck.sh`, 50/51 — the one skip is the misaligned-access
+`ma_data` test).
 
-Pinned to atoom commit `633526d4`.
+The earlier engine — `purg.c` / `purg.h` (purg = "generated") — is kept for
+reference but is no longer built. The `tools/` pipeline (`flatten.py` /
+`inline.py` / `compact.py`) and the `atoomnetmarc-rv` submodule (pinned to commit
+`633526d4`) mechanically distilled the upstream engine into it; `make regen`
+rebuilds `purg.c` from the submodule (it never touches the hand-written
+`purv.c` / `purv.h`). `purg`'s public API predates this rewrite — its
+`RiscvEmulatorLoop(state)` steps an internal pc rather than taking/returning one.
 
 [atoom]: https://github.com/atoomnetmarc/RISC-V-emulator

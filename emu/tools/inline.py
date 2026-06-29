@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inline purv.c's single-call-site static handlers into the public API functions.
+"""Inline purg.c's single-call-site static handlers into the public API functions.
 
 The flattened engine is a pure tree: every `static void RiscvEmulator*` handler
 is called exactly once, so the Loop dispatches down two or three levels of tiny

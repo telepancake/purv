@@ -421,9 +421,10 @@ int main(int argc, char **argv) {
 #endif
 
     uint64_t i = 0;
+    uint32_t pc = start;
     for (; i < max_insns && !g_halt; i++) {
-        if (invoke && RiscvEmulatorGetNextProgramCounter(st) == MAGIC_RET) break;
-        RiscvEmulatorLoop(st);
+        if (invoke && pc == MAGIC_RET) break;   /* function returned to the sentinel */
+        pc = RiscvEmulatorLoop(st, pc);
     }
 
     if (invoke) {
