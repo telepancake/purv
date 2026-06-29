@@ -40,7 +40,14 @@ echo "[4/6] guest test program"
 $GUEST $SQOPTS -c guest.c         -o guest.o
 if [ ! -f sqlite3.o ] || [ "$SQLDIR/sqlite3.c" -nt sqlite3.o ]; then
   echo "[5/6] sqlite3.c (big; cached after first build)"
-  $GUEST $SQOPTS -Wno-implicit-int -c "$SQLDIR/sqlite3.c" -o sqlite3.o
+  # Benign warnings, silenced to keep the build readable:
+  #  -Wno-*conversion : OMIT_FLOATING_POINT makes `double` an i64, so sqlite3.c's
+  #                     double literals warn as value-changing conversions.
+  #  -Wno-atomic-alignment : rv32 has no lock-free atomics, so SQLite's __atomic_*
+  #                     become libcalls (which builtins.c provides); the warning
+  #                     is moot under SQLITE_THREADSAFE=0.
+  $GUEST $SQOPTS -Wno-implicit-int -Wno-literal-conversion -Wno-constant-conversion \
+    -Wno-atomic-alignment -c "$SQLDIR/sqlite3.c" -o sqlite3.o
 else
   echo "[5/6] sqlite3.o cached"
 fi

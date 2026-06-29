@@ -47,67 +47,100 @@ void __atomic_store_4(volatile void *p, unsigned int v,   int m) { (void)m; *(vo
 
 /* --------------------------------------------------------- soft double shim */
 
-typedef union { double d; uint64_t u; } DU;
-static double  mkd(uint64_t u) { DU x; x.u = u; return x.d; }
-static uint64_t ub(double d)   { DU x; x.d = d; return x.u; }
+/* Exactly which of these the compiler emits varies by version, so provide the
+ * whole comparison + conversion set (and multiply). They are never *executed* by
+ * an integer/text workload -- SQLite only reaches its double code when parsing or
+ * formatting a REAL -- so they only need to link.
+ *
+ * SOFTFP = optnone: without it the optimizer recognizes the integer bit-tricks
+ * below as float ops and lowers them right back into __eqdf2/__nedf2/... calls
+ * (which then fail to link, or recurse). optnone keeps them as plain integer code. */
+#if defined(__clang__)
+#  define SOFTFP __attribute__((optnone, noinline))
+#else
+#  define SOFTFP __attribute__((optimize("O0"), noinline))
+#endif
 
-/* magnitude/sign compare; NaN not handled (the formatting path never feeds it). */
-static int dcmp(double a, double b) {
-    uint64_t ua = ub(a), ub_ = ub(b);
-    if (((ua << 1) == 0) && ((ub_ << 1) == 0)) return 0;     /* +0 == -0 */
-    int sa = (int)(ua >> 63), sb = (int)(ub_ >> 63);
+typedef union { double d; uint64_t u; } DU;
+static uint64_t d2u(double d)   { DU x; x.d = d; return x.u; }
+static double   u2d(uint64_t u) { DU x; x.u = u; return x.d; }
+
+static SOFTFP int dcmp(double a, double b) {                 /* -1 / 0 / +1 */
+    uint64_t ua = d2u(a), ub = d2u(b);
+    if (((ua << 1) == 0) && ((ub << 1) == 0)) return 0;      /* +0 == -0 */
+    int sa = (int)(ua >> 63), sb = (int)(ub >> 63);
     if (sa != sb) return sa ? -1 : 1;
-    if (ua == ub_) return 0;
-    int mag = ua < ub_ ? -1 : 1;
+    if (ua == ub) return 0;
+    int mag = ua < ub ? -1 : 1;
     return sa ? -mag : mag;
 }
-int __ltdf2(double a, double b) { return dcmp(a, b); }
-int __gtdf2(double a, double b) { return dcmp(a, b); }
-int __gedf2(double a, double b) { return dcmp(a, b); }
-
-double __floatdidf(int64_t a) {
-    if (a == 0) return mkd(0);
-    int neg = a < 0;
-    uint64_t m = neg ? -(uint64_t)a : (uint64_t)a;
-    int e = 63;
-    while (!(m & ((uint64_t)1 << 63))) { m <<= 1; e--; }     /* normalize MSB -> bit 63 */
-    uint64_t frac = (m >> 11) & (((uint64_t)1 << 52) - 1);   /* 52 fraction bits */
-    uint64_t bits = ((uint64_t)neg << 63) | ((uint64_t)(e + 1023) << 52) | frac;
-    return mkd(bits);
+static SOFTFP int dnan(double a) {
+    uint64_t u = d2u(a);
+    return ((u >> 52) & 0x7ff) == 0x7ff && (u & (((uint64_t)1 << 52) - 1)) != 0;
 }
-int64_t __fixdfdi(double a) {
-    uint64_t bits = ub(a);
-    int neg = (int)(bits >> 63);
+
+/* Comparisons (libgcc ABI: caller tests the sign/zeroness of the result). */
+SOFTFP int __eqdf2(double a, double b)    { return dcmp(a, b); }
+SOFTFP int __nedf2(double a, double b)    { return dcmp(a, b); }
+SOFTFP int __ltdf2(double a, double b)    { return dcmp(a, b); }
+SOFTFP int __ledf2(double a, double b)    { return dcmp(a, b); }
+SOFTFP int __gtdf2(double a, double b)    { return dcmp(a, b); }
+SOFTFP int __gedf2(double a, double b)    { return dcmp(a, b); }
+SOFTFP int __unorddf2(double a, double b) { return dnan(a) || dnan(b); }
+
+/* unsigned/signed integer -> double. */
+SOFTFP double __floatundidf(uint64_t a) {
+    if (a == 0) return u2d(0);
+    int e = 63;
+    while (!(a & ((uint64_t)1 << 63))) { a <<= 1; e--; }     /* normalize MSB -> bit 63 */
+    uint64_t frac = (a >> 11) & (((uint64_t)1 << 52) - 1);
+    return u2d(((uint64_t)(e + 1023) << 52) | frac);
+}
+SOFTFP double __floatdidf(int64_t a) {
+    if (a == 0) return u2d(0);
+    int neg = a < 0;
+    uint64_t m = neg ? (uint64_t)(-(uint64_t)a) : (uint64_t)a; /* |a|, incl. INT64_MIN */
+    uint64_t bits = d2u(__floatundidf(m));
+    return u2d(bits | ((uint64_t)neg << 63));
+}
+SOFTFP double __floatsidf(int32_t a)    { return __floatdidf(a); }
+SOFTFP double __floatunsidf(uint32_t a) { return __floatundidf(a); }
+
+/* double -> unsigned/signed integer (truncating). */
+SOFTFP uint64_t __fixunsdfdi(double a) {
+    uint64_t bits = d2u(a);
+    if (bits >> 63) return 0;                                /* negative -> 0 */
     int e = (int)((bits >> 52) & 0x7ff) - 1023;
     if (e < 0) return 0;
-    uint64_t mant = (bits & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
-    int64_t v = e >= 52 ? (int64_t)(mant << (e - 52)) : (int64_t)(mant >> (52 - e));
-    return neg ? -v : v;
+    uint64_t m = (bits & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
+    return e >= 52 ? (m << (e - 52)) : (m >> (52 - e));
 }
-int __fixdfsi(double a) { return (int)__fixdfdi(a); }
+SOFTFP int64_t __fixdfdi(double a) {
+    uint64_t bits = d2u(a);
+    int64_t v = (int64_t)__fixunsdfdi(u2d(bits & ~((uint64_t)1 << 63)));  /* of |a| */
+    return (bits >> 63) ? -v : v;
+}
+SOFTFP int      __fixdfsi(double a)     { return (int)__fixdfdi(a); }
+SOFTFP unsigned __fixunsdfsi(double a)  { return (unsigned)__fixunsdfdi(a); }
 
-double __muldf3(double a, double b) {
-    uint64_t ua = ub(a), ub_ = ub(b);
-    int sign = (int)((ua ^ ub_) >> 63);
-    int ea = (int)((ua >> 52) & 0x7ff), eb = (int)((ub_ >> 52) & 0x7ff);
-    uint64_t ma = (ua & (((uint64_t)1 << 52) - 1)), mb = (ub_ & (((uint64_t)1 << 52) - 1));
-    if (ea == 0 && ma == 0) return mkd((uint64_t)sign << 63);  /* a == 0 */
-    if (eb == 0 && mb == 0) return mkd((uint64_t)sign << 63);  /* b == 0 */
+SOFTFP double __muldf3(double a, double b) {
+    uint64_t ua = d2u(a), ub = d2u(b);
+    int sign = (int)((ua ^ ub) >> 63);
+    int ea = (int)((ua >> 52) & 0x7ff), eb = (int)((ub >> 52) & 0x7ff);
+    uint64_t ma = (ua & (((uint64_t)1 << 52) - 1)), mb = (ub & (((uint64_t)1 << 52) - 1));
+    if (ea == 0 && ma == 0) return u2d((uint64_t)sign << 63);  /* a == 0 */
+    if (eb == 0 && mb == 0) return u2d((uint64_t)sign << 63);  /* b == 0 */
     ma |= (uint64_t)1 << 52; mb |= (uint64_t)1 << 52;          /* implicit 1 */
     int e = ea + eb - 1023;
-    /* 53x53 -> 106-bit product via 32-bit halves */
-    uint64_t al = ma & 0xffffffff, ah = ma >> 32;
+    uint64_t al = ma & 0xffffffff, ah = ma >> 32;             /* 53x53 -> 106 bits */
     uint64_t bl = mb & 0xffffffff, bh = mb >> 32;
     uint64_t lo = al * bl;
     uint64_t mid = ah * bl + al * bh + (lo >> 32);
     uint64_t hi = ah * bh + (mid >> 32);
-    uint64_t prod_hi = hi;                                     /* top ~64 bits of product */
-    /* product is in [2^104, 2^106); we want top 53 bits */
-    int shift = 105 - 52;                                      /* bring bit105/104 down to 52 */
-    uint64_t mant = prod_hi >> (shift - 32);
-    if (mant & ((uint64_t)1 << 53)) { mant >>= 1; e++; }       /* normalize 106-bit case */
+    uint64_t mant = hi >> (105 - 52 - 32);                    /* top 53 bits */
+    if (mant & ((uint64_t)1 << 53)) { mant >>= 1; e++; }
     uint64_t frac = (mant >> 1) & (((uint64_t)1 << 52) - 1);
-    if (e <= 0) return mkd((uint64_t)sign << 63);              /* underflow -> 0 (shim) */
-    if (e >= 0x7ff) return mkd(((uint64_t)sign << 63) | ((uint64_t)0x7ff << 52)); /* inf */
-    return mkd(((uint64_t)sign << 63) | ((uint64_t)e << 52) | frac);
+    if (e <= 0) return u2d((uint64_t)sign << 63);                                 /* underflow */
+    if (e >= 0x7ff) return u2d(((uint64_t)sign << 63) | ((uint64_t)0x7ff << 52)); /* inf */
+    return u2d(((uint64_t)sign << 63) | ((uint64_t)e << 52) | frac);
 }

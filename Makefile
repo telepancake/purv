@@ -9,7 +9,8 @@
 # Conformance harness (RISCOF vs the Sail reference model):
 #   make bootstrap    fetch submodules + install riscof  (needs open git egress)
 #   make spike        build Spike (differential oracle)
-#   make sail         fetch the prebuilt Sail 0.12 reference model
+#   make sail-dl      fetch the prebuilt Sail 0.12 reference model  (default `make sail`)
+#   make sail-build   build the pinned submodule from source (needs the Sail toolchain)
 #   make validate     RISCOF: Spike (DUT) vs Sail (reference) — proves the harness
 #   make conformance  RISCOF: purv  (DUT) vs Sail (reference) — the real run
 
@@ -21,18 +22,25 @@ ARCHTEST    := $(TP)/riscv-arch-test
 CONF        := $(ROOT)/conformance
 WORK        := $(ROOT)/riscof_work
 
-# Reference model: the prebuilt Sail release 0.12, which is what ACT4/RISCOF
-# actually consumes. The sail-riscv submodule HEAD is the newer CMake
-# single-binary build and is NOT it (see conformance/STATUS.md), so `make sail`
-# fetches the release binary rather than building the heavy OCaml/opam source.
-SAIL_VER    := 0.12
-SAIL_DIR    := $(ROOT)/tools/sail-$(SAIL_VER)
-SAIL_BIN    := $(SAIL_DIR)/bin/sail_riscv_sim
+# Reference model, two ways:
+#   sail-dl    : the prebuilt Sail release 0.12 binary -- exactly the version the
+#                ACT4/RISCOF golden signatures were computed with.
+#   sail-build : build the pinned submodule from source. NOTE the submodule pin
+#                (third_party/sail-riscv) is 0.12 + 19 commits, so the from-source
+#                binary is NOT identical to the 0.12 the signatures use -- re-pin
+#                the submodule to tag 0.12 (commit 65ddde80) if you need a match.
+SAIL_VER       := 0.12
+SAIL_DL_DIR    := $(ROOT)/tools/sail-$(SAIL_VER)
+SAIL_DL_BIN    := $(SAIL_DL_DIR)/bin/sail_riscv_sim
+SAIL_BUILD_BIN := $(SAIL_SRC)/build/c_emulator/sail_riscv_sim
+# Which binary validate/conformance gate on (override to use the from-source one,
+# e.g. `make conformance SAIL_BIN=$(SAIL_BUILD_BIN)`):
+SAIL_BIN       ?= $(SAIL_DL_BIN)
 
 # Built artifact Spike's plugin invokes.
 SPIKE_BIN   := $(SPIKE_DIR)/build/spike
 
-.PHONY: help emu emu-test secure sqlite bootstrap spike sail validate conformance clean distclean
+.PHONY: help emu emu-test secure sqlite bootstrap spike sail sail-dl sail-build validate conformance clean distclean
 
 help:
 	@sed -n '1,14p' $(MAKEFILE_LIST)
@@ -59,23 +67,35 @@ $(SPIKE_BIN):
 	mkdir -p $(SPIKE_DIR)/build
 	cd $(SPIKE_DIR)/build && ../configure && $(MAKE) -j
 
-sail: $(SAIL_BIN)
-$(SAIL_BIN):
+# Default `make sail` is the download (lighter, version-matched to the harness).
+sail: sail-dl
+
+# Prebuilt Sail 0.12 release binary -> tools/sail-0.12/bin/sail_riscv_sim.
+sail-dl: $(SAIL_DL_BIN)
+$(SAIL_DL_BIN):
 	@echo "==> Fetching prebuilt Sail $(SAIL_VER) reference model (sail_riscv_sim)"
-	@mkdir -p $(SAIL_DIR)
+	@mkdir -p $(SAIL_DL_DIR)
 	@os=$$(uname); [ "$$os" = Darwin ] && os=Mac; \
 	 asset="sail-riscv-$$os-$$(uname -m).tar.gz"; \
 	 url="https://github.com/riscv/sail-riscv/releases/download/$(SAIL_VER)/$$asset"; \
 	 echo "    $$url"; \
 	 curl -fSL -o /tmp/sail-$(SAIL_VER).tgz "$$url" || { \
 	   echo "ERROR: no prebuilt Sail $(SAIL_VER) asset '$$asset' for this platform."; \
-	   echo "       Published: Linux-x86_64, Linux-aarch64, Mac-arm64."; \
-	   echo "       Build from source instead (needs opam + the sail compiler):"; \
-	   echo "         git submodule update --init $(SAIL_SRC)"; \
-	   echo "         cmake -S $(SAIL_SRC) -B $(SAIL_SRC)/build && cmake --build $(SAIL_SRC)/build"; \
+	   echo "       Published: Linux-x86_64, Linux-aarch64, Mac-arm64. Use 'make sail-build'."; \
 	   exit 1; }; \
-	 tar xzf /tmp/sail-$(SAIL_VER).tgz --directory=$(SAIL_DIR) --strip-components=1
-	@$(SAIL_BIN) --version
+	 tar xzf /tmp/sail-$(SAIL_VER).tgz --directory=$(SAIL_DL_DIR) --strip-components=1
+	@$(SAIL_DL_BIN) --version
+
+# Build the reference model from the pinned submodule. Needs the Sail compiler
+# (>= 0.20.1) and a C/C++ toolchain; build_simulator.sh drives CMake and fetches
+# libgmp. See the Arch package list in conformance/README.md. RV32 vs RV64 is a
+# runtime --config, so this one binary serves both.
+sail-build: $(SAIL_BUILD_BIN)
+$(SAIL_BUILD_BIN):
+	@echo "==> Building Sail reference model from the pinned submodule"
+	cd $(ROOT) && git submodule update --init -- third_party/sail-riscv
+	cd $(SAIL_SRC) && ./build_simulator.sh
+	@$(SAIL_BUILD_BIN) --version
 
 # --- RISCOF runs ----------------------------------------------------------
 
