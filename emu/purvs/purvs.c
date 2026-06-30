@@ -2,28 +2,34 @@
  * purvs.c - RISC-V (RV32IMC + Zifencei) monadic emulator: implementation.
  *
  * purvs is purv (the hand-written engine) restructured into a decode/execute
- * split. purv's inner loop fused fetch, decode, and execute; here that loop is
- * cut in two:
+ * split. purv's inner loop fused fetch, decode, and execute; here it is cut in
+ * two, with a deliberately lean intermediate form between them:
  *
- *   1. decode-ahead (decode_one, driven from RiscvEmulatorLoop): walk the code
- *      window from pc, lowering each raw instruction -- 32-bit or compressed --
- *      into a wide RiscvEmulatorDecoded_t in an internal buffer, until the first
- *      control transfer (its last record) or the buffer / code window is full.
- *      Decode reads only the code bytes: register INDICES and immediates, never
- *      values, so a whole run can be decoded before any of it executes.
+ *   1. decode-ahead (decode_one, driven from RiscvEmulatorLoop): from pc, lower
+ *      each raw instruction -- 32-bit or compressed -- into an 8-byte
+ *      RiscvEmulatorDecoded_t { imm, op, rd, rs1, rs2 } in an internal buffer,
+ *      until the first control transfer (its last record) or the buffer / code
+ *      window fills. Decode reads only the code bytes; it never reads register
+ *      values, so a whole run is decoded before any of it runs.
  *
- *   2. threaded execution (RiscvEmulatorDefaultEval): thread through the decoded
- *      buffer with a computed-goto jump table indexed by the record's leaf op.
- *      Our leaf opcode is not the RISC-V opcode -- decode folds opcode, funct3,
- *      and funct7 into one byte per evaluator handler (ADD, SUB, LB, BEQ, ...) --
- *      so dispatch is a single indexed jump with no secondary decode.
+ *   2. direct-threaded execution (RiscvEmulatorDefaultEval): a computed-goto jump
+ *      table indexed by the leaf op, where each handler ends by jumping STRAIGHT
+ *      to the next op's handler -- so every op carries its own indirect dispatch
+ *      and the branch predictor can specialise per op.
+ *
+ * The intermediate form carries only what cannot be recovered for free at run
+ * time. The instruction's pc and width are NOT stored: the loop tracks the running
+ * pc and presets state->pc to the run's fall-through before eval, so a sequential
+ * op never touches pc and jal/jalr take their link straight from state->pc. Every
+ * pc-relative result is baked into `imm` at decode (AUIPC becomes a LUI of pc+imm;
+ * a branch/JAL target is the absolute pc+imm), which is the only reason `imm`
+ * needs 32 bits. Operand source is folded into the op (ADDI is distinct from ADD).
  *
  * Execution is the pluggable half: state->eval (default RiscvEmulatorDefaultEval)
  * is the one place value semantics live, so an alternate interpretation (tag
- * tracking, taint, tracing, ...) is a drop-in replacement over the same decode
- * pass and run loop. Registers are indices into x[32]; x0 is never written, so it
- * reads as a hard zero. Code is in the read-only lower half, so a decoded run can
- * never be invalidated by a store -- decoding ahead is always safe.
+ * tracking, taint, tracing, ...) is a drop-in over the same decode and run loop.
+ * Code is in the read-only lower half, so a decoded run can never be invalidated
+ * by a store -- decoding ahead is always safe.
  */
 #include <stdint.h>
 #include <string.h>
@@ -34,9 +40,8 @@
 enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
        OP = 0x33, LUI = 0x37, BRANCH = 0x63, JALR = 0x67, JAL = 0x6f, SYSTEM = 0x73 };
 
-/* How many decoded instructions one decode-ahead pass buffers. A basic block
- * rarely runs longer; a longer straight-line run just decodes in successive
- * batches (a full buffer with no control transfer continues from the advanced pc). */
+/* How many decoded instructions one decode-ahead pass buffers (plus room for the
+ * END sentinel). A longer straight-line run just decodes in successive batches. */
 enum { RISCV_BLOCK_MAX = 64 };
 
 /* ---- memory: one address translation, used by every load and store ---- */
@@ -65,6 +70,14 @@ static int32_t sext(uint32_t v, int bits) {
     return (int32_t)(v << sh) >> sh;
 }
 
+/* The control transfers and traps that end a decoded run: a branch/jump (the next
+ * pc is the target, not pc+width) or a trap (control leaves the engine). They are
+ * a contiguous range of leaf ops, so the test is two range checks. */
+static int is_terminator(uint8_t op) {
+    return (op >= RISCV_OP_BEQ   && op <= RISCV_OP_JALR) ||
+           (op >= RISCV_OP_ECALL && op <= RISCV_OP_ILLEGAL);
+}
+
 /* ----------------------------------------------------------------- decode */
 
 /* funct3 -> leaf op for the encodings whose width/sign/condition lives in funct3.
@@ -91,41 +104,31 @@ static uint8_t branch_op(uint32_t f3) {
     }
 }
 
-/* The control transfers and traps that end a decoded run: after one of these the
- * next pc is not pc+width (branch/jump) or control leaves the engine (trap), so
- * decode stops with it as the run's last record. */
-static int ends_block(uint8_t op) {
-    return (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) ||
-           op == RISCV_OP_JAL || op == RISCV_OP_JALR ||
-           op == RISCV_OP_ECALL || op == RISCV_OP_EBREAK || op == RISCV_OP_ILLEGAL;
-}
-
-/* Lower the instruction at `code[off]` into *d. Reads only the code bytes -- it
- * records the leaf op, register indices, and immediates, and never touches
- * register or memory state -- so a whole run can be decoded ahead of eval. The
- * caller has already checked that the encoding's bytes are in range. The case
- * structure mirrors purv's fused decode/execute switch; each former `goto
- * <action>` becomes `op = RISCV_OP_<leaf>` plus the operand fields that action
- * consumed, with funct3/funct7 folded into the leaf op rather than carried. */
+/* Lower the instruction at `code[off]` into *d. Reads only the code bytes. Sets the
+ * leaf op, register indices, and the per-op `imm` payload -- baking pc-relative
+ * targets (AUIPC value, branch/JAL target) into `imm` using `off`, so nothing
+ * downstream needs the instruction's own pc. The case structure mirrors purv's
+ * fused decode/execute switch; each former `goto <action>` becomes a leaf op plus
+ * the operand fields that action consumed. A trailing fixup stores the raw word in
+ * `imm` for trap ops, which the run loop hands to the host as state->inst. */
 static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t off) {
     uint16_t lo = (uint16_t)(code[off] | code[off + 1] << 8);
-    d->pc = off;
-    d->rd = 0; d->rs1 = 0; d->rs2 = 0; d->imm = 0; d->b_imm = 0;
+    uint32_t raw;
+    d->rd = 0; d->rs1 = 0; d->rs2 = 0; d->imm = 0;
 
     if ((lo & 3) == 3) {                                  /* ---- 32-bit ---- */
         uint32_t w = lo | (uint32_t)(code[off + 2] | code[off + 3] << 8) << 16;
         uint32_t rd = (w >> 7) & 31, rs1 = (w >> 15) & 31, f3 = (w >> 12) & 7;
-        d->raw = w; d->width = 4;
+        raw = w;
         d->rd = rd; d->rs1 = rs1;
         switch (w & 0x7f) {
         case OPIMM:                                       /* reg-immediate */
-            d->b_imm = 1;
             if (f3 == 1 || f3 == 5) {                     /* shifts: shamt + funct7 */
                 d->imm = (w >> 20) & 31;
-                d->op = (f3 == 5 && (w >> 25) == 0x20) ? RISCV_OP_SRA : (uint8_t)(RISCV_OP_ADD + f3);
+                d->op = (f3 == 5 && (w >> 25) == 0x20) ? RISCV_OP_SRAI : (uint8_t)(RISCV_OP_ADDI + f3);
             } else {
                 d->imm = (uint32_t)((int32_t)w >> 20);    /* I-immediate */
-                d->op = RISCV_OP_ADD + f3;
+                d->op = RISCV_OP_ADDI + f3;
             }
             break;
         case OP:                                          /* reg-register */
@@ -141,18 +144,18 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
             d->imm = (uint32_t)(((int32_t)w >> 25 << 5) | ((w >> 7) & 0x1f)); break;
         case BRANCH:
             d->op = branch_op(f3); d->rs2 = (w >> 20) & 31;
-            d->imm = sext((w >> 31 & 1) << 12 | (w >> 7 & 1) << 11 |
-                          (w >> 25 & 0x3f) << 5 | (w >> 8 & 0xf) << 1, 13);
+            d->imm = off + sext((w >> 31 & 1) << 12 | (w >> 7 & 1) << 11 |       /* baked target */
+                                (w >> 25 & 0x3f) << 5 | (w >> 8 & 0xf) << 1, 13);
             break;
         case JAL:
             d->op = RISCV_OP_JAL;
-            d->imm = sext((w >> 31 & 1) << 20 | (w >> 12 & 0xff) << 12 |
-                          (w >> 20 & 1) << 11 | (w >> 21 & 0x3ff) << 1, 21);
+            d->imm = off + sext((w >> 31 & 1) << 20 | (w >> 12 & 0xff) << 12 |   /* baked target */
+                                (w >> 20 & 1) << 11 | (w >> 21 & 0x3ff) << 1, 21);
             break;
         case JALR:
-            d->op = RISCV_OP_JALR; d->imm = (uint32_t)((int32_t)w >> 20); break;
-        case LUI:   d->op = RISCV_OP_LUI;   d->imm = w & 0xfffff000; break;
-        case AUIPC: d->op = RISCV_OP_AUIPC; d->imm = w & 0xfffff000; break;
+            d->op = RISCV_OP_JALR; d->imm = (uint32_t)((int32_t)w >> 20); break; /* dynamic offset */
+        case LUI:   d->op = RISCV_OP_LUI; d->imm = w & 0xfffff000; break;
+        case AUIPC: d->op = RISCV_OP_LUI; d->imm = off + (w & 0xfffff000); break; /* fold into LUI */
         case MISCMEM:                                     /* FENCE / FENCE.I -> nop */
             d->op = (rd || rs1 || (f3 != 0 && f3 != 1)) ? RISCV_OP_ILLEGAL : RISCV_OP_NOP;
             break;
@@ -171,14 +174,14 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
         uint32_t shamt = ((c >> 2) & 0x1f) | ((c >> 12) & 1) << 5;
         int32_t  ci = sext(shamt, 6);                                 /* CI 6-bit imm */
         uint32_t rd = (c >> 7) & 31;
-        d->raw = lo; d->width = 2;
+        raw = lo;
         d->rd = rd;
         switch (((c >> 13) & 7) << 2 | (c & 3)) {
         case 0 << 2 | 0: {                       /* C.ADDI4SPN -> addi rd', sp, uimm */
             uint32_t imm = ((c >> 11) & 3) << 4 | ((c >> 7) & 0xf) << 6 |
                            ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 3;
-            d->op = imm ? RISCV_OP_ADD : RISCV_OP_ILLEGAL;            /* imm 0 reserved */
-            d->rd = rdp; d->rs1 = 2; d->b_imm = 1; d->imm = imm; break;
+            d->op = imm ? RISCV_OP_ADDI : RISCV_OP_ILLEGAL;          /* imm 0 reserved */
+            d->rd = rdp; d->rs1 = 2; d->imm = imm; break;
         }
         case 2 << 2 | 0:                          /* C.LW -> lw rd', uimm(rs1') */
             d->op = RISCV_OP_LW; d->rd = rdp; d->rs1 = rsp;
@@ -187,22 +190,22 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
             d->op = RISCV_OP_SW; d->rs1 = rsp; d->rs2 = rdp;
             d->imm = ((c >> 10) & 7) << 3 | ((c >> 6) & 1) << 2 | ((c >> 5) & 1) << 6; break;
         case 0 << 2 | 1:                          /* C.ADDI / C.NOP -> addi rd, rd, imm */
-            d->op = RISCV_OP_ADD; d->rs1 = rd; d->b_imm = 1; d->imm = (uint32_t)ci; break;
+            d->op = RISCV_OP_ADDI; d->rs1 = rd; d->imm = (uint32_t)ci; break;
         case 1 << 2 | 1: d->rd = 1; goto cj;      /* C.JAL -> jal ra, off */
         case 5 << 2 | 1: d->rd = 0;               /* C.J -> jal x0, off */
         cj: d->op = RISCV_OP_JAL;
-            d->imm = sext(((c >> 12) & 1) << 11 | ((c >> 11) & 1) << 4 | ((c >> 9) & 3) << 8 |
-                          ((c >> 8) & 1) << 10 | ((c >> 7) & 1) << 6 | ((c >> 6) & 1) << 7 |
-                          ((c >> 3) & 7) << 1 | ((c >> 2) & 1) << 5, 12);
+            d->imm = off + sext(((c >> 12) & 1) << 11 | ((c >> 11) & 1) << 4 | ((c >> 9) & 3) << 8 |
+                                ((c >> 8) & 1) << 10 | ((c >> 7) & 1) << 6 | ((c >> 6) & 1) << 7 |
+                                ((c >> 3) & 7) << 1 | ((c >> 2) & 1) << 5, 12);   /* baked target */
             break;
         case 2 << 2 | 1:                          /* C.LI -> addi rd, x0, imm */
-            d->op = RISCV_OP_ADD; d->rs1 = 0; d->b_imm = 1; d->imm = (uint32_t)ci; break;
+            d->op = RISCV_OP_ADDI; d->rs1 = 0; d->imm = (uint32_t)ci; break;
         case 3 << 2 | 1:                          /* C.LUI / C.ADDI16SP */
             if (rd == 2) {                        /* addi sp, sp, nzimm */
                 uint32_t imm = sext(((c >> 6) & 1) << 4 | ((c >> 2) & 1) << 5 | ((c >> 5) & 1) << 6 |
                                     ((c >> 3) & 3) << 7 | ((c >> 12) & 1) << 9, 10);
-                d->op = imm ? RISCV_OP_ADD : RISCV_OP_ILLEGAL;
-                d->rd = 2; d->rs1 = 2; d->b_imm = 1; d->imm = imm; break;
+                d->op = imm ? RISCV_OP_ADDI : RISCV_OP_ILLEGAL;
+                d->rd = 2; d->rs1 = 2; d->imm = imm; break;
             }
             {                                     /* lui rd, nzimm */
                 uint32_t imm = sext(((c >> 2) & 0x1f) << 12 | ((c >> 12) & 1) << 17, 18);
@@ -211,11 +214,11 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
         case 4 << 2 | 1:                          /* C.MISC-ALU */
             d->rd = rsp; d->rs1 = rsp;
             switch ((c >> 10) & 3) {
-            case 0: d->op = RISCV_OP_SRL; d->b_imm = 1; d->imm = shamt; break;       /* C.SRLI */
-            case 1: d->op = RISCV_OP_SRA; d->b_imm = 1; d->imm = shamt; break;       /* C.SRAI */
-            case 2: d->op = RISCV_OP_AND; d->b_imm = 1; d->imm = (uint32_t)ci; break;/* C.ANDI */
+            case 0: d->op = RISCV_OP_SRLI; d->imm = shamt; break;         /* C.SRLI */
+            case 1: d->op = RISCV_OP_SRAI; d->imm = shamt; break;         /* C.SRAI */
+            case 2: d->op = RISCV_OP_ANDI; d->imm = (uint32_t)ci; break;  /* C.ANDI */
             default:
-                if ((c >> 12) & 1) { d->op = RISCV_OP_ILLEGAL; break; }              /* RV64 only */
+                if ((c >> 12) & 1) { d->op = RISCV_OP_ILLEGAL; break; }   /* RV64 only */
                 d->rs2 = rdp;
                 switch ((c >> 5) & 3) {
                 case 0: d->op = RISCV_OP_SUB; break;     /* C.SUB */
@@ -225,13 +228,13 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
                 }
             }
             break;
-        case 6 << 2 | 1: d->op = RISCV_OP_BEQ; d->rs1 = rsp; goto cb;   /* C.BEQZ */
-        case 7 << 2 | 1: d->op = RISCV_OP_BNE; d->rs1 = rsp;            /* C.BNEZ */
-        cb: d->imm = sext(((c >> 12) & 1) << 8 | ((c >> 10) & 3) << 3 | ((c >> 5) & 3) << 6 |
-                          ((c >> 3) & 3) << 1 | ((c >> 2) & 1) << 5, 9);
-            break;                                /* rs2 defaults to 0 (compare against x0) */
+        case 6 << 2 | 1: d->op = RISCV_OP_BEQ; d->rs1 = rsp; goto cb;   /* C.BEQZ (rs2 = x0) */
+        case 7 << 2 | 1: d->op = RISCV_OP_BNE; d->rs1 = rsp;            /* C.BNEZ (rs2 = x0) */
+        cb: d->imm = off + sext(((c >> 12) & 1) << 8 | ((c >> 10) & 3) << 3 | ((c >> 5) & 3) << 6 |
+                                ((c >> 3) & 3) << 1 | ((c >> 2) & 1) << 5, 9);   /* baked target */
+            break;
         case 0 << 2 | 2:                          /* C.SLLI -> slli rd, rd, shamt */
-            d->op = RISCV_OP_SLL; d->rs1 = rd; d->b_imm = 1; d->imm = shamt; break;
+            d->op = RISCV_OP_SLLI; d->rs1 = rd; d->imm = shamt; break;
         case 2 << 2 | 2:                          /* C.LWSP -> lw rd, uimm(sp) */
             d->op = RISCV_OP_LW; d->rs1 = 2;
             d->imm = ((c >> 4) & 7) << 2 | ((c >> 2) & 3) << 6 | ((c >> 12) & 1) << 5; break;
@@ -251,174 +254,166 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
         default: d->op = RISCV_OP_ILLEGAL; break;
         }
     }
-    d->ends_block = ends_block(d->op);
+    /* Trap ops carry the raw word so the loop can hand it to the host as state->inst. */
+    if (d->op >= RISCV_OP_ECALL && d->op <= RISCV_OP_ILLEGAL) d->imm = raw;
 }
 
 /* ------------------------------------------------------------- default eval */
 
-/* The default value semantics: thread through the decoded run with a computed-goto
- * jump table indexed by the leaf op, reading live operands from the register file.
- * Returns the number of records executed (normally `count`); sets *halt nonzero
- * when a handler asks to stop the run. Init installs this into state->eval; swap
- * it to change semantics without touching the decode pass or the run loop.
+/* Keep the direct threading intact in this ONE function without nerfing the rest
+ * of the translation unit (or the host built alongside it). At -O2 a compiler will
+ * merge the 48 identical per-op `goto *tbl[...]` dispatches back into a handful of
+ * shared indirect branches, defeating the per-op branch prediction the threading
+ * is for. GCC exposes the two responsible passes as a per-function optimize
+ * attribute, which turns them off here only (verified: 4 -> 48 distinct dispatch
+ * sites). Clang has no equivalent per-function knob -- its `optimize`/`nomerge`
+ * attributes are ignored on a computed goto, and `optnone` would disable ALL
+ * optimization of the evaluator (far worse than the merge) -- so under Clang the
+ * dispatches stay merged. That is acceptable: the default build is GCC (see the
+ * Makefile), and the merge is perf-neutral on this engine anyway (the cost is
+ * dominated by re-decoding each run, not by dispatch prediction). A Clang user who
+ * wants the threading can compile this file with -mllvm -enable-tail-merge=false. */
+#if defined(__GNUC__) && !defined(__clang__)
+#define PURVS_THREADED __attribute__((optimize("no-crossjumping", "no-gcse")))
+#else
+#define PURVS_THREADED   /* no per-function equivalent on Clang; see above */
+#endif
+
+/* The default value semantics: a DIRECT-THREADED interpreter over the decoded run.
+ * Each op handler ends with NEXT, which fetches the next record and jumps straight
+ * to its handler through the jump table -- so every op has its own indirect
+ * dispatch, no shared dispatch tail. The run is terminated by the RISCV_OP_END
+ * sentinel the loop appends at block[count], so NEXT needs no bound check.
  *
- * Threaded ("token threading"): each handler ends with NEXT, which dispatches the
- * next record directly through the jump table rather than returning to a loop top. */
-uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *s,
-                                  const RiscvEmulatorDecoded_t *block,
-                                  uint32_t count, int *halt) {
+ * state->pc was preset by the loop to the run's fall-through, so sequential ops
+ * leave it alone, a not-taken branch leaves it alone, and jal/jalr read their link
+ * from it. Traps are not run here: a trap op stops eval (the loop sets pc/inst and
+ * calls the host handler). Returns the number of real records executed. */
+PURVS_THREADED
+uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *s, const RiscvEmulatorDecoded_t *block) {
     static const void *const tbl[RISCV_OP_COUNT] = {
-        [RISCV_OP_ADD] = &&h_add, [RISCV_OP_SUB]  = &&h_sub,  [RISCV_OP_SLL]  = &&h_sll,
-        [RISCV_OP_SLT] = &&h_slt, [RISCV_OP_SLTU] = &&h_sltu, [RISCV_OP_XOR]  = &&h_xor,
-        [RISCV_OP_SRL] = &&h_srl, [RISCV_OP_SRA]  = &&h_sra,  [RISCV_OP_OR]   = &&h_or,
-        [RISCV_OP_AND] = &&h_and,
-        [RISCV_OP_MUL]    = &&h_mul,    [RISCV_OP_MULH] = &&h_mulh, [RISCV_OP_MULHSU] = &&h_mulhsu,
-        [RISCV_OP_MULHU]  = &&h_mulhu,  [RISCV_OP_DIV]  = &&h_div,  [RISCV_OP_DIVU]   = &&h_divu,
-        [RISCV_OP_REM]    = &&h_rem,    [RISCV_OP_REMU] = &&h_remu,
-        [RISCV_OP_LB]  = &&h_lb, [RISCV_OP_LH] = &&h_lh, [RISCV_OP_LW] = &&h_lw,
+        [RISCV_OP_ADD] = &&h_add, [RISCV_OP_SLL] = &&h_sll, [RISCV_OP_SLT] = &&h_slt,
+        [RISCV_OP_SLTU] = &&h_sltu, [RISCV_OP_XOR] = &&h_xor, [RISCV_OP_SRL] = &&h_srl,
+        [RISCV_OP_OR] = &&h_or, [RISCV_OP_AND] = &&h_and, [RISCV_OP_SUB] = &&h_sub, [RISCV_OP_SRA] = &&h_sra,
+        [RISCV_OP_ADDI] = &&h_addi, [RISCV_OP_SLLI] = &&h_slli, [RISCV_OP_SLTI] = &&h_slti,
+        [RISCV_OP_SLTIU] = &&h_sltiu, [RISCV_OP_XORI] = &&h_xori, [RISCV_OP_SRLI] = &&h_srli,
+        [RISCV_OP_ORI] = &&h_ori, [RISCV_OP_ANDI] = &&h_andi, [RISCV_OP_SRAI] = &&h_srai,
+        [RISCV_OP_MUL] = &&h_mul, [RISCV_OP_MULH] = &&h_mulh, [RISCV_OP_MULHSU] = &&h_mulhsu,
+        [RISCV_OP_MULHU] = &&h_mulhu, [RISCV_OP_DIV] = &&h_div, [RISCV_OP_DIVU] = &&h_divu,
+        [RISCV_OP_REM] = &&h_rem, [RISCV_OP_REMU] = &&h_remu,
+        [RISCV_OP_LB] = &&h_lb, [RISCV_OP_LH] = &&h_lh, [RISCV_OP_LW] = &&h_lw,
         [RISCV_OP_LBU] = &&h_lbu, [RISCV_OP_LHU] = &&h_lhu,
-        [RISCV_OP_SB]  = &&h_sb, [RISCV_OP_SH] = &&h_sh, [RISCV_OP_SW] = &&h_sw,
+        [RISCV_OP_SB] = &&h_sb, [RISCV_OP_SH] = &&h_sh, [RISCV_OP_SW] = &&h_sw,
         [RISCV_OP_BEQ] = &&h_beq, [RISCV_OP_BNE] = &&h_bne, [RISCV_OP_BLT] = &&h_blt,
         [RISCV_OP_BGE] = &&h_bge, [RISCV_OP_BLTU] = &&h_bltu, [RISCV_OP_BGEU] = &&h_bgeu,
-        [RISCV_OP_JAL]  = &&h_jal,  [RISCV_OP_JALR] = &&h_jalr, [RISCV_OP_LUI] = &&h_lui,
-        [RISCV_OP_AUIPC] = &&h_auipc, [RISCV_OP_NOP] = &&h_nop,
-        [RISCV_OP_ECALL] = &&h_ecall, [RISCV_OP_EBREAK] = &&h_ebreak, [RISCV_OP_ILLEGAL] = &&h_illegal,
+        [RISCV_OP_JAL] = &&h_jal, [RISCV_OP_JALR] = &&h_jalr,
+        [RISCV_OP_LUI] = &&h_lui, [RISCV_OP_NOP] = &&h_nop,
+        [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
+        [RISCV_OP_END] = &&h_end,
     };
     const RiscvEmulatorDecoded_t *d;
-    uint32_t i = 0, a, b, r, addr, n;
-    uint32_t pc = 0, width = 0;
+    uint32_t i = 0, a, b;
 
-    *halt = 0;
-    if (!count) return 0;
+    #define NEXT() do { d = &block[i++]; goto *tbl[d->op]; } while (0)
+    NEXT();
 
-    /* DISPATCH consumes the next record (advancing i past it) and jumps to its
-     * handler; NEXT is DISPATCH guarded by the run's end. */
-    #define DISPATCH() do { d = &block[i++]; pc = d->pc; width = d->width; goto *tbl[d->op]; } while (0)
-    #define NEXT()     do { if (i >= count) goto out; DISPATCH(); } while (0)
-    DISPATCH();
+    /* ---- ALU reg-reg (rd = x[rs1] <op> x[rs2]) ---- */
+    h_add:  wr(s, d->rd, s->x[d->rs1] + s->x[d->rs2]);                          NEXT();
+    h_sub:  wr(s, d->rd, s->x[d->rs1] - s->x[d->rs2]);                          NEXT();
+    h_sll:  wr(s, d->rd, s->x[d->rs1] << (s->x[d->rs2] & 31));                  NEXT();
+    h_slt:  wr(s, d->rd, (int32_t)s->x[d->rs1] < (int32_t)s->x[d->rs2]);        NEXT();
+    h_sltu: wr(s, d->rd, s->x[d->rs1] < s->x[d->rs2]);                          NEXT();
+    h_xor:  wr(s, d->rd, s->x[d->rs1] ^ s->x[d->rs2]);                          NEXT();
+    h_srl:  wr(s, d->rd, s->x[d->rs1] >> (s->x[d->rs2] & 31));                  NEXT();
+    h_sra:  wr(s, d->rd, (uint32_t)((int32_t)s->x[d->rs1] >> (s->x[d->rs2] & 31))); NEXT();
+    h_or:   wr(s, d->rd, s->x[d->rs1] | s->x[d->rs2]);                          NEXT();
+    h_and:  wr(s, d->rd, s->x[d->rs1] & s->x[d->rs2]);                          NEXT();
 
-    /* ---- ALU (a = x[rs1]; b = imm or x[rs2]) ---- */
-    h_add:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a + b;            goto alu_wb;
-    h_sub:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a - b;            goto alu_wb;
-    h_sll:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a << (b & 31);    goto alu_wb;
-    h_slt:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = (int32_t)a < (int32_t)b; goto alu_wb;
-    h_sltu: a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a < b;            goto alu_wb;
-    h_xor:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a ^ b;            goto alu_wb;
-    h_srl:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a >> (b & 31);    goto alu_wb;
-    h_sra:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2];
-            r = (uint32_t)((int32_t)a >> (b & 31));                                        goto alu_wb;
-    h_or:   a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a | b;            goto alu_wb;
-    h_and:  a = s->x[d->rs1]; b = d->b_imm ? d->imm : s->x[d->rs2]; r = a & b;            goto alu_wb;
-    alu_wb: wr(s, d->rd, r); s->pc = pc + width; NEXT();
+    /* ---- ALU reg-imm (rd = x[rs1] <op> imm) ---- */
+    h_addi:  wr(s, d->rd, s->x[d->rs1] + d->imm);                               NEXT();
+    h_slli:  wr(s, d->rd, s->x[d->rs1] << (d->imm & 31));                       NEXT();
+    h_slti:  wr(s, d->rd, (int32_t)s->x[d->rs1] < (int32_t)d->imm);             NEXT();
+    h_sltiu: wr(s, d->rd, s->x[d->rs1] < d->imm);                              NEXT();
+    h_xori:  wr(s, d->rd, s->x[d->rs1] ^ d->imm);                              NEXT();
+    h_srli:  wr(s, d->rd, s->x[d->rs1] >> (d->imm & 31));                       NEXT();
+    h_ori:   wr(s, d->rd, s->x[d->rs1] | d->imm);                              NEXT();
+    h_andi:  wr(s, d->rd, s->x[d->rs1] & d->imm);                              NEXT();
+    h_srai:  wr(s, d->rd, (uint32_t)((int32_t)s->x[d->rs1] >> (d->imm & 31)));  NEXT();
 
     /* ---- RV32M (a = x[rs1]; b = x[rs2]) ---- */
-    h_mul:    a = s->x[d->rs1]; b = s->x[d->rs2]; r = a * b; goto mul_wb;
-    h_mulh:   a = s->x[d->rs1]; b = s->x[d->rs2]; r = (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32); goto mul_wb;
-    h_mulhsu: a = s->x[d->rs1]; b = s->x[d->rs2]; r = (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32); goto mul_wb;
-    h_mulhu:  a = s->x[d->rs1]; b = s->x[d->rs2]; r = (uint32_t)(((uint64_t)a * b) >> 32); goto mul_wb;
+    h_mul:    wr(s, d->rd, s->x[d->rs1] * s->x[d->rs2]); NEXT();
+    h_mulh:   a = s->x[d->rs1]; b = s->x[d->rs2]; wr(s, d->rd, (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32)); NEXT();
+    h_mulhsu: a = s->x[d->rs1]; b = s->x[d->rs2]; wr(s, d->rd, (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32)); NEXT();
+    h_mulhu:  a = s->x[d->rs1]; b = s->x[d->rs2]; wr(s, d->rd, (uint32_t)(((uint64_t)a * b) >> 32)); NEXT();
     h_div:    a = s->x[d->rs1]; b = s->x[d->rs2];
-              r = b == 0 ? 0xffffffffu : (a == 0x80000000u && (int32_t)b == -1) ? a : (uint32_t)((int32_t)a / (int32_t)b);
-              goto mul_wb;
-    h_divu:   a = s->x[d->rs1]; b = s->x[d->rs2]; r = b == 0 ? 0xffffffffu : a / b; goto mul_wb;
+              wr(s, d->rd, b == 0 ? 0xffffffffu : (a == 0x80000000u && (int32_t)b == -1) ? a : (uint32_t)((int32_t)a / (int32_t)b)); NEXT();
+    h_divu:   a = s->x[d->rs1]; b = s->x[d->rs2]; wr(s, d->rd, b == 0 ? 0xffffffffu : a / b); NEXT();
     h_rem:    a = s->x[d->rs1]; b = s->x[d->rs2];
-              r = b == 0 ? a : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b);
-              goto mul_wb;
-    h_remu:   a = s->x[d->rs1]; b = s->x[d->rs2]; r = b == 0 ? a : a % b; goto mul_wb;
-    mul_wb:   wr(s, d->rd, r); s->pc = pc + width; NEXT();
+              wr(s, d->rd, b == 0 ? a : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b)); NEXT();
+    h_remu:   a = s->x[d->rs1]; b = s->x[d->rs2]; wr(s, d->rd, b == 0 ? a : a % b); NEXT();
 
-    /* ---- loads (rd = mem[x[rs1] + imm]) ---- */
-    h_lb:  n = 1; goto load;
-    h_lh:  n = 2; goto load;
-    h_lw:  n = 4; goto load;
-    h_lbu: n = 1; goto load;
-    h_lhu: n = 2; goto load;
-    load:
-        addr = s->x[d->rs1] + d->imm;
-        if (d->rd) {                              /* a load into x0 has no effect */
-            uint8_t *p = mem_xlate(s, addr, n, 0);
-            uint32_t v;
-            if (p) switch (d->op) {
-            case RISCV_OP_LB:  v = (uint32_t)(int32_t)(int8_t)p[0]; break;
-            case RISCV_OP_LH:  v = (uint32_t)(int32_t)(int16_t)(p[0] | p[1] << 8); break;
-            case RISCV_OP_LW:  v = (uint32_t)p[0] | (uint32_t)p[1] << 8
-                                 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; break;
-            case RISCV_OP_LBU: v = p[0]; break;
-            default:           v = (uint32_t)p[0] | (uint32_t)p[1] << 8; break;       /* LHU */
-            } else {                              /* miss -> callback supplies it */
-                v = s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0;
-                switch (d->op) {                  /* narrow it / sign-extend per op */
-                case RISCV_OP_LB:  v = (uint32_t)sext(v, 8); break;
-                case RISCV_OP_LH:  v = (uint32_t)sext(v, 16); break;
-                case RISCV_OP_LBU: v &= 0xff; break;
-                case RISCV_OP_LHU: v &= 0xffff; break;
-                default: break;                   /* LW: full word */
-                }
-            }
-            wr(s, d->rd, v);
-        }
-        s->pc = pc + width; NEXT();
+    /* ---- loads (rd = mem[x[rs1] + imm]); miss -> the memory callback ---- */
+    h_lb: if (d->rd) { uint32_t ad = s->x[d->rs1] + d->imm; uint8_t *p = mem_xlate(s, ad, 1, 0);
+            wr(s, d->rd, p ? (uint32_t)(int32_t)(int8_t)p[0]
+                           : (uint32_t)sext(s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0, 8)); }
+          NEXT();
+    h_lh: if (d->rd) { uint32_t ad = s->x[d->rs1] + d->imm; uint8_t *p = mem_xlate(s, ad, 2, 0);
+            wr(s, d->rd, p ? (uint32_t)(int32_t)(int16_t)(p[0] | p[1] << 8)
+                           : (uint32_t)sext(s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0, 16)); }
+          NEXT();
+    h_lw: if (d->rd) { uint32_t ad = s->x[d->rs1] + d->imm; uint8_t *p = mem_xlate(s, ad, 4, 0);
+            wr(s, d->rd, p ? ((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24)
+                           : (s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0)); }
+          NEXT();
+    h_lbu: if (d->rd) { uint32_t ad = s->x[d->rs1] + d->imm; uint8_t *p = mem_xlate(s, ad, 1, 0);
+            wr(s, d->rd, p ? p[0] : ((s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0) & 0xff)); }
+          NEXT();
+    h_lhu: if (d->rd) { uint32_t ad = s->x[d->rs1] + d->imm; uint8_t *p = mem_xlate(s, ad, 2, 0);
+            wr(s, d->rd, p ? ((uint32_t)p[0] | (uint32_t)p[1] << 8)
+                           : ((s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0) & 0xffff)); }
+          NEXT();
 
-    /* ---- stores (mem[x[rs1] + imm] = x[rs2]) ---- */
-    h_sb: n = 1; goto store;
-    h_sh: n = 2; goto store;
-    h_sw: n = 4; goto store;
-    store:
-        addr = s->x[d->rs1] + d->imm; b = s->x[d->rs2];
-        {
-            uint8_t *p = mem_xlate(s, addr, n, 1);
-            if (p) switch (d->op) {
-            case RISCV_OP_SB: p[0] = (uint8_t)b; break;
-            case RISCV_OP_SH: p[0] = (uint8_t)b; p[1] = (uint8_t)(b >> 8); break;
-            default:          p[0] = (uint8_t)b;        p[1] = (uint8_t)(b >> 8);
-                              p[2] = (uint8_t)(b >> 16); p[3] = (uint8_t)(b >> 24); break;  /* SW */
-            } else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, b);
-        }
-        s->pc = pc + width; NEXT();
+    /* ---- stores (mem[x[rs1] + imm] = x[rs2]); miss -> the memory callback ---- */
+    h_sb: { uint32_t ad = s->x[d->rs1] + d->imm; b = s->x[d->rs2]; uint8_t *p = mem_xlate(s, ad, 1, 1);
+            if (p) p[0] = (uint8_t)b; else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
+          NEXT();
+    h_sh: { uint32_t ad = s->x[d->rs1] + d->imm; b = s->x[d->rs2]; uint8_t *p = mem_xlate(s, ad, 2, 1);
+            if (p) { p[0] = (uint8_t)b; p[1] = (uint8_t)(b >> 8); } else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
+          NEXT();
+    h_sw: { uint32_t ad = s->x[d->rs1] + d->imm; b = s->x[d->rs2]; uint8_t *p = mem_xlate(s, ad, 4, 1);
+            if (p) { p[0] = (uint8_t)b; p[1] = (uint8_t)(b >> 8); p[2] = (uint8_t)(b >> 16); p[3] = (uint8_t)(b >> 24); }
+            else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
+          NEXT();
 
-    /* ---- branches (a = x[rs1]; b = x[rs2]; taken -> pc += imm) ---- */
-    h_beq:  a = s->x[d->rs1]; b = s->x[d->rs2]; r = a == b;                  goto br;
-    h_bne:  a = s->x[d->rs1]; b = s->x[d->rs2]; r = a != b;                  goto br;
-    h_blt:  a = s->x[d->rs1]; b = s->x[d->rs2]; r = (int32_t)a < (int32_t)b; goto br;
-    h_bge:  a = s->x[d->rs1]; b = s->x[d->rs2]; r = (int32_t)a >= (int32_t)b; goto br;
-    h_bltu: a = s->x[d->rs1]; b = s->x[d->rs2]; r = a < b;                   goto br;
-    h_bgeu: a = s->x[d->rs1]; b = s->x[d->rs2]; r = a >= b;                  goto br;
-    br:     s->pc = r ? pc + d->imm : pc + width; NEXT();   /* a branch is always the run's last record */
+    /* ---- branches: taken -> the baked absolute target; not taken -> leave pc
+     *      (it was preset to the fall-through). Always the run's last real record. ---- */
+    h_beq:  if (s->x[d->rs1] == s->x[d->rs2])                   s->pc = d->imm; NEXT();
+    h_bne:  if (s->x[d->rs1] != s->x[d->rs2])                   s->pc = d->imm; NEXT();
+    h_blt:  if ((int32_t)s->x[d->rs1] <  (int32_t)s->x[d->rs2]) s->pc = d->imm; NEXT();
+    h_bge:  if ((int32_t)s->x[d->rs1] >= (int32_t)s->x[d->rs2]) s->pc = d->imm; NEXT();
+    h_bltu: if (s->x[d->rs1] <  s->x[d->rs2])                   s->pc = d->imm; NEXT();
+    h_bgeu: if (s->x[d->rs1] >= s->x[d->rs2])                   s->pc = d->imm; NEXT();
 
-    /* ---- jumps ---- */
-    h_jal:  wr(s, d->rd, pc + width); s->pc = pc + d->imm; NEXT();
-    h_jalr: addr = (s->x[d->rs1] + d->imm) & ~1u; wr(s, d->rd, pc + width); s->pc = addr; NEXT();
+    /* ---- jumps: link = the preset fall-through in state->pc, then jump ---- */
+    h_jal:  wr(s, d->rd, s->pc); s->pc = d->imm; NEXT();
+    h_jalr: { uint32_t t = (s->x[d->rs1] + d->imm) & ~1u; wr(s, d->rd, s->pc); s->pc = t; } NEXT();
 
-    /* ---- upper-immediate / nop ---- */
-    h_lui:   wr(s, d->rd, d->imm);       s->pc = pc + width; NEXT();
-    h_auipc: wr(s, d->rd, pc + d->imm);  s->pc = pc + width; NEXT();
-    h_nop:   s->pc = pc + width; NEXT();
+    /* ---- upper-immediate (LUI, and AUIPC folded in) / nop ---- */
+    h_lui:  wr(s, d->rd, d->imm); NEXT();
+    h_nop:  NEXT();
 
-    /* ---- traps: set pc/inst, call the handler; a nonzero return halts the run ---- */
-    h_ecall:
-        s->pc = pc; s->inst = d->raw;
-        if (s->ecall && s->ecall(s)) { *halt = 1; goto out; }   /* e.g. exit stops at the ecall */
-        s->pc = pc + width; NEXT();
-    h_ebreak:
-        s->pc = pc; s->inst = d->raw;
-        if (s->ebreak ? s->ebreak(s) : 1) { *halt = 1; goto out; }   /* default: breakpoint stops */
-        s->pc = pc + width; NEXT();
-    h_illegal:
-        s->pc = pc; s->inst = d->raw;
-        if (s->illegal ? s->illegal(s) : 1) { *halt = 1; goto out; }  /* default: illegal stops */
-        s->pc = pc + width; NEXT();
-
+    /* ---- traps: stop; the run loop sets pc/inst and calls the host handler ---- */
+    h_trap: return i;
     #undef NEXT
-    #undef DISPATCH
-    out:
-    return i;
+    h_end:  return i - 1;                     /* the END sentinel was fetched but is not real */
 }
 
 /* ----------------------------------------------------------------- the VM */
 
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
-    RiscvEmulatorDecoded_t block[RISCV_BLOCK_MAX];
-    const uint8_t *code = s->region[RISCV_CODE].ptr;   /* instruction-fetch window... */
-    uint32_t code_len = s->region[RISCV_CODE].len;     /* ...based at 0 */
+    RiscvEmulatorDecoded_t block[RISCV_BLOCK_MAX + 1];  /* + 1 for the END sentinel */
+    const uint8_t *code = s->region[RISCV_CODE].ptr;    /* instruction-fetch window... */
+    uint32_t code_len = s->region[RISCV_CODE].len;      /* ...based at 0 */
     RiscvEmulatorEvalFn eval = s->eval ? s->eval : RiscvEmulatorDefaultEval;
     uint64_t k = 0;
 
@@ -427,8 +422,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     while (k < max) {
         uint64_t room = max - k;
         uint32_t cap = room < RISCV_BLOCK_MAX ? (uint32_t)room : RISCV_BLOCK_MAX;
-        uint32_t pc = s->pc;
-        uint32_t n = 0;
+        uint32_t pc = s->pc, n = 0, last_pc = pc;
 
         /* loop 1: decode ahead until the first control transfer (its last record),
          * a full buffer, or the code window's end. Code is read-only, so nothing
@@ -439,15 +433,30 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t width = ((lo & 3) == 3) ? 4 : 2;
             if (width == 4 && code_len - pc < 4) break;   /* 32-bit straddles end */
             decode_one(&block[n], code, pc);
+            last_pc = pc;
             pc += width;
-            if (block[n++].ends_block) break;
+            if (is_terminator(block[n++].op)) break;
         }
         if (n == 0) break;                    /* pc outside the code window: nothing to run */
 
+        uint32_t end_pc = pc;                 /* fall-through / link / continue address */
+        block[n].op = RISCV_OP_END;           /* sentinel terminates the threaded dispatch */
+        s->pc = end_pc;                       /* preset: sequential ops and not-taken branches land here */
+
         /* loop 2: threaded execution of the decoded run (the pluggable half). */
-        int halt = 0;
-        k += eval(s, block, n, &halt);
-        if (halt) break;                      /* a handler asked to stop; pc left at the trap */
+        k += eval(s, block);
+
+        /* A trap terminates the run without executing in eval: set the faulting pc
+         * and raw word, then call the host handler (it may stop or resume). */
+        uint8_t term = block[n - 1].op;
+        if (term >= RISCV_OP_ECALL && term <= RISCV_OP_ILLEGAL) {
+            s->pc = last_pc; s->inst = block[n - 1].imm;
+            int stop = (term == RISCV_OP_ECALL)  ? (s->ecall   ? s->ecall(s)   : 0)
+                     : (term == RISCV_OP_EBREAK) ? (s->ebreak  ? s->ebreak(s)  : 1)
+                     :                             (s->illegal ? s->illegal(s) : 1);
+            if (stop) break;                  /* terminal trap (exit, breakpoint, illegal) */
+            s->pc = end_pc;                   /* serviced (e.g. a syscall): resume after it */
+        }
     }
     return k;
 }

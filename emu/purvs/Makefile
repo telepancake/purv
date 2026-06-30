@@ -10,6 +10,9 @@
 
 CC      ?= gcc
 # -g keeps source line info for profilers/debuggers (no effect on -O2 codegen).
+# The direct-threading codegen hint is a per-function attribute on the evaluator
+# in purvs.c (PURVS_THREADED), not a build flag, so it does not nerf the rest of
+# the build.
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra
 
 # Guest toolchain (compiles the RISC-V example programs the emulator runs).

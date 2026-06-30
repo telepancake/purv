@@ -77,77 +77,99 @@ enum { RISCV_CODE, RISCV_RODATA, RISCV_HEAP, RISCV_STACK };
 /* ---- decoded instruction: the engine's wide internal form ----
  *
  * The run loop is split in two. A decode pass walks the code window and lowers
- * each raw instruction -- 32-bit or compressed -- into one of these flat records;
- * an eval pass then threads through the records, dispatching on `op`.
+ * each raw instruction -- 32-bit or compressed -- into one of these flat 8-byte
+ * records; an eval pass then threads through them, dispatching on `op`.
  *
  * `op` is OUR opcode, not RISC-V's: a flat LEAF code, one per evaluator handler
- * (ADD, SUB, LB, BEQ, ...), so the evaluator dispatches with a single jump-table
- * index -- no secondary decode of funct3/funct7. There is deliberately no 1:1
- * correspondence with the RISC-V encoding; decode folds the 32-bit and compressed
- * forms, funct3, and funct7 into this one byte. Operand sources still vary, so a
- * couple of fields remain: for an ALU op the second operand is imm when `b_imm`,
- * else x[rs2]; loads/stores use x[rs1]+imm; branches/jal use imm.
+ * (ADD, ADDI, LB, BEQ, ...), so the evaluator dispatches with a single jump-table
+ * index and no secondary decode. There is deliberately no 1:1 correspondence with
+ * the RISC-V encoding -- decode folds the 32-bit and compressed forms, funct3, and
+ * funct7 into this one byte, AND folds the operand source in too: a reg-immediate
+ * ALU op (ADDI) is a different leaf op from its reg-reg form (ADD), so the handler
+ * never tests where its second operand comes from.
  *
- * Decode records only what is fixed at decode time -- the leaf op, register
- * INDICES, and immediates -- and deliberately does NOT read register values
- * (those change as earlier instructions in the same run execute). Eval reads the
- * live operands from state->x when the instruction runs; that split is what lets
- * the value semantics be swapped out (see RiscvEmulatorEvalFn). */
+ * The record carries only what is fixed at decode time and cannot be recovered for
+ * free at run time: the leaf op, the register INDICES, and one 32-bit payload.
+ * Things that ARE recoverable are NOT stored:
+ *   - the instruction's own pc / width: the run loop tracks the running pc and,
+ *     before eval, presets state->pc to the run's fall-through, so a sequential op
+ *     never touches pc and jal/jalr read their link straight from state->pc;
+ *   - pc-relative results: decode bakes them into `imm` (AUIPC becomes a plain
+ *     LUI of pc+imm; a branch/JAL target is the absolute address pc+imm), which is
+ *     why `imm` is a full 32 bits -- it holds LUI values and absolute targets;
+ *   - the raw encoding: only an illegal/ecall/ebreak needs it, so decode stows it
+ *     in `imm` for those ops (they have no other use for the field);
+ *   - "ends the block": a pure function of `op`, computed by the decode loop.
+ * Decode never reads register values (those change as earlier instructions in the
+ * run execute); eval reads the live operands from state->x. That split is what
+ * lets the value semantics be swapped out (see RiscvEmulatorEvalFn).
+ *
+ * Per-op payload meaning of `imm`:
+ *   ALU-reg  (ADD..AND, MUL..REMU)   unused; operands are x[rs1], x[rs2]
+ *   ALU-imm  (ADDI..SRAI)            the immediate / shift amount
+ *   LB..LHU / SB..SW                 the load/store offset (addr = x[rs1] + imm)
+ *   BEQ..BGEU                        absolute branch target (= pc + offset)
+ *   JAL                             absolute jump target;  JALR  the indirect offset
+ *   LUI                             the value to write to rd (AUIPC folds in here)
+ *   ECALL/EBREAK/ILLEGAL            the raw instruction word (for state->inst) */
 enum {
-    /* ALU: a = x[rs1]; b = b_imm ? imm : x[rs2]; rd = a <op> b */
-    RISCV_OP_ADD, RISCV_OP_SLL, RISCV_OP_SLT, RISCV_OP_SLTU,   /* funct3 order, so */
-    RISCV_OP_XOR, RISCV_OP_SRL, RISCV_OP_OR,  RISCV_OP_AND,    /* op = ADD + funct3 */
+    /* ALU reg-reg: rd = x[rs1] <op> x[rs2] */
+    RISCV_OP_ADD, RISCV_OP_SLL, RISCV_OP_SLT, RISCV_OP_SLTU,   /* funct3 order: */
+    RISCV_OP_XOR, RISCV_OP_SRL, RISCV_OP_OR,  RISCV_OP_AND,    /*   op = ADD + funct3 */
     RISCV_OP_SUB, RISCV_OP_SRA,                                /* funct7-bit-5 variants */
-    /* RV32M: a = x[rs1]; b = x[rs2]  (funct3 order, op = MUL + funct3) */
+    /* ALU reg-imm: rd = x[rs1] <op> imm (op = ADDI + funct3; SRAI is the alt of SRLI) */
+    RISCV_OP_ADDI, RISCV_OP_SLLI, RISCV_OP_SLTI, RISCV_OP_SLTIU,
+    RISCV_OP_XORI, RISCV_OP_SRLI, RISCV_OP_ORI,  RISCV_OP_ANDI, RISCV_OP_SRAI,
+    /* RV32M: rd = x[rs1] <op> x[rs2]  (funct3 order, op = MUL + funct3) */
     RISCV_OP_MUL, RISCV_OP_MULH, RISCV_OP_MULHSU, RISCV_OP_MULHU,
     RISCV_OP_DIV, RISCV_OP_DIVU, RISCV_OP_REM, RISCV_OP_REMU,
     /* loads: rd = mem[x[rs1] + imm] */
     RISCV_OP_LB, RISCV_OP_LH, RISCV_OP_LW, RISCV_OP_LBU, RISCV_OP_LHU,
     /* stores: mem[x[rs1] + imm] = x[rs2] */
     RISCV_OP_SB, RISCV_OP_SH, RISCV_OP_SW,
-    /* branches: if cmp(x[rs1], x[rs2]) pc += imm */
+    /* --- terminators: decode ends the run on these (always the run's last record) --- */
+    /* branches: if cmp(x[rs1], x[rs2]) pc = imm (the baked target) */
     RISCV_OP_BEQ, RISCV_OP_BNE, RISCV_OP_BLT, RISCV_OP_BGE, RISCV_OP_BLTU, RISCV_OP_BGEU,
-    /* control / misc */
-    RISCV_OP_JAL,    /* rd = pc + width; pc += imm */
-    RISCV_OP_JALR,   /* rd = pc + width; pc = (x[rs1] + imm) & ~1 */
+    RISCV_OP_JAL,    /* rd = state->pc (the link); pc = imm (the baked target) */
+    RISCV_OP_JALR,   /* rd = state->pc; pc = (x[rs1] + imm) & ~1 */
+    /* non-terminators */
     RISCV_OP_LUI,    /* rd = imm */
-    RISCV_OP_AUIPC,  /* rd = pc + imm */
     RISCV_OP_NOP,    /* fence / fence.i */
-    RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,  /* -> the matching handler */
+    /* traps (also terminators): the run loop sets pc/inst and calls the handler */
+    RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,
+    RISCV_OP_END,    /* dispatch sentinel: one is appended after each decoded run */
     RISCV_OP_COUNT   /* number of leaf ops; sizes the jump table */
 };
 
 typedef struct {
-    uint32_t pc;            /* guest address of this instruction */
-    uint32_t raw;           /* raw encoding (the low 16 bits for a compressed insn) */
-    uint32_t imm;           /* immediate / shift amount, pre-extended for the op */
+    uint32_t imm;           /* per-op 32-bit payload (see the table above) */
     uint8_t  op;            /* one of RISCV_OP_*: our flat leaf opcode */
     uint8_t  rd, rs1, rs2;  /* register indices (0..31) */
-    uint8_t  width;         /* encoded length in bytes: 2 or 4 */
-    uint8_t  b_imm;         /* ALU: second operand is imm (1) or x[rs2] (0) */
-    uint8_t  ends_block;    /* this insn ends the decoded run (control transfer / trap) */
 } RiscvEmulatorDecoded_t;
 
 /* The pluggable evaluator: the engine's value semantics, made swappable.
  *
  * The engine decodes a straight-line run of instructions into an internal buffer,
- * then calls eval ONCE for the whole run. eval threads through the `block` of
- * `count` records, dispatching each on its leaf op, and interprets them however
- * it likes -- the default (RiscvEmulatorDefaultEval) does ordinary RV32 value
- * computation with a computed-goto jump table. eval is the ONE place value
+ * then calls eval ONCE for the whole run. eval threads through `block` -- which is
+ * terminated by a RISCV_OP_END sentinel -- dispatching each record on its leaf op,
+ * and interprets them however it likes. The default (RiscvEmulatorDefaultEval) is
+ * a direct-threaded interpreter: a computed-goto jump table where each op handler
+ * ends by jumping STRAIGHT to the next op's handler, so every op carries its own
+ * indirect dispatch and the branch predictor can specialise per op (e.g. learn
+ * that a compare is usually followed by a branch). eval is the ONE place value
  * semantics live, so an alternate (tag tracking, taint, tracing, symbolic
  * execution, ...) is a drop-in replacement that reuses decode and the run loop.
  *
- * Contract: eval executes the records in order and MUST leave state->pc at the
- * next instruction to execute (pc + width for a sequential op, the computed
- * target for a taken branch/jump). It returns the number of records it actually
- * executed (normally `count`), and sets *halt to nonzero to stop the whole run
- * (a terminal ecall, a breakpoint, an illegal instruction). A control transfer is
- * always the LAST record in a run (decode ends the run there), so eval never has
- * to abandon the buffer mid-stream except on *halt. */
+ * Contract: before calling eval the loop presets state->pc to the run's
+ * fall-through address, so a sequential op leaves pc alone, a not-taken branch
+ * leaves pc alone, and jal/jalr read their link (= fall-through) from state->pc
+ * before overwriting it. A taken branch/jump writes the (already absolute) target
+ * to state->pc. The run's last real record is always a terminator (branch, jump,
+ * or trap); eval returns the number of records it executed. Traps do not run
+ * inside eval -- eval stops at a trap op, and the loop sets state->pc/state->inst
+ * and calls the host handler. */
 typedef uint32_t (*RiscvEmulatorEvalFn)(RiscvEmulatorState_t *state,
-                                        const RiscvEmulatorDecoded_t *block,
-                                        uint32_t count, int *halt);
+                                        const RiscvEmulatorDecoded_t *block);
 
 /* The whole VM state. Set it up by writing the fields:
  *   - pc:       the next instruction to execute (the run loop resumes here);
@@ -203,12 +225,11 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *state,
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint64_t max);
 
 /* The default evaluator installed by Init: ordinary RV32IMC value semantics (the
- * same computation purv has always done), implemented as a threaded computed-goto
- * dispatch over the decoded run. Exposed so callers can reinstall it. See
- * RiscvEmulatorEvalFn for the contract. */
+ * same computation purv has always done), implemented as a direct-threaded
+ * computed-goto dispatch over the decoded run. Exposed so callers can reinstall
+ * it. See RiscvEmulatorEvalFn for the contract. */
 uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *state,
-                                  const RiscvEmulatorDecoded_t *block,
-                                  uint32_t count, int *halt);
+                                  const RiscvEmulatorDecoded_t *block);
 
 /* (To read or write guest memory from outside the engine, pick the region from
  * the address: half = addr >> 31, then within the half lo = addr & (RISCV_HALF-1)
