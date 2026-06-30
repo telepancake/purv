@@ -77,8 +77,17 @@ enum { RISCV_CODE, RISCV_RODATA, RISCV_HEAP, RISCV_STACK };
 /* ---- decoded instruction: the engine's wide internal form ----
  *
  * The run loop is split in two. A decode pass walks the code window and lowers
- * each raw instruction -- 32-bit or compressed -- into one of these flat 8-byte
- * records; an eval pass then threads through them, dispatching on `op`.
+ * each raw instruction -- 32-bit or compressed -- into the buffer; an eval pass
+ * then threads through it, dispatching on `op`.
+ *
+ * A decoded instruction is a 4-byte HEAD slot { op, rd, rs1, rs2 } -- and, only
+ * for the ops that need one, an immediate that trails in the NEXT 4-byte slot. So
+ * the record is a union: a slot is read either as the head (its four byte fields)
+ * or, when it is an immediate slot, as one 32-bit `imm`. Half the ops (the
+ * reg-reg ALU forms, nop) carry no immediate and so occupy a single slot; the
+ * rest spill one extra slot. The eval consumes the immediate by simply advancing
+ * its cursor into the trailing slot (`(++d)->imm`), so a handler that needs the
+ * immediate is the only one that strides past it -- there is no wasted field.
  *
  * `op` is OUR opcode, not RISC-V's: a flat LEAF code, one per evaluator handler
  * (ADD, ADDI, LB, BEQ, ...), so the evaluator dispatches with a single jump-table
@@ -89,8 +98,8 @@ enum { RISCV_CODE, RISCV_RODATA, RISCV_HEAP, RISCV_STACK };
  * never tests where its second operand comes from.
  *
  * The record carries only what is fixed at decode time and cannot be recovered for
- * free at run time: the leaf op, the register INDICES, and one 32-bit payload.
- * Things that ARE recoverable are NOT stored:
+ * free at run time: the leaf op, the register INDICES, and (when present) one
+ * 32-bit immediate. Things that ARE recoverable are NOT stored:
  *   - the instruction's own pc / width: the run loop tracks the running pc and,
  *     before eval, presets state->pc to the run's fall-through, so a sequential op
  *     never touches pc and jal/jalr read their link straight from state->pc;
@@ -98,19 +107,20 @@ enum { RISCV_CODE, RISCV_RODATA, RISCV_HEAP, RISCV_STACK };
  *     LUI of pc+imm; a branch/JAL target is the absolute address pc+imm), which is
  *     why `imm` is a full 32 bits -- it holds LUI values and absolute targets;
  *   - the raw encoding: only an illegal/ecall/ebreak needs it, so decode stows it
- *     in `imm` for those ops (they have no other use for the field);
+ *     in the immediate slot for those ops (they have no other use for it);
  *   - "ends the block": a pure function of `op`, computed by the decode loop.
  * Decode never reads register values (those change as earlier instructions in the
  * run execute); eval reads the live operands from state->x. That split is what
  * lets the value semantics be swapped out (see RiscvEmulatorEvalFn).
  *
- * Per-op payload meaning of `imm`:
- *   ALU-reg  (ADD..AND, MUL..REMU)   unused; operands are x[rs1], x[rs2]
+ * Which ops carry a trailing immediate slot, and what it means:
+ *   ALU-reg  (ADD..AND, MUL..REMU)   none; operands are x[rs1], x[rs2]
  *   ALU-imm  (ADDI..SRAI)            the immediate / shift amount
  *   LB..LHU / SB..SW                 the load/store offset (addr = x[rs1] + imm)
  *   BEQ..BGEU                        absolute branch target (= pc + offset)
  *   JAL                             absolute jump target;  JALR  the indirect offset
  *   LUI                             the value to write to rd (AUIPC folds in here)
+ *   NOP                             none
  *   ECALL/EBREAK/ILLEGAL            the raw instruction word (for state->inst) */
 enum {
     /* ALU reg-reg: rd = x[rs1] <op> x[rs2] */
@@ -141,18 +151,21 @@ enum {
     RISCV_OP_COUNT   /* number of leaf ops; sizes the jump table */
 };
 
-typedef struct {
-    uint32_t imm;           /* per-op 32-bit payload (see the table above) */
-    uint8_t  op;            /* one of RISCV_OP_*: our flat leaf opcode */
-    uint8_t  rd, rs1, rs2;  /* register indices (0..31) */
+typedef union {
+    struct {
+        uint8_t op;            /* one of RISCV_OP_*: our flat leaf opcode */
+        uint8_t rd, rs1, rs2;  /* register indices (0..31) */
+    };                         /* the HEAD slot */
+    uint32_t imm;              /* OR an immediate slot (see the table above) */
 } RiscvEmulatorDecoded_t;
 
 /* The pluggable evaluator: the engine's value semantics, made swappable.
  *
  * The engine decodes a straight-line run of instructions into an internal buffer,
- * then calls eval ONCE for the whole run. eval threads through `block` -- which is
- * terminated by a RISCV_OP_END sentinel -- dispatching each record on its leaf op,
- * and interprets them however it likes. The default (RiscvEmulatorDefaultEval) is
+ * then calls eval ONCE for the whole run. eval threads through `block` -- a stream
+ * of head slots, each optionally followed by an immediate slot, terminated by a
+ * RISCV_OP_END sentinel -- dispatching each record on its leaf op, and interprets
+ * them however it likes. The default (RiscvEmulatorDefaultEval) is
  * a direct-threaded interpreter: a computed-goto jump table where each op handler
  * ends by jumping STRAIGHT to the next op's handler, so every op carries its own
  * indirect dispatch and the branch predictor can specialise per op (e.g. learn
@@ -165,9 +178,14 @@ typedef struct {
  * leaves pc alone, and jal/jalr read their link (= fall-through) from state->pc
  * before overwriting it. A taken branch/jump writes the (already absolute) target
  * to state->pc. The run's last real record is always a terminator (branch, jump,
- * or trap); eval returns the number of records it executed. Traps do not run
- * inside eval -- eval stops at a trap op, and the loop sets state->pc/state->inst
- * and calls the host handler. */
+ * or trap); traps do not run inside eval -- eval stops at a trap op, and the loop
+ * sets state->pc/state->inst and calls the host handler.
+ *
+ * Return value: the only thing the loop reads from it is whether eval finished the
+ * run. Completing it returns at least the run's record count (the default returns
+ * its cursor displacement, which is >= that since each record is one-or-two slots);
+ * stopping early returns the number of records executed (< the run's count), which
+ * the loop uses to recover the resume pc. The default never stops early. */
 typedef uint32_t (*RiscvEmulatorEvalFn)(RiscvEmulatorState_t *state,
                                         const RiscvEmulatorDecoded_t *block);
 
