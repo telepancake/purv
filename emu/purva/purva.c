@@ -20,6 +20,18 @@
 
 static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i] = v; }
 
+/* A single 4-byte store, written the same way h_sw's does (GCC reliably folds this
+ * exact shape into one unaligned mov). SPILL2's fast path needs TWO of these back
+ * to back; writing both as one flat 8-byte byte-store block instead made GCC try to
+ * fuse them into a single 64-bit store, and since the two halves come from
+ * DIFFERENT source registers (v1, v2, not one combined value), it could only do
+ * that by manually reconstructing the 64-bit pattern via ~15 shift/or/movzbl
+ * instructions before the store -- measured ~30 Ir per call versus ~4 for two calls
+ * to this. Calling it twice keeps each store the simple, already-efficient shape. */
+static inline __attribute__((always_inline)) void st32(uint8_t *q, uint32_t v) {
+    q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24);
+}
+
 static inline __attribute__((always_inline))
 uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
     if (write && addr < RISCV_HALF) return (uint8_t *)0;
@@ -62,6 +74,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_JAL] = &&h_jal, [RISCV_OP_JALR] = &&h_jalr,
         [RISCV_OP_LUI] = &&h_lui, [RISCV_OP_AUIPC] = &&h_auipc, [RISCV_OP_NOP] = &&h_nop,
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
+        [RISCV_OP_SPILL2] = &&h_spill2,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -143,6 +156,28 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); q[2] = (uint8_t)(b >> 16); q[3] = (uint8_t)(b >> 24); }
             else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
           NEXT();
+
+    /* SPILL2 (fused store-pair, transcode.h): val1 at base+off, val2 at base+off+4 --
+     * two independent stores (no register write, no hazard between them), so the
+     * only thing to get right is matching the unfused pair's behaviour exactly,
+     * including a miss on EITHER word going through the callback the same way a
+     * real sw would. Deliberately NOT a single combined 8-byte mem_xlate: q and q+4
+     * are then provably-adjacent pointers, and GCC's store-merge pass tries to fuse
+     * the two 4-byte writes into one 64-bit store -- since the two halves come from
+     * DIFFERENT source registers (v1, v2), the only way to do that is manually
+     * reconstructing the 64-bit pattern via ~15 shift/or/movzbl instructions before
+     * the store (measured ~30 Ir per call versus ~4 for the form below, used twice
+     * -- the conditional callback branch between the two stores keeps the merge
+     * pass from treating them as one mergeable group). */
+    h_spill2: {
+        uint32_t base = s->x[TC_A(w)], v1 = s->x[TC_B(w)], v2 = s->x[TC_C(w)];
+        uint32_t ad = base + (uint32_t)TC_OFF11(w);
+        uint8_t *q1 = mem_xlate(s, ad, 4, 1);
+        if (q1) st32(q1, v1); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, v1);
+        uint8_t *q2 = mem_xlate(s, ad + 4, 4, 1);
+        if (q2) st32(q2, v2); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad + 4, v2);
+    }
+    k += 2; w = *++p; goto *tbl[TC_OP(w)];     /* one op word, but two real instructions */
 
     h_beq:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a == b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
     h_bne:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a != b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();

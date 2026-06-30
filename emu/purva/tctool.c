@@ -122,6 +122,33 @@ static uint32_t nobits_top(const Ehdr *eh, uint32_t base) {
     return top;
 }
 
+/* Every R_RISCV_32 relocation anywhere in the file whose target value lands inside
+ * the code window: every code address taken as a value ANYWHERE in the program --
+ * a vtable slot, a stored function pointer -- and therefore a possible jalr target.
+ * This is the set transcode_ex's fusion pass must never hide a second half inside
+ * (see transcode.h's SPILL2 contract); unlike patch_all_relas, it does not matter
+ * which section the relocation lives in, only what it points AT. Caller frees. */
+static uint32_t *collect_code_address_relocs(const Ehdr *eh, uint32_t code_len, uint32_t *n_out) {
+    uint32_t *out = NULL, n = 0, cap = 0;
+    for (int i = 0; i < eh->e_shnum; i++) {
+        const Shdr *sh = shdr(eh, i);
+        if (sh->sh_type != SHT_RELA) continue;
+        const Shdr *symsh = shdr(eh, sh->sh_link);
+        const Sym  *syms = (const Sym *)(g_elf + symsh->sh_offset);
+        const Rela *relas = (const Rela *)(g_elf + sh->sh_offset);
+        uint32_t cnt = sh->sh_size / sizeof(Rela);
+        for (uint32_t j = 0; j < cnt; j++) {
+            if ((relas[j].r_info & 0xff) != R_RISCV_32) continue;
+            uint32_t target = syms[relas[j].r_info >> 8].st_value + relas[j].r_addend;
+            if (target >= code_len) continue;
+            if (n == cap) { cap = cap ? cap * 2 : 64; out = realloc(out, cap * sizeof *out); }
+            out[n++] = target;
+        }
+    }
+    *n_out = n;
+    return out;
+}
+
 /* Patch every R_RISCV_32 relocation in section `ri` whose target value lands inside
  * the code window [0, code_len): overwrite the word at its (absolute address -
  * buf_base) in `buf` with its resolved op index * 4. */
@@ -196,14 +223,23 @@ int main(int argc, char **argv) {
 
     uint32_t bss_len = nobits_top(eh, RISCV_HALF + rwdata_len) - (RISCV_HALF + rwdata_len);
 
+    /* Every code address taken as a value anywhere in the file: the fusion pass's
+     * required input (transcode.h's SPILL2 contract) -- a bare transcode() call has
+     * no way to know these (it never reads the ELF), only this tool does. */
+    uint32_t n_ext;
+    uint32_t *ext_addrs = collect_code_address_relocs(eh, code_len, &n_ext);
+    TcExternalTargets ext = { ext_addrs, n_ext };
+
     /* 1. transcode code -- the only decoding in this pipeline. */
     Transcoded prog;
-    transcode(code_bytes, code_len, &prog);
+    transcode_ex(code_bytes, code_len, &ext, &prog);
 
-    /* Rebuild the map for the patcher (transcode() consumed its own internal copy).
-     * Cheap: one pass over code, done once, at build time. */
+    /* Rebuild the map for the patcher (transcode_ex() consumed its own internal
+     * copy) -- with the SAME ext targets, so it makes the identical fusion
+     * decisions and the map matches what's actually in the op array. Cheap: one
+     * pass over code, done once, at build time. */
     uint32_t n_ops_check;
-    uint32_t *map = transcode_map(code_bytes, code_len, &n_ops_check);
+    uint32_t *map = transcode_map_ex(code_bytes, code_len, &ext, &n_ops_check);
 
     /* 2. patch every code-pointer relocation found anywhere into rodata/rwdata. */
     patch_all_relas(eh, code_len, rodata_bytes, rodata_len,
@@ -224,5 +260,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "transcode: %s -> %s  (%u ops, rodata=%u, rwdata=%u, bss>=%u)\n",
             argv[1], argv[2], prog.n_ops, rodata_len, rwdata_len, bss_len);
     free(map);
+    free(ext_addrs);
     return 0;
 }
