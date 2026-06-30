@@ -21,13 +21,16 @@
 #include <unistd.h>
 #include <time.h>
 
-/* The same host drives two engines: plain purv, or purvs (the tagged-memory
- * variant) when built -DPURV_TAGGED. purvs has the same public API plus tagged
- * load/store/fetch/control-transfer hook signatures; we implement those
- * permissively here (do the access, ignore the tags) so an ordinary, untagged
- * workload like SQLite runs unchanged and we measure only the engine's
- * per-instruction tag-tracking overhead, not its enforcement. */
-#ifdef PURV_TAGGED
+/* The same host drives purv or its variants. purvs (-DPURV_PURVS) is the monadic
+ * engine: same public API as purv -- regions, the public state struct, and
+ * RiscvEmulatorLoop(state, max) -- so the ordinary (non-tagged) host code below
+ * drives it unchanged, and the benchmark measures the decode-ahead + threaded
+ * eval against purv's fused loop on the identical workload.
+ *
+ * -DPURV_TAGGED selects the older machine-mode tagged engine instead, which
+ * reaches the host through link-time memory/trap hooks (implemented permissively
+ * below: do the access, ignore the tags). */
+#if defined(PURV_TAGGED) || defined(PURV_PURVS)
 #include "../purvs/purvs.h"
 #else
 #include "../purv.h"
