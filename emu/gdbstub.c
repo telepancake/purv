@@ -150,12 +150,17 @@ static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
     else if (i)  st->x[i] = v;              /* x0 stays zero */
 }
 
-/* Guest memory by walking the state's regions (the public struct exposes them).
- * Out-of-range reads give zero; out-of-range / read-only writes are dropped. */
+/* Guest memory by walking the state's regions (the public struct exposes them):
+ * the data regions (st->mem[], based at RAM_ORIGIN) and the stack (st->stack,
+ * the top region, ending at the last address). Out-of-range reads give zero;
+ * out-of-range / read-only writes are dropped. */
 static void mem_read(const RiscvEmulatorState_t *st, uint32_t addr, uint8_t *dst, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
         uint32_t a = addr + i; uint8_t v = 0;
-        if (a >= RAM_ORIGIN) {
+        if (a >= RISCV_STACK_BASE) {            /* the stack (top region) */
+            uint32_t base = (uint32_t)(0u - st->stack.len);
+            if (st->stack.ptr && a >= base) v = st->stack.ptr[a - base];
+        } else if (a >= RAM_ORIGIN) {           /* data regions 0 .. RISCV_REGIONS-2 */
             const RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
             uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
             if (r->ptr && off < r->len) v = r->ptr[off];
@@ -166,7 +171,10 @@ static void mem_read(const RiscvEmulatorState_t *st, uint32_t addr, uint8_t *dst
 static void mem_write(RiscvEmulatorState_t *st, uint32_t addr, const uint8_t *src, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
         uint32_t a = addr + i;
-        if (a >= RAM_ORIGIN) {
+        if (a >= RISCV_STACK_BASE) {            /* the stack (top region) */
+            uint32_t base = (uint32_t)(0u - st->stack.len);
+            if (st->stack.ptr && st->stack.writable && a >= base) st->stack.ptr[a - base] = src[i];
+        } else if (a >= RAM_ORIGIN) {           /* data regions 0 .. RISCV_REGIONS-2 */
             RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
             uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
             if (r->ptr && r->writable && off < r->len) r->ptr[off] = src[i];

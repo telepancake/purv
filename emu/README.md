@@ -10,8 +10,8 @@ the handlers you put in the state; nothing vectors anywhere.
 
 ```
 emu/
-  purv.h      public interface — the state struct + the calls you need (~90 lines)
-  purv.c      the whole engine behind purv.h (hand-written, ~310 lines)
+  purv.h      public interface — the state struct + the calls you need (~100 lines)
+  purv.c      the whole engine behind purv.h (hand-written, ~335 lines)
   act/        userspace ACT conformance vs Spike golden signatures (make act)
   purg.c/.h   the earlier engine, mechanically generated from atoom (g = generated;
               kept for reference, not built — see "How the engine is organized")
@@ -37,30 +37,37 @@ assign the handlers, and run a batch:
 ```c
 RiscvEmulatorState_t st;                       /* allocate it yourself (stack or heap) */
 RiscvEmulatorRegion_t code  = { ram,   ram_len,   /*writable=*/1 };  /* fetch window */
-RiscvEmulatorRegion_t stack = { stkbuf, stk_len,  /*writable=*/1 };  /* -> region 7 */
-RiscvEmulatorInit(&st, code, stack);            /* sets st.code, st.mem[7], sp, pc */
+RiscvEmulatorRegion_t stack = { stkbuf, stk_len,  /*writable=*/1 };  /* the stack region */
+RiscvEmulatorInit(&st, code, stack);            /* sets st.code, st.stack, sp=0, pc */
 st.mem[0]  = (RiscvEmulatorRegion_t){ ram, ram_len, 1 };  /* data: region 0 */
-st.ecall   = on_ecall;          /* int (*)(state): nonzero -> stop the run loop */
-st.ebreak  = on_ebreak;
-st.illegal = on_illegal;
-st.pc      = entry;                             /* defaults to 0x80000000 */
+st.ecall    = on_ecall;         /* int (*)(state): nonzero -> stop the run loop */
+st.ebreak   = on_ebreak;
+st.illegal  = on_illegal;
+st.overflow = on_overflow;      /* called when the guest runs off the end of the stack */
+st.pc       = entry;                            /* defaults to 0x80000000 */
 uint64_t ran = RiscvEmulatorLoop(&st, max);     /* runs a batch of up to `max` */
 ```
 
-The address space is **8 evenly spaced regions** (`st->mem[0..7]`), each up to
-256 MiB, based at `0x80000000`, `0x90000000`, … `0xF0000000`. A data load from an
-unmapped/out-of-bounds address reads zero; a store to a read-only or
-out-of-bounds address is dropped. Instruction *fetch* comes from `st.code` (a
-separate window based at `0x80000000`, never one of the data regions); a pc
-outside it ends the batch. The **stack is always region 7** (`st.mem[7]`,
-`0xF0000000`): `RiscvEmulatorInit` takes it as its second argument, points
-`mem[7]` at it, and sets `sp` to the top of that region. `ecall`/`ebreak`/`illegal`
-are the only handlers, and each returns nonzero to stop the run loop. The engine
-exposes essentially two functions -- `RiscvEmulatorLoop` and `RiscvEmulatorInit`;
-you allocate the state, write its fields, and to touch guest memory from outside
-you index `st.mem[]` yourself. The struct is also naturally sized per target --
-smaller on a 32-bit host, where its pointers are 4 bytes -- and the engine builds
-and runs on both.
+The address space is **8 evenly spaced regions**, each up to 256 MiB, based at
+`0x80000000`, `0x90000000`, … `0xF0000000`. The first seven are general data
+(`st.mem[0..6]`); the **last one is the stack** (`st.stack`, based at
+`0xF0000000`). A data load from an unmapped/out-of-bounds address reads zero; a
+store to a read-only or out-of-bounds address is dropped. Instruction *fetch*
+comes from `st.code` (a separate window based at `0x80000000`, never one of the
+data regions); a pc outside it ends the batch.
+
+The stack is a region of its own (like the code window): its bytes **end at the
+last address** (`0xFFFFFFFF`) and it grows down, so `RiscvEmulatorInit` starts
+`sp` at `0` (== 2³², one past the top). A load or store that runs off the bottom
+of the mapped stack bytes is a **stack overflow**: instead of silently reading
+zero, the engine calls the `overflow` handler (NULL keeps the old zero/drop
+behavior). `ecall`/`ebreak`/`illegal`/`overflow` are the handlers, and each
+returns nonzero to stop the run loop. The engine exposes essentially two
+functions -- `RiscvEmulatorLoop` and `RiscvEmulatorInit`; you allocate the state,
+write its fields, and to touch guest memory from outside you index `st.mem[]` (or
+`st.stack`) yourself. The struct is also naturally sized per target -- smaller on
+a 32-bit host, where its pointers are 4 bytes -- and the engine builds and runs
+on both.
 
 ## Build
 
@@ -90,10 +97,11 @@ purv --user <elf> [program args...]    # ecall -> Linux/RISC-V syscall
 ```
 
 In `--user` mode the host sets up a real initial stack (`argc`, `argv`, an empty
-`envp`, and an `AT_NULL` auxv) from the trailing command-line args, then an
-`ecall` is delivered as a syscall (`a7`=number, `a0..`=args, result in `a0`).
-`main.c` implements `write`, `exit`, and `brk`; everything else returns
-`-ENOSYS`. Examples:
+`envp`, and an `AT_NULL` auxv) at the top of the stack region (just below
+`0x100000000`, where `sp` starts), then an `ecall` is delivered as a syscall
+(`a7`=number, `a0..`=args, result in `a0`). `main.c` implements `write`, `exit`,
+and `brk`, and prints a diagnostic if the guest overflows its stack; everything
+else returns `-ENOSYS`. Examples:
 
 ```sh
 make examples/hello.elf && ./purv --user examples/hello.elf
@@ -142,8 +150,8 @@ single-step, continue, software breakpoints (`Z0`/`z0`, tracked in the stub rath
 than by patching guest code), Ctrl-C to interrupt a run, and a program exit
 reported back to gdb. It drives the engine purely through `purv.h` — stepping with
 `RiscvEmulatorLoop` (one instruction at a time), reaching guest memory by walking
-`state->mem[]` — so the engine is untouched. `--gdb=FD` composes with the
-other modes (`--user`, plain run-to-halt): gdb just takes over execution.
+`state->mem[]` and `state->stack` — so the engine is untouched. `--gdb=FD` composes
+with the other modes (`--user`, plain run-to-halt): gdb just takes over execution.
 
 ### Reverse execution (time travel)
 
@@ -220,24 +228,27 @@ applies; ACT is the conformance path.
 ## Memory map
 
 The engine's address space is 8 regions of up to 256 MiB, based 256 MiB apart
-from `0x80000000`; the host maps host storage into them by writing `st->mem[i]`.
+from `0x80000000`. The host maps storage into the first seven data regions by
+writing `st->mem[i]`; the last region is the stack (`st->stack`).
 
 | region | base address | `main.c` use                                |
 |-------:|--------------|---------------------------------------------|
 | 0      | `0x80000000` | flat RAM backing array (`--ram=` bytes), writable |
 | 1..6   | `0x90000000`…`0xE0000000` | unmapped (reads 0, stores dropped) |
-| 7      | `0xF0000000` | user stack (`--user`), writable; `sp` starts at its top |
+| 7      | `0xF0000000` | the stack (`st->stack`): its bytes end at `0xFFFFFFFF` and it grows down; `sp` starts at `0` |
 
-There is no MMIO: console output is the `write` syscall (`--user`) and a
-conformance test halts by writing the `tohost` word, which the host polls (both
-live in region 0). Stores to a read-only or unmapped/out-of-bounds address are
-silently dropped; such loads read zero.
+The stack is the one region the engine treats specially: a load or store below
+the mapped stack bytes (off the bottom of the stack) calls the `overflow` handler
+instead of reading zero. There is no MMIO: console output is the `write` syscall
+(`--user`) and a conformance test halts by writing the `tohost` word, which the
+host polls (both live in region 0). Stores to a read-only or unmapped/out-of-
+bounds address are silently dropped; such loads read zero.
 
 ## How the engine is organized
 
 `purv.c` is hand-written (so are `purv.h` and `main.c`). It keeps atoom's premise
 — the host owns the memory map; the engine reaches the world only through the
-hooks above — but trims the redundancy of the original, in ~310 lines. Two ideas
+hooks above — but trims the redundancy of the original, in ~335 lines. Two ideas
 do most of that:
 
 - **Registers are indices into `x[32]`, not pointers.** `x0` is never written, so

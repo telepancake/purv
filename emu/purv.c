@@ -3,14 +3,15 @@
  *
  * A user-level program runner, not a machine: no CSRs, no privileged modes, no
  * trap-to-mtvec. It is self-contained -- no host hooks. The state (defined in
- * purv.h, public) holds everything: the 8 memory regions, evenly spaced 256 MiB
- * apart from RAM_ORIGIN, and the ecall/ebreak/illegal handlers. Data loads/stores
- * resolve straight into the regions (OOB reads give zero, OOB / read-only stores
- * are dropped); the handlers return nonzero to stop the run loop.
+ * purv.h, public) holds everything: the data regions and the stack (evenly
+ * spaced 256 MiB apart from RAM_ORIGIN), and the ecall/ebreak/illegal/overflow
+ * handlers. Data loads/stores resolve straight into the regions (OOB reads give
+ * zero, OOB / read-only stores are dropped); a load/store off the end of the
+ * stack calls the overflow handler; the handlers return nonzero to stop the loop.
  *
  * RiscvEmulatorLoop runs a batch in one call -- the fetch/decode/execute step is
  * the body of an internal loop, so there is no per-instruction call boundary --
- * fetching instructions from a code window the caller hands in.
+ * fetching instructions from state->code.
  *
  * Structure: each opcode -- 32-bit or compressed -- decodes only the operands it
  * needs into a few locals, then `goto`s a shared action body. Registers are
@@ -26,22 +27,46 @@ enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
        OP = 0x33, LUI = 0x37, BRANCH = 0x63, JALR = 0x67, JAL = 0x6f, SYSTEM = 0x73 };
 
 /* ---- memory: resolve a guest address to one of the regions ---- */
-/* A load of n bytes, zero-extended; out of range reads zero. */
-static uint32_t mem_load(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
-    uint32_t v = 0;
-    if (addr >= RAM_ORIGIN) {
-        const RiscvEmulatorRegion_t *r = &s->mem[(addr - RAM_ORIGIN) / RISCV_REGION_SIZE];
-        uint32_t off = (addr - RAM_ORIGIN) % RISCV_REGION_SIZE;
+/* The stack is the top region: it grows down and its last byte is the last
+ * address, so its bytes cover [(uint32_t)(0 - stack.len), 0xFFFFFFFF]. An access
+ * at/above RISCV_STACK_BASE targets the stack; one below the mapped bytes means
+ * the guest ran off the end of the stack -- we flag it (trap = 2) so the run loop
+ * calls the overflow handler instead of silently reading zero / dropping it. */
+/* DATA_SPAN is the address span of the data regions: [RAM_ORIGIN, RISCV_STACK_BASE).
+ * `addr - RAM_ORIGIN < DATA_SPAN` is one compare that excludes both the stack zone
+ * above and anything below RAM_ORIGIN (which wraps to a huge offset). */
+#define DATA_SPAN ((RISCV_REGIONS - 1) * RISCV_REGION_SIZE)
+
+static uint32_t mem_load(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
+    uint32_t v = 0, rel = addr - RAM_ORIGIN;
+    if (rel < DATA_SPAN) {                        /* data regions 0 .. RISCV_REGIONS-2 */
+        const RiscvEmulatorRegion_t *r = &s->mem[rel / RISCV_REGION_SIZE];
+        uint32_t off = rel % RISCV_REGION_SIZE;
         if (r->ptr && off + n <= r->len) memcpy(&v, r->ptr + off, n);
+    } else if (addr >= RISCV_STACK_BASE) {        /* the stack (top region) */
+        uint32_t base = (uint32_t)(0u - s->stack.len);
+        if (s->stack.ptr && addr >= base && addr - base + n <= s->stack.len)
+            memcpy(&v, s->stack.ptr + (addr - base), n);
+        else
+            s->trap = 2;                          /* ran off the end of the stack */
     }
     return v;
 }
-/* A store of the low n bytes of val; dropped if out of range or read-only. */
+/* A store of the low n bytes of val; dropped if read-only, zero if out of range
+ * (stack overflow flags trap = 2, as in mem_load). */
 static void mem_store(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, uint32_t val) {
-    if (addr >= RAM_ORIGIN) {
-        RiscvEmulatorRegion_t *r = &s->mem[(addr - RAM_ORIGIN) / RISCV_REGION_SIZE];
-        uint32_t off = (addr - RAM_ORIGIN) % RISCV_REGION_SIZE;
+    uint32_t rel = addr - RAM_ORIGIN;
+    if (rel < DATA_SPAN) {                        /* data regions 0 .. RISCV_REGIONS-2 */
+        RiscvEmulatorRegion_t *r = &s->mem[rel / RISCV_REGION_SIZE];
+        uint32_t off = rel % RISCV_REGION_SIZE;
         if (r->ptr && r->writable && off + n <= r->len) memcpy(r->ptr + off, &val, n);
+    } else if (addr >= RISCV_STACK_BASE) {        /* the stack (top region) */
+        uint32_t base = (uint32_t)(0u - s->stack.len);
+        if (s->stack.ptr && addr >= base && addr - base + n <= s->stack.len) {
+            if (s->stack.writable) memcpy(s->stack.ptr + (addr - base), &val, n);
+        } else {
+            s->trap = 2;                          /* ran off the end of the stack */
+        }
     }
 }
 
@@ -285,9 +310,13 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     illegal:
         s->trap = 1;
     done:
-        if (s->trap) {
+        if (s->trap) {                                       /* a load/store may set trap = 2 */
             s->pc = pc;
-            if (s->illegal ? s->illegal(s) : 1) stop = 1;   /* default: illegal stops */
+            if (s->trap == 2) {                              /* stack overflow */
+                if (s->overflow && s->overflow(s)) stop = 1; /* default: zero/drop, keep running */
+            } else {                                         /* illegal instruction */
+                if (s->illegal ? s->illegal(s) : 1) stop = 1;/* default: illegal stops */
+            }
             s->trap = 0;
         }
         pc = s->npc;
@@ -302,8 +331,7 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *s,
                        RiscvEmulatorRegion_t code, RiscvEmulatorRegion_t stack) {
     memset(s, 0, sizeof *s);              /* clears registers, memory map, handlers */
     s->code = code;                       /* instruction fetch, based at RAM_ORIGIN */
-    s->mem[RISCV_REGIONS - 1] = stack;    /* stack is the last region */
-    /* sp starts at the top of the stack region (its base + its size). */
-    s->x[2] = RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE + stack.len;
+    s->stack = stack;                     /* stack: grows down, ends at the last address */
+    s->x[2] = 0;                          /* sp = 0 == 2^32, one past the top of the stack */
     s->pc = s->npc = RAM_ORIGIN;          /* code starts at RAM_ORIGIN */
 }

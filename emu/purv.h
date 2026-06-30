@@ -15,19 +15,23 @@
 
 /* Base of the address space. It is RISCV_REGIONS regions, each up to
  * RISCV_REGION_SIZE bytes, based that far apart: region i covers
- * [RAM_ORIGIN + i*RISCV_REGION_SIZE, ...). */
+ * [RAM_ORIGIN + i*RISCV_REGION_SIZE, ...). The first RISCV_REGIONS-1 are general
+ * data (state->mem[]); the last is the stack (state->stack, see below), based at
+ * RISCV_STACK_BASE. */
 #define RAM_ORIGIN         0x80000000u
 #define RISCV_REGIONS      8u
 #define RISCV_REGION_SIZE  0x10000000u           /* 256 MiB */
+#define RISCV_STACK_BASE   (RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE)  /* 0xF0000000 */
 
 typedef struct RiscvEmulatorState RiscvEmulatorState_t;
 
-/* A trap handler: the engine calls it for an ecall, ebreak, or illegal
- * instruction. Return nonzero to stop the run loop and hand control back to the
- * caller of RiscvEmulatorLoop, or zero to keep executing (a fully-serviced
- * syscall returns zero and continues in place; a terminal call like exit returns
- * nonzero). NULL means the default: ecall is a nop that keeps running; ebreak
- * and illegal stop. */
+/* A trap handler: the engine calls it for an ecall, ebreak, illegal instruction,
+ * or a stack overflow (a load/store past the end of the stack). Return nonzero to
+ * stop the run loop and hand control back to the caller of RiscvEmulatorLoop, or
+ * zero to keep executing (a fully-serviced syscall returns zero and continues in
+ * place; a terminal call like exit returns nonzero). NULL means the default:
+ * ecall is a nop that keeps running; ebreak and illegal stop; an overflowing
+ * access reads zero / is dropped and the run continues. */
 typedef int (*RiscvEmulatorTrapFn)(RiscvEmulatorState_t *state);
 
 /* One memory region. `ptr` is host storage of `len` bytes (<= RISCV_REGION_SIZE)
@@ -46,25 +50,31 @@ typedef struct {
  *               reads instructions only from here, never from mem[];
  *   - mem[i]:   data region i (a load from an unmapped/out-of-bounds address
  *               reads zero; a store to a read-only/out-of-bounds address is
- *               dropped). mem[RISCV_REGIONS-1] is conventionally the stack;
- *   - ecall/ebreak/illegal: the handlers the engine calls.
+ *               dropped). These are the first RISCV_REGIONS-1 regions;
+ *   - stack:    the last region (based at RISCV_STACK_BASE) -- its bytes END at
+ *               the last address (0xFFFFFFFF) and it grows down, so sp starts at
+ *               0 (== 2^32, one past the top). A load/store past the bottom of
+ *               the mapped stack bytes is a stack overflow: the engine calls the
+ *               `overflow` handler instead of reading zero / dropping the store;
+ *   - ecall/ebreak/illegal/overflow: the handlers the engine calls.
  * The remaining fields (npc, inst, trap) are engine-internal scratch. */
 struct RiscvEmulatorState {
     uint32_t pc;
     uint32_t npc;                                /* internal: next pc within a step */
     uint32_t inst;                               /* internal: raw word of the current insn */
     uint32_t x[32];
-    uint8_t  trap;                               /* internal: pending illegal flag */
+    uint8_t  trap;                               /* internal: pending fault (1 illegal, 2 stack overflow) */
     RiscvEmulatorRegion_t code;                  /* instruction fetch, based at RAM_ORIGIN */
-    RiscvEmulatorRegion_t mem[RISCV_REGIONS];
-    RiscvEmulatorTrapFn   ecall, ebreak, illegal;
+    RiscvEmulatorRegion_t stack;                 /* the stack: grows down, ends at 0xFFFFFFFF */
+    RiscvEmulatorRegion_t mem[RISCV_REGIONS - 1];/* data regions 0 .. RISCV_REGIONS-2 */
+    RiscvEmulatorTrapFn   ecall, ebreak, illegal, overflow;
 };
 
 /* Optional convenience: zero the state, then map `code` as the instruction-fetch
- * window (based at RAM_ORIGIN) and `stack` as the last data region
- * (mem[RISCV_REGIONS-1], based at the top of the address space). sp (x[2]) is set
- * to the top of the stack region, and pc to RAM_ORIGIN. Allocate the struct
- * yourself (stack or heap); there is no create/destroy. */
+ * window (based at RAM_ORIGIN) and `stack` as the stack region (based at
+ * RISCV_STACK_BASE, ending at the last address). sp (x[2]) is set to 0 -- the
+ * stack grows down from 2^32, into the top of that region -- and pc to
+ * RAM_ORIGIN. Allocate the struct yourself (stack or heap); no create/destroy. */
 void RiscvEmulatorInit(RiscvEmulatorState_t *state,
                        RiscvEmulatorRegion_t code, RiscvEmulatorRegion_t stack);
 
@@ -78,13 +88,15 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *state,
  * how you detect it). Data loads/stores go through state->mem; only fetch uses
  * the code window.
  *
- * Loop also stops when `max` is reached, or an ecall/ebreak/illegal handler
- * returns nonzero. A halt the host decides by other means (e.g. polling a tohost
- * word it owns) is invisible to the engine; run Loop in bounded slices and check
- * between them. */
+ * Loop also stops when `max` is reached, or an ecall/ebreak/illegal/overflow
+ * handler returns nonzero. A halt the host decides by other means (e.g. polling a
+ * tohost word it owns) is invisible to the engine; run Loop in bounded slices and
+ * check between them. */
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint64_t max);
 
 /* (To read or write guest memory from outside the engine, index state->mem[]
- * directly: region i covers [RAM_ORIGIN + i*RISCV_REGION_SIZE, + region.len).) */
+ * directly: data region i covers [RAM_ORIGIN + i*RISCV_REGION_SIZE, + region.len).
+ * The stack (state->stack) is the top region: its bytes end at the last address,
+ * so they cover [(uint32_t)(0 - stack.len), 0xFFFFFFFF].) */
 
 #endif /* PURV_H_ */

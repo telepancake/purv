@@ -37,11 +37,11 @@
 /* ------------------------------------------------------------------ memory */
 
 #define RAM_BYTES   (256u * 1024 * 1024)
-#define STACK_BASE  (RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE)  /* region 7 */
 #define STACK_BYTES (16u * 1024 * 1024)
+#define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* stack ends at the last address */
 static uint8_t *g_ram;                    /* code + data + heap (region 0) */
 #ifndef PURV_TAGGED
-static uint8_t *g_stack;                  /* stack (region 7); purvs keeps its stack in region 0 */
+static uint8_t *g_stack;                  /* stack (top region); purvs keeps its stack in region 0 */
 #endif
 
 static int in_ram(uint32_t a, uint32_t n) {
@@ -173,6 +173,11 @@ static int on_illegal(RiscvEmulatorState_t *st) {
             st->inst, st->pc);
     g_halt = 1; g_exit = 1; return 1;
 }
+static int on_overflow(RiscvEmulatorState_t *st) {
+    fprintf(stderr, "purv-sqlite: stack overflow at pc=0x%08x (sp=0x%08x)\n",
+            st->pc, st->x[2]);
+    g_halt = 1; g_exit = 1; return 1;
+}
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 static int on_ecall(RiscvEmulatorState_t *st) { service_hostcall(st); return g_halt; }
 #endif
@@ -201,6 +206,10 @@ static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
 }
 #else
 static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
+    if (a >= RISCV_STACK_BASE) {                  /* the stack (top region) */
+        uint32_t base = (uint32_t)(0u - s->stack.len);
+        return (s->stack.ptr && a >= base) ? s->stack.ptr[a - base] : 0;
+    }
     if (a < RAM_ORIGIN) return 0;
     const RiscvEmulatorRegion_t *r = &s->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
     uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
@@ -310,20 +319,21 @@ int main(int argc, char **argv) {
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
     rset(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of region 0 */
 #else
-    /* purv: the stack is its own region (region 7), so the heap uses all of
-     * region 0. Init wires code + stack + sp; we add region 0 and the handlers. */
+    /* purv: the stack is its own (top) region, so the heap uses all of region 0.
+     * Init wires code + stack + sp; we add region 0 and the handlers. */
     g_stack = calloc(1, STACK_BYTES);
     if (!g_stack) { fprintf(stderr, "OOM\n"); return 2; }
     heap_init(heap_base, RAM_ORIGIN + RAM_BYTES);
     RiscvEmulatorRegion_t code  = { g_ram, RAM_BYTES, 1 };
     RiscvEmulatorRegion_t stack = { g_stack, STACK_BYTES, 1 };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, code, stack);   /* sp = top of region 7 */
+    RiscvEmulatorInit(&state, code, stack);   /* sp = 0 (top of the stack region) */
     RiscvEmulatorState_t *st = &state;
     st->mem[0] = code;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
+    st->overflow = on_overflow;
 #endif
     spc(st, entry);
 

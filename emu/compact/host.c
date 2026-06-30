@@ -18,19 +18,19 @@
 #include "../purv.h"
 #include "hostcalls.h"
 
-#define RAM_BYTES   (64u * 1024 * 1024)
-#define STACK_BASE  (RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE)  /* region 7 */
-#define STACK_BYTES (4u * 1024 * 1024)
+#define RAM_BYTES      (64u * 1024 * 1024)
+#define STACK_BYTES    (4u * 1024 * 1024)
+#define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* stack ends at the last address */
 static uint8_t *g_ram;                   /* code + data + heap (region 0) */
-static uint8_t *g_stack;                 /* stack (region 7) */
+static uint8_t *g_stack;                 /* stack (top region, grows down) */
 
 static int in_ram(uint32_t a, uint32_t n) {
     return a >= RAM_ORIGIN && (uint64_t)a + n <= (uint64_t)RAM_ORIGIN + RAM_BYTES;
 }
-/* Read a guest byte through the region map (region 0 RAM or region 7 stack). */
+/* Read a guest byte through the region map (region 0 RAM or the stack region). */
 static uint8_t guest_byte(uint32_t a) {
+    if (a >= STACK_MEM_BASE) return g_stack[a - STACK_MEM_BASE];   /* the stack */
     if (a >= RAM_ORIGIN && a < RAM_ORIGIN + RAM_BYTES) return g_ram[a - RAM_ORIGIN];
-    if (a >= STACK_BASE && a < STACK_BASE + STACK_BYTES) return g_stack[a - STACK_BASE];
     return 0;
 }
 
@@ -86,6 +86,11 @@ static void service(RiscvEmulatorState_t *st);
 static int on_illegal(RiscvEmulatorState_t *st) {
     fprintf(stderr, "compact: illegal instruction 0x%08x at pc=0x%08x\n",
             st->inst, st->pc);
+    g_halt = 1; g_exit = 1; return 1;
+}
+static int on_overflow(RiscvEmulatorState_t *st) {
+    fprintf(stderr, "compact: stack overflow at pc=0x%08x (sp=0x%08x)\n",
+            st->pc, st->x[2]);
     g_halt = 1; g_exit = 1; return 1;
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
@@ -147,6 +152,7 @@ int main(int argc, char **argv) {
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
+    st->overflow = on_overflow;
     st->pc = entry;
 
     /* pc lives in the state; run in slices off the flat RAM image. */

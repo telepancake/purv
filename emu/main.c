@@ -34,11 +34,12 @@
 /* ------------------------------------------------------------------ memory */
 
 /* Flat RAM, mapped as the engine's region 0 (RAM_ORIGIN..) for code + data +
- * heap, and a separate stack buffer mapped as the last region (region 7, based
- * at STACK_BASE). */
+ * heap, and a separate stack buffer mapped as the stack region. The stack grows
+ * down and ends at the last address, so its bytes live at [STACK_MEM_BASE,
+ * 0xFFFFFFFF] and the initial sp is 0 (== 2^32, one past the top). */
 #define PURV_RAM_DEFAULT (256u * 1024u * 1024u)
-#define STACK_BASE  (RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE)  /* 0xF0000000 */
-#define STACK_BYTES (16u * 1024u * 1024u)
+#define STACK_BYTES    (16u * 1024u * 1024u)
+#define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* host base of the stack buffer */
 static uint8_t *g_ram;
 static uint32_t g_ram_size;
 static uint8_t *g_stack;
@@ -73,6 +74,15 @@ static int on_illegal(RiscvEmulatorState_t *state) {
     return 1;
 }
 
+static int on_overflow(RiscvEmulatorState_t *state) {
+    /* The guest ran off the end of its stack: report and stop. */
+    fprintf(stderr, "purv: stack overflow at pc=0x%08x (sp=0x%08x)\n",
+            state->pc, state->x[2]);
+    g_halt = 1;
+    g_exit = 1;
+    return 1;
+}
+
 /* User-mode syscall emulation (Linux/RISC-V ABI subset): a7=number, a0..a5=args,
  * result in a0. Only what single-threaded console programs need; everything else
  * returns -ENOSYS. Enabled by --user; without it an ecall is a nop and execution
@@ -80,6 +90,10 @@ static int on_illegal(RiscvEmulatorState_t *state) {
 /* Read a guest byte through the region map -- the write buffer may be anywhere
  * (often the stack, which is its own region), not just region 0. */
 static uint8_t guest_byte(const RiscvEmulatorState_t *st, uint32_t a) {
+    if (a >= RISCV_STACK_BASE) {                  /* the stack (top region) */
+        uint32_t base = (uint32_t)(0u - st->stack.len);
+        return (st->stack.ptr && a >= base) ? st->stack.ptr[a - base] : 0;
+    }
     if (a < RAM_ORIGIN) return 0;
     const RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
     uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
@@ -231,21 +245,21 @@ static void dump_signature(const char *path, uint32_t gran) {
 #define MAGIC_RET 0xdeadbee0u            /* sentinel return address for --invoke */
 
 static void gpoke(uint32_t addr, uint32_t v) {
-    memcpy(&g_stack[addr - STACK_BASE], &v, 4);
+    memcpy(&g_stack[addr - STACK_MEM_BASE], &v, 4);
 }
 
 /* Build the initial process stack (RISC-V Linux ABI): sp points at argc,
  * followed by the argv pointers, a NULL, an empty envp, and an AT_NULL auxv.
- * Built in the stack region (region 7); argument strings sit just below its top.
- * Returns the new sp. */
+ * Built at the top of the stack region (sp starts at 0 == 2^32); argument
+ * strings sit just below the top. Returns the new sp. */
 static uint32_t setup_user_stack(int argc, char **argv) {
-    uint32_t sp = STACK_BASE + STACK_BYTES;
+    uint32_t sp = 0;                                 /* 2^32: one past the last address */
     uint32_t ptr[64];
     if (argc > 64) argc = 64;
     for (int i = argc - 1; i >= 0; i--) {
         uint32_t len = (uint32_t)strlen(argv[i]) + 1;
         sp -= len;
-        memcpy(&g_stack[sp - STACK_BASE], argv[i], len);
+        memcpy(&g_stack[sp - STACK_MEM_BASE], argv[i], len);
         ptr[i] = sp;
     }
     sp &= ~15u;
@@ -317,7 +331,7 @@ int main(int argc, char **argv) {
     uint32_t entry = load_elf(elf);
 
     /* code (fetch) and region 0 (data) both view the flat RAM at RAM_ORIGIN
-     * (von Neumann); the stack is its own buffer in the last region. Init wires
+     * (von Neumann); the stack is its own buffer in the top region. Init wires
      * up code + stack + sp; we add region 0 and the handlers. */
     uint32_t code_len = g_ram_size < RISCV_REGION_SIZE ? g_ram_size : RISCV_REGION_SIZE;
     RiscvEmulatorRegion_t code  = { g_ram, code_len, 1 };
@@ -329,6 +343,7 @@ int main(int argc, char **argv) {
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
+    st->overflow = on_overflow;
 
     uint32_t start = entry;
     if (invoke) {
