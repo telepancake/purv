@@ -113,12 +113,10 @@ static uint8_t branch_op(uint32_t f3) {
  * downstream needs the instruction's own pc. The case structure mirrors purv's
  * fused decode/execute switch; each former `goto <action>` becomes a leaf op plus
  * the operand fields that action consumed. A trailing fixup stores the raw word in
- * `imm` for trap ops, which the run loop hands to the host as state->inst.
- *
- * always_inline: this is the decode half of the hot loop, and it must stay inlined
- * into RiscvEmulatorLoop. The cold early-exit helper (fixup_pc) is a second caller,
- * which would otherwise make the compiler emit decode_one out-of-line -- a real
- * call per instruction, ~25% more host instructions on the hot path. */
+ * `imm` for trap ops, which the run loop hands to the host as state->inst. This is
+ * the decode half of the hot loop and its only caller (the cold pc fixup uses the
+ * lean step_one, not this), so inline it -- always_inline here only firms up codegen
+ * the single-caller heuristic already chooses, with no cold-copy cost. */
 static inline __attribute__((always_inline))
 uint32_t decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t off) {
     uint16_t lo = (uint16_t)(code[off] | code[off + 1] << 8);
@@ -429,26 +427,52 @@ uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *s, const RiscvEmulatorDe
 
 /* ------------------------------------------------------- early-exit pc fixup */
 
+/* Lean step for the cold fixup walk: just enough to advance pc. Returns the
+ * instruction width; for an unconditional jump (the only control flow the walk can
+ * meet -- see fixup_pc) sets *jump and, then, the absolute *target and whether it
+ * writes a link (jal vs plain j). It does none of decode_one's operand/op work. */
+static uint32_t step_one(const uint8_t *code, uint32_t pc, int *jump, int *link, uint32_t *target) {
+    uint16_t lo = (uint16_t)(code[pc] | code[pc + 1] << 8);
+    *jump = 0;
+    if ((lo & 3) == 3) {                                   /* 32-bit */
+        uint32_t w = lo | (uint32_t)(code[pc + 2] | code[pc + 3] << 8) << 16;
+        if ((w & 0x7f) == JAL) {
+            *jump = 1; *link = ((w >> 7) & 31) != 0;
+            *target = pc + sext((w >> 31 & 1) << 20 | (w >> 12 & 0xff) << 12 |
+                                (w >> 20 & 1) << 11 | (w >> 21 & 0x3ff) << 1, 21);
+        }
+        return 4;
+    }
+    uint32_t sel = ((lo >> 13) & 7) << 2 | (lo & 3);       /* compressed: C.JAL / C.J */
+    if (sel == (1 << 2 | 1) || sel == (5 << 2 | 1)) {
+        *jump = 1; *link = (sel == (1 << 2 | 1));          /* C.JAL links ra; C.J does not */
+        *target = pc + sext(((lo >> 12) & 1) << 11 | ((lo >> 11) & 1) << 4 | ((lo >> 9) & 3) << 8 |
+                            ((lo >> 8) & 1) << 10 | ((lo >> 7) & 1) << 6 | ((lo >> 6) & 1) << 7 |
+                            ((lo >> 3) & 7) << 1 | ((lo >> 2) & 1) << 5, 12);
+    }
+    return 2;
+}
+
 /* Recover the resume pc when an evaluator stops before the run's end. Because the
  * decode pass omits plain unconditional jumps from the record stream (their only
  * effect is the pc redirect, which the trace already followed), the loop can't map
  * "records executed" back to a pc by record count alone. So on a short return we
  * re-walk the code from the run's start, advancing through `records` emitted
- * records -- stepping sequential ops by their width and FOLLOWING the omitted/
- * absorbed jumps -- and land on the resume pc. The first `records` of a run are
- * never terminators (those are always the run's last record), so the walk only
- * meets sequential ops and jumps. *insns receives the guest instructions covered
- * (records plus the jumps traversed). Cold path: only a custom eval that stops
- * mid-run reaches it. */
+ * records -- stepping sequential ops by their width and FOLLOWING the absorbed
+ * jumps -- and land on the resume pc. The first `records` of a run are never
+ * terminators (those are always the run's last record), so the walk only meets
+ * sequential ops and unconditional jumps -- exactly what step_one decodes.
+ * *insns receives the guest instructions covered (records plus jumps traversed).
+ * Cold path: only a custom eval that stops mid-run reaches it. */
 static uint32_t fixup_pc(const uint8_t *code, uint32_t pc, uint32_t records, uint32_t *insns) {
-    uint32_t recs = 0, cnt = 0;
-    RiscvEmulatorDecoded_t d;
+    uint32_t recs = 0, cnt = 0, target;
+    int jump, link;
     while (recs < records) {
-        uint32_t width = decode_one(&d, code, pc);
+        uint32_t width = step_one(code, pc, &jump, &link, &target);
         cnt++;
-        if (d.op == RISCV_OP_JAL) {     /* a jump: omitted (plain j) or a LUI link (jal) */
-            if (d.rd) recs++;           /* jal kept a link-write record; plain j did not */
-            pc = d.imm;                 /* follow the baked target either way */
+        if (jump) {                     /* omitted plain j, or a jal kept as a LUI link */
+            if (link) recs++;           /* jal left a record; plain j did not */
+            pc = target;
             continue;
         }
         recs++;
