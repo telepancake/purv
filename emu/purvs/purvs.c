@@ -114,12 +114,18 @@ static uint8_t branch_op(uint32_t f3) {
  * fused decode/execute switch; each former `goto <action>` becomes a leaf op plus
  * the operand fields that action consumed. A trailing fixup stores the raw word in
  * `imm` for trap ops, which the run loop hands to the host as state->inst. */
-static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t off) {
+static uint32_t decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t off) {
     uint16_t lo = (uint16_t)(code[off] | code[off + 1] << 8);
-    uint32_t raw;
-    d->rd = 0; d->rs1 = 0; d->rs2 = 0; d->imm = 0;
+    uint32_t raw, width;
+    /* Set only the fields the op's handler reads (see the payload table in purvs.h).
+     * A field a handler never touches is left as-is -- the buffer is reused, but a
+     * stale value in an unread field is harmless. The only ops whose handler reads a
+     * field their case does not write are the compare-against-x0 compressed branches
+     * (rs2) and C.JR/C.JALR (imm); those zero it explicitly. Decode returns the
+     * instruction's width, so the caller needs no second test of the 16/32-bit bit. */
 
     if ((lo & 3) == 3) {                                  /* ---- 32-bit ---- */
+        width = 4;
         uint32_t w = lo | (uint32_t)(code[off + 2] | code[off + 3] << 8) << 16;
         uint32_t rd = (w >> 7) & 31, rs1 = (w >> 15) & 31, f3 = (w >> 12) & 7;
         raw = w;
@@ -172,6 +178,7 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
         default: d->op = RISCV_OP_ILLEGAL; break;
         }
     } else {                                              /* ---- compressed ---- */
+        width = 2;
         uint16_t c = lo;
         uint32_t rdp = ((c >> 2) & 7) + 8, rsp = ((c >> 7) & 7) + 8;  /* x8..x15 fields */
         uint32_t shamt = ((c >> 2) & 0x1f) | ((c >> 12) & 1) << 5;
@@ -231,9 +238,10 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
                 }
             }
             break;
-        case 6 << 2 | 1: d->op = RISCV_OP_BEQ; d->rs1 = rsp; goto cb;   /* C.BEQZ (rs2 = x0) */
-        case 7 << 2 | 1: d->op = RISCV_OP_BNE; d->rs1 = rsp;            /* C.BNEZ (rs2 = x0) */
-        cb: d->imm = off + sext(((c >> 12) & 1) << 8 | ((c >> 10) & 3) << 3 | ((c >> 5) & 3) << 6 |
+        case 6 << 2 | 1: d->op = RISCV_OP_BEQ; d->rs1 = rsp; goto cb;   /* C.BEQZ */
+        case 7 << 2 | 1: d->op = RISCV_OP_BNE; d->rs1 = rsp;            /* C.BNEZ */
+        cb: d->rs2 = 0;                                                 /* compare against x0 */
+            d->imm = off + sext(((c >> 12) & 1) << 8 | ((c >> 10) & 3) << 3 | ((c >> 5) & 3) << 6 |
                                 ((c >> 3) & 3) << 1 | ((c >> 2) & 1) << 5, 9);   /* baked target */
             break;
         case 0 << 2 | 2:                          /* C.SLLI -> slli rd, rd, shamt */
@@ -244,10 +252,10 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
         case 4 << 2 | 2: {                        /* C.JR / C.JALR / C.MV / C.ADD / C.EBREAK */
             uint32_t rs2 = (c >> 2) & 31;
             if (!((c >> 12) & 1)) {
-                if (rs2 == 0) { d->op = RISCV_OP_JALR; d->rs1 = rd; d->rd = 0; }      /* C.JR */
+                if (rs2 == 0) { d->op = RISCV_OP_JALR; d->rs1 = rd; d->rd = 0; d->imm = 0; }  /* C.JR */
                 else { d->op = RISCV_OP_ADD; d->rd = (c >> 7) & 31; d->rs1 = 0; d->rs2 = rs2; }  /* C.MV */
             } else if (rd == 0 && rs2 == 0) d->op = RISCV_OP_EBREAK;                  /* C.EBREAK */
-            else if (rs2 == 0) { d->op = RISCV_OP_JALR; d->rs1 = rd; d->rd = 1; }     /* C.JALR */
+            else if (rs2 == 0) { d->op = RISCV_OP_JALR; d->rs1 = rd; d->rd = 1; d->imm = 0; }  /* C.JALR */
             else { d->op = RISCV_OP_ADD; d->rs1 = rd; d->rs2 = rs2; }                 /* C.ADD */
             break;
         }
@@ -259,6 +267,7 @@ static void decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t 
     }
     /* Trap ops carry the raw word so the loop can hand it to the host as state->inst. */
     if (d->op >= RISCV_OP_ECALL && d->op <= RISCV_OP_ILLEGAL) d->imm = raw;
+    return width;
 }
 
 /* ------------------------------------------------------------- default eval */
@@ -431,13 +440,19 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         /* loop 1: decode ahead, tracing THROUGH unconditional jumps (their target
          * is static), until a conditional branch / indirect jump / trap (the run's
          * last record), a full buffer, or the code window's end. Code is read-only,
-         * so nothing eval does can invalidate what we decode here. */
-        while (n < cap) {
-            if (!code || pc >= code_len || code_len - pc < 2) break;
-            uint16_t lo = (uint16_t)(code[pc] | code[pc + 1] << 8);
-            uint32_t width = ((lo & 3) == 3) ? 4 : 2;
-            if (width == 4 && code_len - pc < 4) break;   /* 32-bit straddles end */
-            decode_one(&block[n], code, pc);
+         * so nothing eval does can invalidate what we decode here.
+         *
+         * `win` is the last pc at which a full 4-byte fetch is in bounds; while pc
+         * stays <= win (the overwhelmingly common case, and a well-predicted branch)
+         * a fetch needs no bounds check. Only at the window's tail -- or after a
+         * traced jump lands near/past the end -- do we re-check carefully. */
+        uint32_t win = code_len >= 4 ? code_len - 4 : 0;
+        if (code) while (n < cap) {
+            if (pc > win) {                               /* tail / out-of-window: check */
+                if (pc >= code_len || code_len - pc < 2) break;
+                if (((code[pc] | code[pc + 1] << 8) & 3) == 3 && code_len - pc < 4) break;
+            }
+            uint32_t width = decode_one(&block[n], code, pc);
             last_pc = pc;
             if (block[n].op == RISCV_OP_JAL) {
                 /* Unconditional jump to a statically-known target: trace across it.
