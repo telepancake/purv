@@ -40,21 +40,35 @@ uint8_t *mem_resolve(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
     return (uint8_t *)0;
 }
 
-/* A load of n bytes, zero-extended. Readable in either half; a miss goes to the
- * callback, whose return supplies the (low n bytes of the) loaded word. */
+/* A load of n bytes (1/2/4), zero-extended. Readable in either half; a miss goes
+ * to the callback, whose return supplies the (low n bytes of the) loaded word.
+ * The width is known from the opcode, so we read it directly -- the byte-or idiom
+ * is recognized as a single (unaligned, little-endian) load, no memcpy. */
 static uint32_t mem_load(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
-    uint8_t *p = mem_resolve(s, addr, n);
-    uint32_t v = 0;
-    if (p) { memcpy(&v, p, n); return v; }
-    v = s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0;
-    return n == 4 ? v : (v & ((1u << (8 * n)) - 1));
+    const uint8_t *p = mem_resolve(s, addr, n);
+    if (!p) {
+        uint32_t v = s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0;
+        return n == 4 ? v : (v & ((1u << (8 * n)) - 1));
+    }
+    switch (n) {
+    case 1:  return p[0];
+    case 2:  return (uint32_t)p[0] | (uint32_t)p[1] << 8;
+    default: return (uint32_t)p[0] | (uint32_t)p[1] << 8
+                  | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+    }
 }
-/* A store of the low n bytes of val. Allowed only in the writable upper half; a
- * store to the read-only lower half or a miss goes to the callback. */
+/* A store of the low n bytes of val (width known from the opcode). Allowed only in
+ * the writable upper half; a store to the read-only lower half or a miss goes to
+ * the callback. The byte writes coalesce into one sized (little-endian) store. */
 static void mem_store(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, uint32_t val) {
     uint8_t *p = (addr & RISCV_HALF) ? mem_resolve(s, addr, n) : (uint8_t *)0;
-    if (p) memcpy(p, &val, n);
-    else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, val);
+    if (!p) { if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, val); return; }
+    switch (n) {
+    case 1:  p[0] = (uint8_t)val; break;
+    case 2:  p[0] = (uint8_t)val; p[1] = (uint8_t)(val >> 8); break;
+    default: p[0] = (uint8_t)val;        p[1] = (uint8_t)(val >> 8);
+             p[2] = (uint8_t)(val >> 16); p[3] = (uint8_t)(val >> 24); break;
+    }
 }
 
 /* Sign-extend the low `bits` of v. */
