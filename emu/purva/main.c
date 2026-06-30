@@ -25,7 +25,9 @@
 #define PURV_HEAP_DEFAULT (256u * 1024u * 1024u)
 #define STACK_MEM_BASE(stack_len) ((uint32_t)(0u - (stack_len)))
 static uint8_t *g_heap, *g_stack;
-static uint32_t g_heap_size, g_stack_size;
+static uint32_t g_heap_size;      /* the DYNAMIC (brk-grown) budget alone, not bss/rwdata */
+static uint32_t g_heap_region_len; /* the full region[HEAP] length: rwdata + bss + g_heap_size */
+static uint32_t g_stack_size;
 
 static int      g_halt;
 static int      g_exit = 1;
@@ -38,7 +40,7 @@ static int       g_have_tohost, g_have_sig;
 static uint32_t  g_tohost, g_begin_sig, g_end_sig;
 
 static int in_heap(uint32_t addr, uint32_t len) {
-    return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_size;
+    return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_region_len;
 }
 
 /* ------------------------------------------------ trap handlers */
@@ -74,7 +76,7 @@ static int on_ecall(RiscvEmulatorState_t *state) {
         g_exit = (int)a0; g_halt = 1; ret = 0;
         break;
     case 214:
-        if (a0 >= g_brk && a0 < RISCV_HALF + g_heap_size) g_brk = a0;
+        if (a0 >= g_brk && a0 < RISCV_HALF + g_heap_region_len) g_brk = a0;
         ret = g_brk;
         break;
     default:
@@ -199,12 +201,15 @@ int main(int argc, char **argv) {
     uint8_t *codereg = calloc(1, codereg_len ? codereg_len : 1);
     if (img.rodata_size) memcpy(codereg + img.code_size, img.rodata, img.rodata_size);
 
-    /* region[HEAP]: rwdata followed by zeroed bss/heap space, sized to at least the
-     * image's minimum (the host may map more via --ram=). */
-    g_heap_size = img.bss_size > g_heap_size ? img.bss_size : g_heap_size;
-    g_heap = calloc(1, img.rwdata_size + g_heap_size);
+    /* region[HEAP]: rwdata, then bss (the compiled code's global/static variables --
+     * their addresses are baked in at the linker's real offset, right after rwdata,
+     * same as purv), then the dynamic (brk-grown) heap. g_heap_size is the dynamic
+     * budget alone (--ram=, default below); bss is additional and must not be
+     * folded into it, or brk's start address overlaps live bss variables. */
+    g_heap_region_len = img.rwdata_size + img.bss_size + g_heap_size;
+    g_heap = calloc(1, g_heap_region_len ? g_heap_region_len : 1);
     if (img.rwdata_size) memcpy(g_heap, img.rwdata, img.rwdata_size);
-    g_brk = RISCV_HALF + img.rwdata_size;
+    g_brk = RISCV_HALF + img.rwdata_size + img.bss_size;
 
     g_stack_size = img.stack_size > (16u * 1024 * 1024) ? img.stack_size : (16u * 1024 * 1024);
     g_stack = calloc(1, g_stack_size);
@@ -213,7 +218,7 @@ int main(int argc, char **argv) {
     RiscvEmulatorInit(&state,
         (RiscvEmulatorRegion_t){ codereg, codereg_len },
         (RiscvEmulatorRegion_t){ 0, 0 },
-        (RiscvEmulatorRegion_t){ g_heap, img.rwdata_size + g_heap_size },
+        (RiscvEmulatorRegion_t){ g_heap, g_heap_region_len },
         (RiscvEmulatorRegion_t){ g_stack, g_stack_size });
     RiscvEmulatorState_t *st = &state;
     st->ecall = on_ecall;

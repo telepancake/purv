@@ -149,11 +149,29 @@ static uint32_t *collect_code_address_relocs(const Ehdr *eh, uint32_t code_len, 
     return out;
 }
 
-/* Patch every R_RISCV_32 relocation in section `ri` whose target value lands inside
- * the code window [0, code_len): overwrite the word at its (absolute address -
- * buf_base) in `buf` with its resolved op index * 4. */
+/* Patch every R_RISCV_32 relocation in section `ri` whose target value is either a
+ * CODE address or a RODATA address -- the two ways a data word anywhere (rodata,
+ * rwdata, or a vtable slot in either) can store "the address of something" that
+ * this image's layout doesn't put at the same byte offset as the original ELF:
+ *
+ *   - target < code_len: a code address (a function pointer, a vtable slot).
+ *     Resolved through the op-index map and overwritten with op_index*4 (fake-pc
+ *     units, like jal's link) -- unchanged from before this function grew a
+ *     second case.
+ *   - code_len <= target < code_len+rodata_len: a RODATA address (e.g. a `static
+ *     const char *` initializer pointing at a string literal -- SQLite alone
+ *     stores dozens of these in plain data words, not just instructions). The
+ *     image places rodata at prog.n_ops*4, not code_len, once anything in the
+ *     whole program has fused or expanded (see fixup_rodata_auipc below, which
+ *     does the identical correction for values baked into the op array instead
+ *     of into a data word) -- so the same `delta` shift applies here.
+ *   - target >= code_len+rodata_len: an rwdata/heap pointer. Always left alone:
+ *     rwdata sits at the fixed RISCV_HALF boundary in both the ELF and the
+ *     image, independent of how the code transcoded, so no shift is needed (and
+ *     this function is never even called with such a target in code_len's
+ *     bucket -- the caller only reaches it for rodata/rwdata-hosted sections). */
 static void patch_rela(const Ehdr *eh, int ri, uint32_t buf_base, uint8_t *buf, uint32_t buf_len,
-                        const uint32_t *map, uint32_t code_len) {
+                        const uint32_t *map, uint32_t code_len, uint32_t rodata_len, int64_t delta) {
     const Shdr *rsh = shdr(eh, ri);
     const Shdr *symsh = shdr(eh, rsh->sh_link);
     const Sym  *syms = (const Sym *)(g_elf + symsh->sh_offset);
@@ -163,30 +181,65 @@ static void patch_rela(const Ehdr *eh, int ri, uint32_t buf_base, uint8_t *buf, 
         uint32_t type = relas[i].r_info & 0xff, sym_idx = relas[i].r_info >> 8;
         if (type != R_RISCV_32) continue;
         uint32_t target = syms[sym_idx].st_value + relas[i].r_addend;
-        if (target >= code_len) continue;                  /* not a code address */
-        uint32_t op_index = map[target >> 1];
-        if (op_index == TC_SENTINEL) continue;              /* not an instruction start */
+        uint32_t new_value;
+        if (target < code_len) {
+            uint32_t op_index = map[target >> 1];
+            if (op_index == TC_SENTINEL) continue;          /* not an instruction start */
+            new_value = op_index * 4;                        /* fake-pc units, like jal's link */
+        } else if (target < code_len + rodata_len) {
+            new_value = (uint32_t)((int64_t)target - delta); /* real ELF offset -> image offset */
+        } else {
+            continue;                                        /* rwdata/heap: no shift needed */
+        }
         if (relas[i].r_offset < buf_base || relas[i].r_offset - buf_base + 4 > buf_len) continue;
         uint32_t at = relas[i].r_offset - buf_base;
-        uint32_t new_value = op_index * 4;                  /* fake-pc units, like jal's link */
         buf[at] = (uint8_t)new_value; buf[at + 1] = (uint8_t)(new_value >> 8);
         buf[at + 2] = (uint8_t)(new_value >> 16); buf[at + 3] = (uint8_t)(new_value >> 24);
     }
 }
 
-/* Patch code-pointer relocations in every .rela.X section whose target X is the
- * rodata or rwdata buffer (matched by address range, not by name). */
+/* Patch code- and rodata-pointer relocations in every .rela.X section whose
+ * target X is the rodata or rwdata buffer (matched by address range, not by
+ * name). */
 static void patch_all_relas(const Ehdr *eh, uint32_t rodata_base, uint8_t *rodata, uint32_t rodata_len,
                              uint32_t rwdata_base, uint8_t *rwdata, uint32_t rwdata_len,
-                             const uint32_t *map, uint32_t code_len) {
+                             const uint32_t *map, uint32_t code_len, int64_t delta) {
     for (int i = 0; i < eh->e_shnum; i++) {
         const Shdr *sh = shdr(eh, i);
         if (sh->sh_type != SHT_RELA) continue;
         const Shdr *target = shdr(eh, sh->sh_info);     /* section this .rela.X applies to */
         if (rodata_len && target->sh_addr >= rodata_base && target->sh_addr < rodata_base + rodata_len)
-            patch_rela(eh, i, rodata_base, rodata, rodata_len, map, code_len);
+            patch_rela(eh, i, rodata_base, rodata, rodata_len, map, code_len, rodata_len, delta);
         else if (rwdata_len && target->sh_addr >= rwdata_base && target->sh_addr < rwdata_base + rwdata_len)
-            patch_rela(eh, i, rwdata_base, rwdata, rwdata_len, map, code_len);
+            patch_rela(eh, i, rwdata_base, rwdata, rwdata_len, map, code_len, rodata_len, delta);
+    }
+}
+
+/* Correct every baked RISCV_OP_AUIPC_ABS target that points into rodata: step()
+ * (transcode.c) bakes such a target unconditionally, in REAL-ELF coordinates,
+ * because it can't yet know the whole-program delta between the original code's
+ * byte length (`code_len`) and the transcoded code's (`prog.n_ops*4`) -- that
+ * delta only exists once the whole pass is done. Now that it's done (the caller
+ * computes it once and shares it with patch_rela's identical correction for
+ * relocation-held rodata pointers), shift every baked target that lands in
+ * [code_len, code_len+rodata_len) -- a rodata pointer -- by that delta,
+ * converting it from "byte offset in the original ELF" to "byte offset in this
+ * image" (where rodata starts at prog.n_ops*4, not code_len). A target >=
+ * code_len+rodata_len is an rwdata/heap pointer instead: those need no
+ * correction, since rwdata is always placed at the fixed RISCV_HALF boundary in
+ * both the ELF and the image, independent of how code transcoded. */
+static void fixup_rodata_auipc(uint32_t *ops, uint32_t n_ops, uint32_t code_len,
+                                uint32_t rodata_len, int64_t delta) {
+    if (delta == 0) return;
+    for (uint32_t i = 0; i < n_ops; ) {
+        if (TC_OP(ops[i]) == RISCV_OP_AUIPC_ABS) {
+            uint32_t target = ops[i + 1];
+            if (target >= code_len && target < code_len + rodata_len)
+                ops[i + 1] = (uint32_t)((int64_t)target - delta);
+            i += 2;
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -228,7 +281,7 @@ int main(int argc, char **argv) {
      * no way to know these (it never reads the ELF), only this tool does. */
     uint32_t n_ext;
     uint32_t *ext_addrs = collect_code_address_relocs(eh, code_len, &n_ext);
-    TcExternalTargets ext = { ext_addrs, n_ext };
+    TcExternalTargets ext = { ext_addrs, n_ext, code_len + rodata_len };
 
     /* 1. transcode code -- the only decoding in this pipeline. */
     Transcoded prog;
@@ -240,10 +293,36 @@ int main(int argc, char **argv) {
      * pass over code, done once, at build time. */
     uint32_t n_ops_check;
     uint32_t *map = transcode_map_ex(code_bytes, code_len, &ext, &n_ops_check);
+    if (getenv("TCVERIFY")) {  /* TEMP debug: independent map/ops consistency check */
+        fprintf(stderr, "TCVERIFY: prog.n_ops=%u n_ops_check=%u %s\n",
+                prog.n_ops, n_ops_check, prog.n_ops == n_ops_check ? "MATCH" : "MISMATCH");
+        /* Independently replay map[off>>1] against a fresh walk of prog.ops and
+         * report the first byte offset where they disagree. */
+        uint32_t at = 0;
+        for (uint32_t off = 0; off + 4 <= code_len; off += 4) {
+            uint32_t mapped = map[off >> 1];
+            if (mapped == TC_SENTINEL) continue;
+            if (mapped != at) {
+                fprintf(stderr, "TCVERIFY: first mismatch at off=0x%x: map=%u walked_at=%u\n", off, mapped, at);
+                break;
+            }
+            uint8_t op = (uint8_t)(prog.ops[at] >> 26);
+            at += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+        }
+    }
 
-    /* 2. patch every code-pointer relocation found anywhere into rodata/rwdata. */
+    /* The whole-program byte-length delta fusion/expansion introduced -- shared by
+     * patch_rela (relocation-held rodata pointers) and fixup_rodata_auipc (baked
+     * auipc rodata pointers); both correct the same real-ELF-vs-image mismatch. */
+    int64_t delta = (int64_t)code_len - (int64_t)(prog.n_ops * 4);
+
+    /* 2. patch every code- and rodata-pointer relocation found anywhere into
+     * rodata/rwdata. */
     patch_all_relas(eh, code_len, rodata_bytes, rodata_len,
-                     RISCV_HALF, rwdata_bytes, rwdata_len, map, code_len);
+                     RISCV_HALF, rwdata_bytes, rwdata_len, map, code_len, delta);
+
+    /* 3. correct every baked rodata-pointing auipc for the same delta. */
+    fixup_rodata_auipc(prog.ops, prog.n_ops, code_len, rodata_len, delta);
 
     Image img = {0};
     img.code_size   = prog.n_ops * 4;

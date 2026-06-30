@@ -103,14 +103,11 @@ static void decode(const uint8_t *code, uint32_t off, Dec *d) {
     }
 }
 
-/* Output op words for an op. Always 1: a fused SPILL2 covers 8 bytes of original
- * code but is still a single op word (its consumed-byte count is reported by
- * try_fuse_spill2's return value, separate from this). auipc stays a single word
- * too (its value is computed at run time from the live cursor, which equals the
- * original pc exactly as long as nothing before it ran ahead of pc/4 -- see
- * transcode.h's note on why that must hold, and SPILL2's contract for why fusion
- * doesn't break it). */
-static int op_words(uint8_t op) { (void)op; return 1; }
+/* Output op words for an op: 2 for RISCV_OP_AUIPC_ABS (its baked absolute value
+ * spills a second word -- see transcode.h), 1 for everything else, including a
+ * fused SPILL2 (it covers 8 bytes of original code, but its consumed-byte count is
+ * reported by try_fuse_spill2's return value, separate from this). */
+static int op_words(uint8_t op) { return op == RISCV_OP_AUIPC_ABS ? 2 : 1; }
 
 /* ---- target set: addresses that must keep their own op slot ---- */
 
@@ -174,11 +171,62 @@ static uint32_t try_fuse_spill2(const uint8_t *code, uint32_t len, uint32_t off,
 
 /* Decode (or fuse) the unit starting at `off`; returns the byte width consumed and
  * fills *d. Shared by build_map and transcode_ex's emit pass so they make the
- * identical decision -- both are pure functions of (code, len, off, targets). */
-static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off, const Targets *targets, Dec *d) {
+ * identical decision -- both are pure functions of (code, len, off, at, targets).
+ *
+ * `at` is the op-word offset this unit will land at, tracked by the caller. Two
+ * independent reasons force an auipc to bake its target into a second word
+ * (RISCV_OP_AUIPC_ABS) instead of using the cheap 1-word cursor-based form:
+ *
+ *   1. DRIFT (at != off/4): some earlier SPILL2 fired, so op-index == pc/4 no
+ *      longer holds here -- the cursor-based runtime formula would use the wrong
+ *      pc. Baking off + uimm20<<12 (the TRUE pc this function has, not the
+ *      drifted cursor) fixes that.
+ *
+ *   2. OUT-OF-CODE TARGET (target >= len): the value is a pointer into rodata or
+ *      rwdata, not another instruction. Even with ZERO local drift, this is NOT
+ *      safe to leave as the raw real-ELF address: the image places rodata right
+ *      after the TRANSCODED code (n_ops*4 bytes), which generally differs from
+ *      the ORIGINAL code's byte length (`len`) once anything in the WHOLE
+ *      program has fused or expanded -- a global, whole-program delta that has
+ *      nothing to do with this auipc's own local drift. A data pointer baked (or
+ *      computed) in real-ELF coordinates would then be silently misinterpreted
+ *      as an image byte offset by mem_xlate. The caller (tctool.c) knows the
+ *      final delta only after this whole pass completes (n_ops isn't final until
+ *      then), so it corrects every such baked target in a cheap post-pass over
+ *      the finished op array -- see its comment. Baking unconditionally here
+ *      (rather than only on local drift) is what makes that post-pass possible:
+ *      a target that's still in cursor-based form can't be corrected after the
+ *      fact, since its value is never materialized until run time.
+ *
+ * A target inside the code window (target < len) needs neither: it's the rare
+ * auipc-as-an-indirect-jump-address idiom transcode.h documents as an accepted
+ * gap, unaffected by this change.
+ *
+ * Trigger 2 only fires for a target inside [len, rodata_end) -- transcode.h's
+ * TcExternalTargets.rodata_end, 0 from a bare transcode()/NULL ext call. An
+ * auipc's "target" here is just its own rounded (hi20) contribution, not
+ * necessarily anyone's real address -- some code uses auipc purely to
+ * construct an arbitrary 32-bit constant (the result is never used as a
+ * pointer at all), and an out-of-code-looking value from THAT usage is
+ * incidental, not a rodata reference. Baking it anyway is value-safe (cursor
+ * and baked forms compute the identical number when undrifted) but costs an
+ * extra op word purely for being miscategorized -- harmless in isolation,
+ * but ACT's I-jal-01 (a heavy auipc-as-constant user) depends on exact
+ * cursor positions for its own self-checks and broke when an unbounded
+ * `target >= len` triggered this on constants outside any real rodata
+ * window. Scoping to rodata_end keeps the fix to the case it was proven for. */
+static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off, uint32_t at,
+                      const Targets *targets, uint32_t rodata_end, Dec *d) {
     uint32_t fused = try_fuse_spill2(code, len, off, targets, d);
     if (fused) return fused;
     decode(code, off, d);
+    if (d->op == RISCV_OP_AUIPC) {
+        uint32_t target = off + (d->imm << 12);
+        if (at != off / 4 || (target >= len && target < rodata_end)) {
+            d->op = RISCV_OP_AUIPC_ABS;
+            d->target = target;
+        }
+    }
     return d->width;
 }
 
@@ -218,6 +266,8 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffff);
     } else if (op == RISCV_OP_LUI || op == RISCV_OP_AUIPC) {
         ops[at++] = w0 | rd << 21 | (d->imm & 0xfffff);            /* lui value / auipc upper */
+    } else if (op == RISCV_OP_AUIPC_ABS) {
+        ops[at++] = w0 | rd << 21; ops[at++] = d->target;          /* + baked absolute value */
     } else {                                                       /* nop / traps   */
         ops[at++] = w0;
     }
@@ -227,7 +277,8 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
 /* Pass 1: place every instruction's (or fused pair's) op-word offset in
  * map[orig_pc>>1], using the SAME step() decision pass 2 will make, and report the
  * total op count. */
-static void build_map(const uint8_t *code, uint32_t len, const Targets *targets, uint32_t *map, uint32_t *n_ops) {
+static void build_map(const uint8_t *code, uint32_t len, const Targets *targets, uint32_t rodata_end,
+                       uint32_t *map, uint32_t *n_ops) {
     size_t mapn = (size_t)(len >> 1) + 2;
     for (size_t i = 0; i < mapn; i++) map[i] = TC_SENTINEL;
     Dec d;
@@ -236,7 +287,7 @@ static void build_map(const uint8_t *code, uint32_t len, const Targets *targets,
         uint16_t lo = code[off] | code[off+1] << 8;
         uint32_t wd = ((lo & 3) == 3) ? 4 : 2;
         if (off + wd > len) break;
-        wd = step(code, len, off, targets, &d);
+        wd = step(code, len, off, at, targets, rodata_end, &d);
         map[off >> 1] = at;
         at += op_words(d.op);
         off += wd;
@@ -247,7 +298,7 @@ static void build_map(const uint8_t *code, uint32_t len, const Targets *targets,
 uint32_t *transcode_map_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ext, uint32_t *n_ops_out) {
     Targets targets = collect_targets(code, len, ext);
     uint32_t *map = malloc(((size_t)(len >> 1) + 2) * sizeof *map);
-    build_map(code, len, &targets, map, n_ops_out);
+    build_map(code, len, &targets, ext ? ext->rodata_end : 0, map, n_ops_out);
     targets_free(&targets);
     return map;
 }
@@ -258,9 +309,10 @@ uint32_t *transcode_map(const uint8_t *code, uint32_t len, uint32_t *n_ops_out) 
 
 void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ext, Transcoded *out) {
     Targets targets = collect_targets(code, len, ext);
+    uint32_t rodata_end = ext ? ext->rodata_end : 0;
     uint32_t n_ops;
     uint32_t *map = malloc(((size_t)(len >> 1) + 2) * sizeof *map);
-    build_map(code, len, &targets, map, &n_ops);
+    build_map(code, len, &targets, rodata_end, map, &n_ops);
     out->n_ops = n_ops;
     out->code_len = n_ops * 4;
     out->ops = malloc(((size_t)n_ops + 2) * sizeof *out->ops);
@@ -271,7 +323,7 @@ void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ex
         uint16_t lo = code[off] | code[off+1] << 8;
         uint32_t wd = ((lo & 3) == 3) ? 4 : 2;
         if (off + wd > len) break;
-        wd = step(code, len, off, &targets, &d);
+        wd = step(code, len, off, at, &targets, rodata_end, &d);
         at = emit(out->ops, at, &d, map, len);
         off += wd;
     }

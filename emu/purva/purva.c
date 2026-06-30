@@ -14,9 +14,23 @@
  * side map and no per-op pc bookkeeping.
  */
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "purva.h"   /* purv.h + transcode.h (the op vocabulary and field macros) */
+
+unsigned long g_s2count;   /* TEMP debug */
+int g_s2trace;             /* TEMP debug */
+int g_itrace;              /* TEMP debug: per-instruction register trace */
+unsigned long g_icount;    /* TEMP debug: running instruction counter for trace labels */
+uint32_t g_watch;          /* TEMP debug: store-address watchpoint, 0 = off */
+
+static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
+    fprintf(stderr, "I%lu op=%u@%u(pc=%u)", g_icount++, TC_OP(*p), (unsigned)(p - base), (unsigned)(p - base) * 4);
+    for (int i = 0; i < 32; i++) fprintf(stderr, " x%d=%x", i, s->x[i]);
+    fprintf(stderr, "\n");
+}
+#define TRACE_STEP() do { if (g_itrace) trace_dump(s, p, base); } while (0)
 
 static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i] = v; }
 
@@ -74,7 +88,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_JAL] = &&h_jal, [RISCV_OP_JALR] = &&h_jalr,
         [RISCV_OP_LUI] = &&h_lui, [RISCV_OP_AUIPC] = &&h_auipc, [RISCV_OP_NOP] = &&h_nop,
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
-        [RISCV_OP_SPILL2] = &&h_spill2,
+        [RISCV_OP_SPILL2] = &&h_spill2, [RISCV_OP_AUIPC_ABS] = &&h_auipc_abs,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -82,11 +96,12 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t a, b;
 
     /* Straight-line step: one op word forward (the cursor is the pc). */
-    #define NEXT() do { k++; w = *++p; goto *tbl[TC_OP(w)]; } while (0)
+    #define NEXT() do { k++; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
     /* Jump to op index `idx`: count it, budget-check (resume pc = idx<<2), relocate. */
     #define RELOC(idx) do { uint32_t i_ = (idx); k++; \
-        if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; goto *tbl[TC_OP(w)]; } while (0)
+        if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
 
+    TRACE_STEP();
     goto *tbl[TC_OP(w)];
 
     h_add:  wr(s, TC_A(w), s->x[TC_B(w)] + s->x[TC_C(w)]);                          NEXT();
@@ -153,6 +168,9 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); } else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
           NEXT();
     h_sw: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 4, 1);
+            extern uint32_t g_watch;
+            if (g_watch && ad == g_watch)
+                fprintf(stderr, "WATCH sw ad=0x%x val=0x%x at op-idx=%u (pc=%u)\n", ad, b, (unsigned)(p - base), (unsigned)(p - base) * 4);
             if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); q[2] = (uint8_t)(b >> 16); q[3] = (uint8_t)(b >> 24); }
             else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
           NEXT();
@@ -172,12 +190,16 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_spill2: {
         uint32_t base = s->x[TC_A(w)], v1 = s->x[TC_B(w)], v2 = s->x[TC_C(w)];
         uint32_t ad = base + (uint32_t)TC_OFF11(w);
+        extern unsigned long g_s2count; extern int g_s2trace;
+        g_s2count++;
+        if (g_s2trace) fprintf(stderr, "SPILL2#%lu baseR=%u base=0x%x off=%d v1R=%u v1=0x%x v2R=%u v2=0x%x ad=0x%x\n",
+            g_s2count, TC_A(w), base, TC_OFF11(w), TC_B(w), v1, TC_C(w), v2, ad);
         uint8_t *q1 = mem_xlate(s, ad, 4, 1);
         if (q1) st32(q1, v1); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, v1);
         uint8_t *q2 = mem_xlate(s, ad + 4, 4, 1);
         if (q2) st32(q2, v2); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad + 4, v2);
     }
-    k += 2; w = *++p; goto *tbl[TC_OP(w)];     /* one op word, but two real instructions */
+    k += 2; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];     /* one op word, but two real instructions */
 
     h_beq:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a == b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
     h_bne:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a != b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
@@ -190,10 +212,16 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
               RELOC(idx + (uint32_t)(TC_JOFF(w) >> 2)); }
     h_jalr: { uint32_t t = (s->x[TC_B(w)] + TC_IMM(w)) & ~1u; wr(s, TC_A(w), ((uint32_t)(p - base) << 2) + 4); k++;
               if (t >= clen || k >= max) { s->pc = t; return k; }
-              p = base + (t >> 2); w = *p; goto *tbl[TC_OP(w)]; }
+              p = base + (t >> 2); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; }
 
     h_lui:   wr(s, TC_A(w), TC_UIMM(w) << 12); NEXT();
+    /* Cursor-based: correct only when nothing before this op has fused (op-index ==
+     * pc/4 still holds). transcode_ex only emits this form when it verified that --
+     * see transcode.h's RISCV_OP_AUIPC_ABS note. */
     h_auipc: wr(s, TC_A(w), ((uint32_t)(p - base) << 2) + (TC_UIMM(w) << 12)); NEXT();
+    /* Drift has occurred upstream: the transcoder baked the real absolute value
+     * (computed from the TRUE pc, not a drifted cursor) into the next word. */
+    h_auipc_abs: wr(s, TC_A(w), p[1]); k++; p += 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     h_nop:   NEXT();
 
     h_trap: {
@@ -205,7 +233,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
                  :                           (s->illegal ? s->illegal(s) : 1);
         if (stop) return k;
         if (k >= max) { s->pc = pc_ + 4; return k; }          /* serviced syscall: resume */
-        w = *++p; goto *tbl[TC_OP(w)];
+        w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     }
     #undef NEXT
     #undef RELOC
