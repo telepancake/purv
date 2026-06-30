@@ -33,15 +33,19 @@
 
 /* ------------------------------------------------------------------ memory */
 
-/* Flat RAM, mapped as the engine's region 0 (RAM_ORIGIN..) for code + data +
- * heap, and a separate stack buffer mapped as the stack region. The stack grows
- * down and ends at the last address, so its bytes live at [STACK_MEM_BASE,
- * 0xFFFFFFFF] and the initial sp is 0 (== 2^32, one past the top). */
-#define PURV_RAM_DEFAULT (256u * 1024u * 1024u)
-#define STACK_BYTES    (16u * 1024u * 1024u)
-#define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* host base of the stack buffer */
-static uint8_t *g_ram;
-static uint32_t g_ram_size;
+/* Three host buffers map the engine's four regions:
+ *   g_code  -> code   [0, CODE_BYTES)            lower half: text + rodata (RO, fetched)
+ *   g_heap  -> heap   [RISCV_HALF, +heap_size)   upper half: data + bss + heap (RW)
+ *   g_stack -> stack  [STACK_MEM_BASE, 2^32)     upper half: the stack, grows down
+ * (The engine's separate `rodata` region is left unmapped here; a guest's .rodata
+ * rides in the code region.) sp starts at 0 (== 2^32, one past the stack top). */
+#define CODE_BYTES        (64u * 1024u * 1024u)
+#define PURV_HEAP_DEFAULT (256u * 1024u * 1024u)
+#define STACK_BYTES       (16u * 1024u * 1024u)
+#define STACK_MEM_BASE    ((uint32_t)(0u - STACK_BYTES))   /* host base of the stack buffer */
+static uint8_t *g_code;
+static uint8_t *g_heap;
+static uint32_t g_heap_size;
 static uint8_t *g_stack;
 
 /* Run/termination state shared with the handlers. */
@@ -57,9 +61,12 @@ static int      g_gdb_fd = -1;            /* --gdb=FD: serve gdb on this connect
 static int      g_have_tohost, g_have_sig;
 static uint32_t g_tohost, g_begin_sig, g_end_sig;
 
-static int in_ram(uint32_t addr, uint32_t len) {
-    return addr >= RAM_ORIGIN &&
-           (uint64_t)addr + len <= (uint64_t)RAM_ORIGIN + g_ram_size;
+/* Is [addr,addr+len) inside the code (lower half) or heap (upper half) buffer? */
+static int in_code(uint32_t addr, uint32_t len) {
+    return addr < RISCV_HALF && (uint64_t)addr + len <= CODE_BYTES;
+}
+static int in_heap(uint32_t addr, uint32_t len) {
+    return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_size;
 }
 
 /* ------------------------------------------------ trap handlers (assigned to the state) */
@@ -74,29 +81,40 @@ static int on_illegal(RiscvEmulatorState_t *state) {
     return 1;
 }
 
-static int on_overflow(RiscvEmulatorState_t *state) {
-    /* The guest ran off the end of its stack: report and stop. */
-    fprintf(stderr, "purv: stack overflow at pc=0x%08x (sp=0x%08x)\n",
-            state->pc, state->x[2]);
-    g_halt = 1;
-    g_exit = 1;
-    return 1;
+/* Out-of-bounds / read-only data access: report the first one and halt (the
+ * engine can't stop mid-instruction, so the run loop notices g_halt next slice).
+ * Conformance/invoke paths never trip this; it is a userspace segfault. */
+static int g_faulted;
+static uint32_t on_oob(RiscvEmulatorState_t *state, int op, uint32_t addr, uint32_t value) {
+    (void)value;
+    if (!g_faulted) {
+        fprintf(stderr, "purv: %s fault at addr=0x%08x pc=0x%08x\n",
+                op == RISCV_MEM_STORE ? "store" : "load", addr, state->pc);
+        g_faulted = 1; g_halt = 1; g_exit = 1;
+    }
+    return 0;
 }
 
 /* User-mode syscall emulation (Linux/RISC-V ABI subset): a7=number, a0..a5=args,
  * result in a0. Only what single-threaded console programs need; everything else
  * returns -ENOSYS. Enabled by --user; without it an ecall is a nop and execution
  * continues (the signature-dump suites halt via the tohost word we poll). */
-/* Read a guest byte through the region map -- the write buffer may be anywhere
- * (often the stack, which is its own region), not just region 0. */
+/* Read a guest byte through the region map -- the write buffer may live in any of
+ * the four regions (text/rodata, heap, or the stack). Mirrors the engine's
+ * address routing: the half decides which two regions to try. */
 static uint8_t guest_byte(const RiscvEmulatorState_t *st, uint32_t a) {
-    if (a >= RISCV_STACK_BASE) {                  /* the stack (top region) */
-        uint32_t base = (uint32_t)(0u - st->stack.len);
-        return (st->stack.ptr && a >= base) ? st->stack.ptr[a - base] : 0;
+    const RiscvEmulatorRegion_t *r; uint32_t off;
+    if (a & RISCV_HALF) {                              /* upper half: heap, then stack */
+        if (a - RISCV_HALF < st->heap.len)            { r = &st->heap;  off = a - RISCV_HALF; }
+        else { uint32_t sb = (uint32_t)(0u - st->stack.len);
+               if (a >= sb)                            { r = &st->stack; off = a - sb; }
+               else return 0; }
+    } else {                                          /* lower half: code, then rodata */
+        if (a < st->code.len)                          { r = &st->code;  off = a; }
+        else { uint32_t rb = RISCV_HALF - st->rodata.len;
+               if (st->rodata.len && a >= rb)          { r = &st->rodata; off = a - rb; }
+               else return 0; }
     }
-    if (a < RAM_ORIGIN) return 0;
-    const RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
-    uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
     return (r->ptr && off < r->len) ? r->ptr[off] : 0;
 }
 
@@ -122,7 +140,7 @@ static int on_ecall(RiscvEmulatorState_t *state) {
         ret = 0;
         break;
     case 214:                             /* brk(addr): grow/query the heap */
-        if (a0 >= g_brk && a0 < RAM_ORIGIN + g_ram_size) g_brk = a0;
+        if (a0 >= g_brk && a0 < RISCV_HALF + g_heap_size) g_brk = a0;
         ret = g_brk;
         break;
     default:
@@ -184,14 +202,26 @@ static uint32_t load_elf(const char *path) {
         Phdr32 ph;
         memcpy(&ph, g_elf + eh.e_phoff + (long)i * eh.e_phentsize, sizeof ph);
         if (ph.p_type != PT_LOAD || ph.p_memsz == 0) continue;
-        if (!in_ram(ph.p_paddr, ph.p_memsz)) {
-            fprintf(stderr, "purv: segment paddr=0x%08x size=0x%x outside RAM\n",
-                    ph.p_paddr, ph.p_memsz); exit(2);
+        /* lower-half segments (text/rodata) load into the code buffer at their
+         * vaddr; upper-half segments (data/bss) into the heap buffer. */
+        uint8_t *dst; uint32_t base;
+        if (ph.p_vaddr < RISCV_HALF) {
+            if (!in_code(ph.p_vaddr, ph.p_memsz)) {
+                fprintf(stderr, "purv: code segment vaddr=0x%08x size=0x%x too big\n",
+                        ph.p_vaddr, ph.p_memsz); exit(2);
+            }
+            dst = g_code; base = 0;
+        } else {
+            if (!in_heap(ph.p_vaddr, ph.p_memsz)) {
+                fprintf(stderr, "purv: data segment vaddr=0x%08x size=0x%x outside heap\n",
+                        ph.p_vaddr, ph.p_memsz); exit(2);
+            }
+            dst = g_heap; base = RISCV_HALF;
+            uint32_t end = ph.p_vaddr + ph.p_memsz;
+            if (end > g_brk) g_brk = (end + 0xFFF) & ~0xFFFu;   /* heap starts past the data */
         }
         if (ph.p_filesz)
-            memcpy(&g_ram[ph.p_paddr - RAM_ORIGIN], g_elf + ph.p_offset, ph.p_filesz);
-        uint32_t end = ph.p_paddr + ph.p_memsz;
-        if (end > g_brk) g_brk = (end + 0xFFF) & ~0xFFFu;   /* heap starts past the image */
+            memcpy(&dst[ph.p_vaddr - base], g_elf + ph.p_offset, ph.p_filesz);
     }
     return eh.e_entry;
 }
@@ -232,7 +262,7 @@ static void dump_signature(const char *path, uint32_t gran) {
         for (uint32_t b = gran; b-- > 0; ) {
             uint8_t byte = 0;
             uint32_t addr = a + b;
-            if (in_ram(addr, 1)) byte = g_ram[addr - RAM_ORIGIN];
+            if (in_heap(addr, 1)) byte = g_heap[addr - RISCV_HALF];
             fprintf(f, "%02x", byte);
         }
         fputc('\n', f);
@@ -289,7 +319,7 @@ static void usage(const char *argv0) {
         "  --gdb=FD                      serve gdb on connected fd FD (no listening;\n"
         "                                a launcher supplies the socket)\n"
 #endif
-        "  --ram=BYTES                   RAM size (default 256 MiB)\n"
+        "  --ram=BYTES                   heap size at 0x80000000 (default 256 MiB)\n"
         "  --max-insns=N                 instruction cap (default 256M)\n",
         argv0);
 }
@@ -300,7 +330,7 @@ int main(int argc, char **argv) {
     uint64_t max_insns = 256ull * 1024 * 1024;
     uint32_t args[8]; int nargs = 0;
     char *gargv[64]; int gargc = 0;       /* program argv (argv[0]=elf, then extras) */
-    g_ram_size = PURV_RAM_DEFAULT;
+    g_heap_size = PURV_HEAP_DEFAULT;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -315,7 +345,7 @@ int main(int argc, char **argv) {
 #ifdef PURV_GDBSTUB
         else if (!strncmp(a, "--gdb=", 6)) g_gdb_fd = (int)strtol(a + 6, 0, 0);
 #endif
-        else if (!strncmp(a, "--ram=", 6)) g_ram_size = (uint32_t)strtoul(a + 6, 0, 0);
+        else if (!strncmp(a, "--ram=", 6)) g_heap_size = (uint32_t)strtoul(a + 6, 0, 0);
         else if (!strncmp(a, "--max-insns=", 12)) max_insns = strtoull(a + 12, 0, 0);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else if (a[0] == '-') { fprintf(stderr, "purv: unknown option %s\n", a); return 2; }
@@ -324,26 +354,28 @@ int main(int argc, char **argv) {
     if (gargc) elf = gargv[0];
     if (!elf) { usage(argv[0]); return 2; }
 
-    g_ram = calloc(1, g_ram_size);
+    g_code  = calloc(1, CODE_BYTES);
+    g_heap  = calloc(1, g_heap_size);
     g_stack = calloc(1, STACK_BYTES);
-    if (!g_ram || !g_stack) { fprintf(stderr, "purv: cannot allocate RAM\n"); return 2; }
+    if (!g_code || !g_heap || !g_stack) { fprintf(stderr, "purv: cannot allocate RAM\n"); return 2; }
 
     uint32_t entry = load_elf(elf);
 
-    /* code (fetch) and region 0 (data) both view the flat RAM at RAM_ORIGIN
-     * (von Neumann); the stack is its own buffer in the top region. Init wires
-     * up code + stack + sp; we add region 0 and the handlers. */
-    uint32_t code_len = g_ram_size < RISCV_REGION_SIZE ? g_ram_size : RISCV_REGION_SIZE;
-    RiscvEmulatorRegion_t code  = { g_ram, code_len, 1 };
-    RiscvEmulatorRegion_t stack = { g_stack, STACK_BYTES, 1 };
+    /* Map the host buffers into the engine's regions: code (text+rodata) at 0,
+     * heap (data+bss+heap) at RISCV_HALF, stack at the top. rodata is unmapped
+     * (the guest's .rodata rides in the code region). Init wires the regions, sp,
+     * pc, and the default callback; we install the host handlers. */
+    RiscvEmulatorRegion_t code   = { g_code,  CODE_BYTES };
+    RiscvEmulatorRegion_t rodata = { 0, 0 };
+    RiscvEmulatorRegion_t heap   = { g_heap,  g_heap_size };
+    RiscvEmulatorRegion_t stack  = { g_stack, STACK_BYTES };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, code, stack);
+    RiscvEmulatorInit(&state, code, rodata, heap, stack);
     RiscvEmulatorState_t *st = &state;
-    st->mem[0] = code;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
-    st->overflow = on_overflow;
+    st->callback = on_oob;
 
     uint32_t start = entry;
     if (invoke) {
@@ -389,13 +421,13 @@ int main(int argc, char **argv) {
         if (g_halt) break;
         if (g_have_tohost) {                      /* HTIF tohost: a nonzero write ends the run */
             uint32_t v = 0;
-            if (in_ram(g_tohost, 4)) memcpy(&v, &g_ram[g_tohost - RAM_ORIGIN], 4);
+            if (in_heap(g_tohost, 4)) memcpy(&v, &g_heap[g_tohost - RISCV_HALF], 4);
             if (v) { g_exit = (v == 1) ? 0 : 1; g_halt = 1; break; }  /* 1 -> PASS */
         }
         if (ran < budget) {                      /* pc left the mapped code */
             uint32_t pc = st->pc;
             if (invoke && pc == MAGIC_RET) break;   /* invoked function returned */
-            fprintf(stderr, "purv: fetch outside RAM at pc=0x%08x\n", pc);
+            fprintf(stderr, "purv: fetch outside code at pc=0x%08x\n", pc);
             g_halt = 1; g_exit = 1;
             break;
         }

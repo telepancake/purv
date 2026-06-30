@@ -39,14 +39,29 @@
 #define RAM_BYTES   (256u * 1024 * 1024)
 #define STACK_BYTES (16u * 1024 * 1024)
 #define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* stack ends at the last address */
-static uint8_t *g_ram;                    /* code + data + heap (region 0) */
-#ifndef PURV_TAGGED
-static uint8_t *g_stack;                  /* stack (top region); purvs keeps its stack in region 0 */
-#endif
-
+#ifdef PURV_TAGGED
+/* purvs (old engine): one RAM region at RAM_ORIGIN holds code + data + heap. */
+static uint8_t *g_ram;
+#define g_arena    g_ram
+#define ARENA_BASE RAM_ORIGIN
 static int in_ram(uint32_t a, uint32_t n) {
     return a >= RAM_ORIGIN && (uint64_t)a + n <= (uint64_t)RAM_ORIGIN + RAM_BYTES;
 }
+#else
+/* purv (four-region engine): code (text+rodata) in the read-only lower half at 0;
+ * heap (data+bss+malloc) in the read/write upper half at RISCV_HALF; stack at the
+ * top. The K&R allocator's arena lives in the heap region. */
+#define CODE_BYTES (64u * 1024 * 1024)
+static uint8_t *g_code, *g_heap, *g_stack;
+#define g_arena    g_heap
+#define ARENA_BASE RISCV_HALF
+static int in_code(uint32_t a, uint32_t n) {
+    return a < RISCV_HALF && (uint64_t)a + n <= CODE_BYTES;
+}
+static int in_heap(uint32_t a, uint32_t n) {
+    return a >= RISCV_HALF && (uint64_t)a + n <= (uint64_t)RISCV_HALF + RAM_BYTES;
+}
+#endif
 
 /* ----------------------------------------------- run state and the ecall flag */
 
@@ -64,10 +79,10 @@ static int      g_ecall_pending;      /* purvs: raised by the ECALL hook, servic
 #define HUNIT 8u                              /* bytes per header and allocation unit */
 static uint32_t heap_brk, heap_top, freep, basep;
 
-static uint32_t hnext(uint32_t a)            { uint32_t v; memcpy(&v, &g_ram[a - RAM_ORIGIN], 4); return v; }
-static uint32_t hsz(uint32_t a)              { uint32_t v; memcpy(&v, &g_ram[a - RAM_ORIGIN + 4], 4); return v; }
-static void set_hnext(uint32_t a, uint32_t v){ memcpy(&g_ram[a - RAM_ORIGIN], &v, 4); }
-static void set_hsz(uint32_t a, uint32_t v)  { memcpy(&g_ram[a - RAM_ORIGIN + 4], &v, 4); }
+static uint32_t hnext(uint32_t a)            { uint32_t v; memcpy(&v, &g_arena[a - ARENA_BASE], 4); return v; }
+static uint32_t hsz(uint32_t a)              { uint32_t v; memcpy(&v, &g_arena[a - ARENA_BASE + 4], 4); return v; }
+static void set_hnext(uint32_t a, uint32_t v){ memcpy(&g_arena[a - ARENA_BASE], &v, 4); }
+static void set_hsz(uint32_t a, uint32_t v)  { memcpy(&g_arena[a - ARENA_BASE + 4], &v, 4); }
 
 static void host_free(uint32_t ap);
 
@@ -117,7 +132,7 @@ static uint32_t host_realloc(uint32_t ap, uint32_t n) {
     if (oldbytes >= n) return ap;
     uint32_t np = host_malloc(n);
     if (!np) return 0;
-    memmove(&g_ram[np - RAM_ORIGIN], &g_ram[ap - RAM_ORIGIN], oldbytes < n ? oldbytes : n);
+    memmove(&g_arena[np - ARENA_BASE], &g_arena[ap - ARENA_BASE], oldbytes < n ? oldbytes : n);
     host_free(ap);
     return np;
 }
@@ -173,10 +188,11 @@ static int on_illegal(RiscvEmulatorState_t *st) {
             st->inst, st->pc);
     g_halt = 1; g_exit = 1; return 1;
 }
-static int on_overflow(RiscvEmulatorState_t *st) {
-    fprintf(stderr, "purv-sqlite: stack overflow at pc=0x%08x (sp=0x%08x)\n",
-            st->pc, st->x[2]);
-    g_halt = 1; g_exit = 1; return 1;
+static uint32_t on_oob(RiscvEmulatorState_t *st, int op, uint32_t addr, uint32_t value) {
+    (void)value;
+    fprintf(stderr, "purv-sqlite: %s fault at addr=0x%08x pc=0x%08x\n",
+            op == RISCV_MEM_STORE ? "store" : "load", addr, st->pc);
+    g_halt = 1; g_exit = 1; return 0;
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 static int on_ecall(RiscvEmulatorState_t *st) { service_hostcall(st); return g_halt; }
@@ -206,13 +222,18 @@ static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
 }
 #else
 static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    if (a >= RISCV_STACK_BASE) {                  /* the stack (top region) */
-        uint32_t base = (uint32_t)(0u - s->stack.len);
-        return (s->stack.ptr && a >= base) ? s->stack.ptr[a - base] : 0;
+    const RiscvEmulatorRegion_t *r; uint32_t off;
+    if (a & RISCV_HALF) {                              /* upper half: heap, then stack */
+        if (a - RISCV_HALF < s->heap.len)             { r = &s->heap;  off = a - RISCV_HALF; }
+        else { uint32_t sb = (uint32_t)(0u - s->stack.len);
+               if (a >= sb)                            { r = &s->stack; off = a - sb; }
+               else return 0; }
+    } else {                                          /* lower half: code, then rodata */
+        if (a < s->code.len)                           { r = &s->code;  off = a; }
+        else { uint32_t rb = RISCV_HALF - s->rodata.len;
+               if (s->rodata.len && a >= rb)           { r = &s->rodata; off = a - rb; }
+               else return 0; }
     }
-    if (a < RAM_ORIGIN) return 0;
-    const RiscvEmulatorRegion_t *r = &s->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
-    uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
     return (r->ptr && off < r->len) ? r->ptr[off] : 0;
 }
 #endif
@@ -287,9 +308,22 @@ static uint32_t load_elf(const char *path) {
     for (int i = 0; i < eh.e_phnum; i++) {
         Phdr32 ph; memcpy(&ph, buf + eh.e_phoff + (long)i * eh.e_phentsize, sizeof ph);
         if (ph.p_type != PT_LOAD || ph.p_memsz == 0) continue;
+#ifdef PURV_TAGGED
         if (!in_ram(ph.p_paddr, ph.p_memsz)) { fprintf(stderr, "segment outside RAM\n"); exit(2); }
         if (ph.p_filesz) memcpy(&g_ram[ph.p_paddr - RAM_ORIGIN], buf + ph.p_offset, ph.p_filesz);
         if (ph.p_paddr + ph.p_memsz > g_image_end) g_image_end = ph.p_paddr + ph.p_memsz;
+#else
+        /* lower-half segments (text/rodata) -> code buffer; upper-half (data/bss)
+         * -> heap buffer. The heap allocator starts past the loaded data. */
+        if (ph.p_vaddr < RISCV_HALF) {
+            if (!in_code(ph.p_vaddr, ph.p_memsz)) { fprintf(stderr, "code segment too big\n"); exit(2); }
+            if (ph.p_filesz) memcpy(&g_code[ph.p_vaddr], buf + ph.p_offset, ph.p_filesz);
+        } else {
+            if (!in_heap(ph.p_vaddr, ph.p_memsz)) { fprintf(stderr, "data segment outside heap\n"); exit(2); }
+            if (ph.p_filesz) memcpy(&g_heap[ph.p_vaddr - RISCV_HALF], buf + ph.p_offset, ph.p_filesz);
+            if (ph.p_vaddr + ph.p_memsz > g_image_end) g_image_end = ph.p_vaddr + ph.p_memsz;
+        }
+#endif
     }
     free(buf);
     return eh.e_entry;
@@ -306,34 +340,39 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--stats")) stats = 1;
     }
 
+#ifdef PURV_TAGGED
     g_ram = calloc(1, RAM_BYTES);
     if (!g_ram) { fprintf(stderr, "OOM\n"); return 2; }
-
     uint32_t entry = load_elf(argv[1]);
     uint32_t heap_base = (g_image_end + 15u) & ~15u;   /* heap: just past the image */
-
-#ifdef PURV_TAGGED
     /* purvs keeps its stack at the top of region 0, so reserve it from the heap. */
     heap_init(heap_base, RAM_ORIGIN + RAM_BYTES - 16u * 1024 * 1024);
     RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
     rset(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of region 0 */
 #else
-    /* purv: the stack is its own (top) region, so the heap uses all of region 0.
-     * Init wires code + stack + sp; we add region 0 and the handlers. */
+    /* purv: code (text+rodata) is the read-only lower half at 0; the heap holds the
+     * guest's data+bss and the malloc arena (just past the data); the stack is the
+     * top region. Init wires the four regions, sp, pc, and the default callback. */
+    g_code  = calloc(1, CODE_BYTES);
+    g_heap  = calloc(1, RAM_BYTES);
     g_stack = calloc(1, STACK_BYTES);
-    if (!g_stack) { fprintf(stderr, "OOM\n"); return 2; }
-    heap_init(heap_base, RAM_ORIGIN + RAM_BYTES);
-    RiscvEmulatorRegion_t code  = { g_ram, RAM_BYTES, 1 };
-    RiscvEmulatorRegion_t stack = { g_stack, STACK_BYTES, 1 };
+    if (!g_code || !g_heap || !g_stack) { fprintf(stderr, "OOM\n"); return 2; }
+    uint32_t entry = load_elf(argv[1]);
+    uint32_t heap_base = (g_image_end + 15u) & ~15u;   /* malloc arena: past the data */
+    if (heap_base < RISCV_HALF) heap_base = RISCV_HALF;
+    heap_init(heap_base, RISCV_HALF + RAM_BYTES);
+    RiscvEmulatorRegion_t code   = { g_code,  CODE_BYTES };
+    RiscvEmulatorRegion_t rodata = { 0, 0 };
+    RiscvEmulatorRegion_t heap   = { g_heap,  RAM_BYTES };
+    RiscvEmulatorRegion_t stack  = { g_stack, STACK_BYTES };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, code, stack);   /* sp = 0 (top of the stack region) */
+    RiscvEmulatorInit(&state, code, rodata, heap, stack);
     RiscvEmulatorState_t *st = &state;
-    st->mem[0] = code;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
-    st->overflow = on_overflow;
+    st->callback = on_oob;
 #endif
     spc(st, entry);
 

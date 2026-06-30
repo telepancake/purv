@@ -6,7 +6,7 @@
  * (exit, write, malloc, free). The ecall hook just raises a flag; the run loop
  * services the call -- the engine has no syscall ABI baked in.
  *
- *   usage: host <flat-image>      (loaded at RAM_ORIGIN, entry there)
+ *   usage: host <flat-image>      (loaded at 0 in the code region, entry there)
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -18,32 +18,36 @@
 #include "../purv.h"
 #include "hostcalls.h"
 
-#define RAM_BYTES      (64u * 1024 * 1024)
+/* Four engine regions, three host buffers: g_code holds the flat image (text +
+ * rodata, read-only lower half at 0, fetched); g_heap is the malloc arena (upper
+ * half at RISCV_HALF); g_stack is the stack (top, grows down). */
+#define CODE_BYTES     (16u * 1024 * 1024)
+#define HEAP_BYTES     (48u * 1024 * 1024)
 #define STACK_BYTES    (4u * 1024 * 1024)
 #define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* stack ends at the last address */
-static uint8_t *g_ram;                   /* code + data + heap (region 0) */
-static uint8_t *g_stack;                 /* stack (top region, grows down) */
+static uint8_t *g_code;                  /* flat image: [0, CODE_BYTES) */
+static uint8_t *g_heap;                  /* malloc arena: [RISCV_HALF, +HEAP_BYTES) */
+static uint8_t *g_stack;                 /* stack (grows down) */
 
-static int in_ram(uint32_t a, uint32_t n) {
-    return a >= RAM_ORIGIN && (uint64_t)a + n <= (uint64_t)RAM_ORIGIN + RAM_BYTES;
-}
-/* Read a guest byte through the region map (region 0 RAM or the stack region). */
+static int in_code(uint32_t n) { return (uint64_t)n <= CODE_BYTES; }
+/* Read a guest byte through the region map (flat image, heap, or stack). */
 static uint8_t guest_byte(uint32_t a) {
-    if (a >= STACK_MEM_BASE) return g_stack[a - STACK_MEM_BASE];   /* the stack */
-    if (a >= RAM_ORIGIN && a < RAM_ORIGIN + RAM_BYTES) return g_ram[a - RAM_ORIGIN];
-    return 0;
+    if (a >= STACK_MEM_BASE) return g_stack[a - STACK_MEM_BASE];           /* the stack */
+    if (a >= RISCV_HALF) return (a - RISCV_HALF < HEAP_BYTES) ? g_heap[a - RISCV_HALF] : 0;
+    return (a < CODE_BYTES) ? g_code[a] : 0;                               /* code/rodata */
 }
 
 static int      g_halt, g_exit;
 static uint32_t g_image_end;
 
-/* ---- tiny heap over guest RAM: K&R allocator with guest-address "pointers" --- */
+/* ---- tiny heap over the guest heap region: K&R allocator with guest-address
+ * "pointers" (all in [RISCV_HALF, RISCV_HALF+HEAP_BYTES), the read/write half) --- */
 #define HUNIT 8u
 static uint32_t heap_brk, heap_top, freep, basep;
-static uint32_t hnext(uint32_t a)             { uint32_t v; memcpy(&v, &g_ram[a - RAM_ORIGIN], 4); return v; }
-static uint32_t hsz(uint32_t a)               { uint32_t v; memcpy(&v, &g_ram[a - RAM_ORIGIN + 4], 4); return v; }
-static void     set_hnext(uint32_t a, uint32_t v) { memcpy(&g_ram[a - RAM_ORIGIN], &v, 4); }
-static void     set_hsz(uint32_t a, uint32_t v)   { memcpy(&g_ram[a - RAM_ORIGIN + 4], &v, 4); }
+static uint32_t hnext(uint32_t a)             { uint32_t v; memcpy(&v, &g_heap[a - RISCV_HALF], 4); return v; }
+static uint32_t hsz(uint32_t a)               { uint32_t v; memcpy(&v, &g_heap[a - RISCV_HALF + 4], 4); return v; }
+static void     set_hnext(uint32_t a, uint32_t v) { memcpy(&g_heap[a - RISCV_HALF], &v, 4); }
+static void     set_hsz(uint32_t a, uint32_t v)   { memcpy(&g_heap[a - RISCV_HALF + 4], &v, 4); }
 static void heap_init(uint32_t base, uint32_t top) {
     basep = base; set_hnext(basep, basep); set_hsz(basep, 0);
     freep = basep; heap_brk = base + HUNIT; heap_top = top;
@@ -88,10 +92,11 @@ static int on_illegal(RiscvEmulatorState_t *st) {
             st->inst, st->pc);
     g_halt = 1; g_exit = 1; return 1;
 }
-static int on_overflow(RiscvEmulatorState_t *st) {
-    fprintf(stderr, "compact: stack overflow at pc=0x%08x (sp=0x%08x)\n",
-            st->pc, st->x[2]);
-    g_halt = 1; g_exit = 1; return 1;
+static uint32_t on_oob(RiscvEmulatorState_t *st, int op, uint32_t addr, uint32_t value) {
+    (void)value;
+    fprintf(stderr, "compact: %s fault at addr=0x%08x pc=0x%08x\n",
+            op == RISCV_MEM_STORE ? "store" : "load", addr, st->pc);
+    g_halt = 1; g_exit = 1; return 0;
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 /* Service the host call in place and continue unless it halted (exit). */
@@ -125,37 +130,40 @@ static uint32_t load_flat(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "compact: cannot open %s: %s\n", path, strerror(errno)); exit(2); }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    if (n <= 0 || !in_ram(RAM_ORIGIN, (uint32_t)n)) { fprintf(stderr, "compact: bad image\n"); exit(2); }
-    if (fread(&g_ram[0], 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "compact: read failed\n"); exit(2); }
+    if (n <= 0 || !in_code((uint32_t)n)) { fprintf(stderr, "compact: bad image\n"); exit(2); }
+    if (fread(&g_code[0], 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "compact: read failed\n"); exit(2); }
     fclose(f);
-    g_image_end = RAM_ORIGIN + (uint32_t)n;
-    return RAM_ORIGIN;                      /* flat: load at RAM_ORIGIN, entry there */
+    g_image_end = (uint32_t)n;
+    return 0;                               /* flat: load at 0 (code region), entry there */
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <flat-image>\n", argv[0]); return 2; }
-    g_ram = calloc(1, RAM_BYTES);
+    g_code  = calloc(1, CODE_BYTES);
+    g_heap  = calloc(1, HEAP_BYTES);
     g_stack = calloc(1, STACK_BYTES);
-    if (!g_ram || !g_stack) { fprintf(stderr, "compact: OOM\n"); return 2; }
+    if (!g_code || !g_heap || !g_stack) { fprintf(stderr, "compact: OOM\n"); return 2; }
 
     uint32_t entry = load_flat(argv[1]);
-    heap_init((g_image_end + 15u) & ~15u, RAM_ORIGIN + RAM_BYTES);   /* heap uses all of region 0 */
+    heap_init(RISCV_HALF, RISCV_HALF + HEAP_BYTES);   /* malloc arena = all of the heap region */
 
-    /* code (fetch) and region 0 (data) both view the flat image; stack is its
-     * own region. Init wires code + stack + sp; we add region 0 and handlers. */
-    RiscvEmulatorRegion_t code  = { g_ram, RAM_BYTES, 1 };
-    RiscvEmulatorRegion_t stack = { g_stack, STACK_BYTES, 1 };
+    /* code (text+rodata) is the read-only lower half (fetched + read); the heap
+     * and stack are the read/write upper half. Init wires the four regions, sp,
+     * pc, and the default callback; we install the host handlers (rodata unused). */
+    RiscvEmulatorRegion_t code   = { g_code,  CODE_BYTES };
+    RiscvEmulatorRegion_t rodata = { 0, 0 };
+    RiscvEmulatorRegion_t heap   = { g_heap,  HEAP_BYTES };
+    RiscvEmulatorRegion_t stack  = { g_stack, STACK_BYTES };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, code, stack);
+    RiscvEmulatorInit(&state, code, rodata, heap, stack);
     RiscvEmulatorState_t *st = &state;
-    st->mem[0] = code;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
-    st->overflow = on_overflow;
+    st->callback = on_oob;
     st->pc = entry;
 
-    /* pc lives in the state; run in slices off the flat RAM image. */
+    /* pc lives in the state; run in slices off the flat code image. */
     const uint64_t CAP = 1000ull * 1000 * 1000, SLICE = 1u << 16;
     uint64_t i = 0;
     while (i < CAP && !g_halt) {
@@ -164,8 +172,8 @@ int main(int argc, char **argv) {
         uint64_t ran = RiscvEmulatorLoop(st, budget);
         i += ran;
         if (g_halt) break;
-        if (ran < budget) {                  /* pc left RAM: stray fetch */
-            fprintf(stderr, "compact: fetch outside RAM at pc=0x%08x\n", st->pc);
+        if (ran < budget) {                  /* pc left the code region: stray fetch */
+            fprintf(stderr, "compact: fetch outside code at pc=0x%08x\n", st->pc);
             g_halt = 1; g_exit = 1; break;
         }
     }

@@ -25,8 +25,11 @@ GUEST_ARCH   ?= --target=riscv32 -march=rv32imc -mabi=ilp32
 GUEST_CFLAGS ?= -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
                 -O2 -Wall -Wextra -Werror -Wpedantic
 # Named RVLD (not LD) so an inherited `LD=ld` in the environment can't shadow it.
+# The guest layout (code in the lower half at 0, writable data in the upper half
+# at 0x80000000) is set by examples/purv.ld; the entry is set per-rule.
 RVLD     := ld.lld
-LDFLAGS  ?= -m elf32lriscv --image-base=0x80000000
+GUEST_LD := examples/purv.ld
+LDFLAGS  ?= -m elf32lriscv -T $(GUEST_LD)
 
 ATOOM_INC ?= ../third_party/atoomnetmarc-rv/include
 OUTDIR    ?= .
@@ -74,18 +77,18 @@ GDB_DEF := $(if $(filter 1,$(GDB)),-DPURV_GDBSTUB)
 purv: purv.c main.c purv.h $(GDB_SRC) $(if $(GDB_SRC),gdbstub.h)
 	$(CC) $(CFLAGS) $(GDB_DEF) purv.c main.c $(GDB_SRC) -o $@
 
-# Build any guest .c/.S into an ELF loadable at RAM_ORIGIN (0x80000000).
-# .c is library-style (called via --invoke, so no entry needed); .S is a full
-# program with _start, run to halt.
-%.elf: %.c
+# Build any guest .c/.S into an ELF: code in the lower half at 0, data in the
+# upper half at 0x80000000 (see examples/purv.ld). .c is library-style (called via
+# --invoke, entry at 0); .S is a full program with _start, run to halt.
+%.elf: %.c $(GUEST_LD)
 	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o $<.o
 	$(RVLD) $(LDFLAGS) --entry=0 $<.o -o $@
-%.elf: %.S
+%.elf: %.S $(GUEST_LD)
 	$(GUESTCC) $(GUEST_ARCH) -c $< -o $<.o
 	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
 
 # Userspace programs: need _start as the ELF entry (--user runs from e_entry).
-examples/hello.elf examples/args.elf examples/loop.elf: %.elf: %.c
+examples/hello.elf examples/args.elf examples/loop.elf: %.elf: %.c $(GUEST_LD)
 	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o $<.o
 	$(RVLD) $(LDFLAGS) -e _start $<.o -o $@
 

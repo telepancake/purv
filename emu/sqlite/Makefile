@@ -35,7 +35,7 @@ SQOPTS  := -DSQLITE_OS_OTHER=1 $(COMMON)
 GUEST   := clang --target=riscv32 -march=rv32imc -mabi=ilp32 -mcmodel=medany \
            -ffreestanding -nostdlib -O2 -ffunction-sections -fdata-sections \
            -nostdinc -isystem $(RES) -Iinclude -I$(SQLDIR)
-RVLD    := ld.lld -m elf32lriscv --image-base=0x80000000 -e _start --gc-sections
+RVLD    := ld.lld -m elf32lriscv -T purv.ld -e _start --gc-sections
 
 HOSTCC    ?= gcc
 # -g: keep debug line info (does not change -O2 codegen) so a profiler
@@ -80,10 +80,10 @@ sqlite3.o: $(AMALG)
 	  -Wno-constant-conversion -Wno-atomic-alignment -c $< -o $@
 
 # --- links ------------------------------------------------------------------
-guest.elf: rt.o builtins.o vfs.o guest.o sqlite3.o
-	$(RVLD) $^ -o $@
-guest-bench.elf: rt.o builtins.o vfs.o bench.o sqlite3.o
-	$(RVLD) $^ -o $@
+guest.elf: rt.o builtins.o vfs.o guest.o sqlite3.o purv.ld
+	$(RVLD) $(filter %.o,$^) -o $@
+guest-bench.elf: rt.o builtins.o vfs.o bench.o sqlite3.o purv.ld
+	$(RVLD) $(filter %.o,$^) -o $@
 
 # --- host (depends only on the purv engine) ---------------------------------
 host: host.c ../purv.c ../purv.h hostcalls.h

@@ -4,7 +4,7 @@
  * Built only when PURV_GDBSTUB is defined. It serves the RSP on a connected fd
  * handed in by a launcher (no listening here) and drives the engine through the
  * public purv.h surface: registers, PC, and memory through the state struct's
- * fields (state->mem[] for guest memory), execution one instruction at a time
+ * fields (the four regions for guest memory), execution one instruction at a time
  * via RiscvEmulatorLoop. Software breakpoints are tracked here (gdb's Z0/z0)
  * rather than by patching guest code. A target description is served so a stock
  * riscv:rv32 gdb knows the 33-register layout (x0..x31, pc) without extra setup.
@@ -150,35 +150,37 @@ static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
     else if (i)  st->x[i] = v;              /* x0 stays zero */
 }
 
-/* Guest memory by walking the state's regions (the public struct exposes them):
- * the data regions (st->mem[], based at RAM_ORIGIN) and the stack (st->stack,
- * the top region, ending at the last address). Out-of-range reads give zero;
- * out-of-range / read-only writes are dropped. */
+/* Guest memory by walking the state's four regions (the public struct exposes
+ * them): the half decides which two to try -- lower [0): code then rodata
+ * (read-only); upper [RISCV_HALF): heap then stack (read/write). Out-of-range
+ * reads give zero; reads/writes to read-only memory still read but never write. */
+static const RiscvEmulatorRegion_t *region_of(const RiscvEmulatorState_t *st, uint32_t a,
+                                              uint32_t *off, int *writable) {
+    if (a & RISCV_HALF) {
+        *writable = 1;
+        if (a - RISCV_HALF < st->heap.len)  { *off = a - RISCV_HALF; return &st->heap; }
+        uint32_t sb = (uint32_t)(0u - st->stack.len);
+        if (a >= sb)                        { *off = a - sb;         return &st->stack; }
+    } else {
+        *writable = 0;
+        if (a < st->code.len)               { *off = a;             return &st->code; }
+        uint32_t rb = RISCV_HALF - st->rodata.len;
+        if (st->rodata.len && a >= rb)      { *off = a - rb;        return &st->rodata; }
+    }
+    return (const RiscvEmulatorRegion_t *)0;
+}
 static void mem_read(const RiscvEmulatorState_t *st, uint32_t addr, uint8_t *dst, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
-        uint32_t a = addr + i; uint8_t v = 0;
-        if (a >= RISCV_STACK_BASE) {            /* the stack (top region) */
-            uint32_t base = (uint32_t)(0u - st->stack.len);
-            if (st->stack.ptr && a >= base) v = st->stack.ptr[a - base];
-        } else if (a >= RAM_ORIGIN) {           /* data regions 0 .. RISCV_REGIONS-2 */
-            const RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
-            uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
-            if (r->ptr && off < r->len) v = r->ptr[off];
-        }
-        dst[i] = v;
+        uint32_t off; int w;
+        const RiscvEmulatorRegion_t *r = region_of(st, addr + i, &off, &w);
+        dst[i] = (r && r->ptr && off < r->len) ? r->ptr[off] : 0;
     }
 }
 static void mem_write(RiscvEmulatorState_t *st, uint32_t addr, const uint8_t *src, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
-        uint32_t a = addr + i;
-        if (a >= RISCV_STACK_BASE) {            /* the stack (top region) */
-            uint32_t base = (uint32_t)(0u - st->stack.len);
-            if (st->stack.ptr && st->stack.writable && a >= base) st->stack.ptr[a - base] = src[i];
-        } else if (a >= RAM_ORIGIN) {           /* data regions 0 .. RISCV_REGIONS-2 */
-            RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
-            uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
-            if (r->ptr && r->writable && off < r->len) r->ptr[off] = src[i];
-        }
+        uint32_t off; int w;
+        const RiscvEmulatorRegion_t *r = region_of(st, addr + i, &off, &w);
+        if (r && w && r->ptr && off < r->len) ((uint8_t *)r->ptr)[off] = src[i];
     }
 }
 

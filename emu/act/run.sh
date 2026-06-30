@@ -66,6 +66,12 @@ for ext in I M C Zifencei; do
     # mepc/mret) -- exactly the privileged machinery purv omits by design.
     if [ "$tag" = "C/cebreak-01" ]; then
       echo "SKIP  $tag (needs M-mode trap routine)"; skip=$((skip+1)); continue; fi
+    # Out of scope 1b: Fencei verifies self-modifying code -- it stores a new
+    # instruction into .text and executes it. purv's code region is the read-only
+    # lower half (fetch is separate from writable data), so self-modification is
+    # unsupported by design (FENCE.I itself executes; this visibility test cannot).
+    if [ "$tag" = "Zifencei/Fencei" ]; then
+      echo "SKIP  $tag (self-modifying code; code region is read-only)"; skip=$((skip+1)); continue; fi
     # Out of scope 2: an extension purv does not implement (it is RV32IMC). Zcb
     # (c.mul/c.lbu/c.sext.b/...) and the Zbb it pulls in are a distinct ISA.
     if grep -qE 'Zcb|Zbb|Zba|Zbs|Zbc' "$f"; then
