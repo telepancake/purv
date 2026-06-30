@@ -75,13 +75,14 @@ enum { RISCV_CODE, RISCV_RODATA, RISCV_HEAP, RISCV_STACK };
  *   - ecall/ebreak/illegal: the trap handlers the engine calls;
  *   - callback: handles a data access that misses the regions or hits read-only
  *               memory (see RiscvEmulatorMemFn); Init installs a no-op default.
- * The remaining fields (npc, inst, trap) are engine-internal scratch. */
+ * The remaining fields (npc, inst) are engine-internal scratch: the run loop
+ * keeps the live values in registers and writes inst (and pc) to the state only
+ * when calling a handler, so they are valid inside ecall/ebreak/illegal. */
 struct RiscvEmulatorState {
     uint32_t pc;
-    uint32_t npc;                                /* internal: next pc within a step */
-    uint32_t inst;                               /* internal: raw word of the current insn */
+    uint32_t npc;                                /* internal: next pc (seedable by a debugger) */
+    uint32_t inst;                               /* internal: raw word of the faulting insn */
     uint32_t x[32];
-    uint8_t  trap;                               /* internal: pending illegal flag */
     RiscvEmulatorRegion_t region[4];
     RiscvEmulatorTrapFn   ecall, ebreak, illegal;
     RiscvEmulatorMemFn    callback;

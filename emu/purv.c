@@ -30,7 +30,8 @@ enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
 /* The half (addr >> 31) selects a pair of adjacent regions; within it the two
  * grow toward each other -- region[half*2] up from the half's base, region[half*2
  * + 1] down from RISCV_HALF. Returns host storage for [addr, addr+n) or NULL. */
-static uint8_t *mem_resolve(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
+static inline __attribute__((always_inline))
+uint8_t *mem_resolve(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
     const RiscvEmulatorRegion_t *r = &s->region[(addr >> 31) << 1];
     uint32_t lo = addr & (RISCV_HALF - 1);
     if (lo + n <= r[0].len) return r[0].ptr + lo;            /* grows up from the base */
@@ -100,14 +101,16 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         uint32_t off = pc;
         if (!code || off >= code_len || code_len - off < 2) break;
 
-        uint32_t rd = 0, rs1 = 0, a = 0, b = 0, f3 = 0, f7 = 0, imm = 0, r, addr, n;
+        /* npc/inst stay in registers across the step; they reach the state only
+         * when a handler needs them (the trap paths below set s->pc/s->inst). */
+        uint32_t rd = 0, rs1 = 0, a = 0, b = 0, f3 = 0, f7 = 0, imm = 0, r, addr, n, npc, inst;
 
         uint16_t lo = (uint16_t)(code[off] | code[off + 1] << 8);
         if ((lo & 3) == 3) {                                  /* ---- 32-bit ---- */
             if (code_len - off < 4) break;                    /* op straddles window end */
             uint32_t w = lo | (uint32_t)(code[off + 2] | code[off + 3] << 8) << 16;
-            s->inst = w;
-            s->npc = pc + 4;
+            inst = w;
+            npc = pc + 4;
             rd = (w >> 7) & 31; rs1 = (w >> 15) & 31; f3 = (w >> 12) & 7;
             switch (w & 0x7f) {
             case OPIMM:                                       /* reg-immediate */
@@ -147,8 +150,8 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t rdp = ((c >> 2) & 7) + 8, rsp = ((c >> 7) & 7) + 8;  /* x8..x15 fields */
             uint32_t shamt = ((c >> 2) & 0x1f) | ((c >> 12) & 1) << 5;
             int32_t  ci = sext(shamt, 6);                                 /* CI 6-bit imm */
-            s->inst = lo;
-            s->npc = pc + 2;
+            inst = lo;
+            npc = pc + 2;
             rd = (c >> 7) & 31;
             switch (((c >> 13) & 7) << 2 | (c & 3)) {
             case 0 << 2 | 0:                          /* C.ADDI4SPN -> addi rd', sp, uimm */
@@ -268,40 +271,36 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         case 7: take = a >= b; break;                                  /* BGEU */
         default: goto illegal;
         }
-        if (take) s->npc = pc + imm;
+        if (take) npc = pc + imm;
         goto done;
     }
     jal:
-        wr(s, rd, s->npc); s->npc = pc + imm; goto done;
+        wr(s, rd, npc); npc = pc + imm; goto done;
     jalr:
-        addr = (a + imm) & ~1u; wr(s, rd, s->npc); s->npc = addr; goto done;
+        addr = (a + imm) & ~1u; wr(s, rd, npc); npc = addr; goto done;
     lui:
         wr(s, rd, imm); goto done;
     auipc:
         wr(s, rd, pc + imm); goto done;
     ebreak:
-        s->pc = pc;
+        s->pc = pc; s->inst = inst;
         if (s->ebreak ? s->ebreak(s) : 1) stop = 1;    /* default: a breakpoint stops */
         goto done;
     system:
         if (f3 == 0 && rd == 0 && rs1 == 0) {
             if (imm == 0x000) {                        /* ECALL -> handler (syscall) */
-                s->pc = pc;
+                s->pc = pc; s->inst = inst;
                 if (s->ecall && s->ecall(s)) stop = 1; /* default: nop, keep running */
                 goto done;
             }
             if (imm == 0x001) goto ebreak;             /* EBREAK */
         }
-        goto illegal;                                  /* CSR / MRET / WFI: not a userspace engine */
-    illegal:
-        s->trap = 1;
+        /* CSR / MRET / WFI: not a userspace engine -- fall through to illegal. */
+    illegal:                                           /* rare: call the handler directly */
+        s->pc = pc; s->inst = inst;
+        if (s->illegal ? s->illegal(s) : 1) stop = 1;  /* default: illegal stops */
     done:
-        if (s->trap) {
-            s->pc = pc;
-            if (s->illegal ? s->illegal(s) : 1) stop = 1;   /* default: illegal stops */
-            s->trap = 0;
-        }
-        pc = s->npc;
+        pc = npc;
     }
     s->pc = pc;                          /* leave the resume point in the state */
     return k;
