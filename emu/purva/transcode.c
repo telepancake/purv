@@ -1,22 +1,28 @@
 /*
  * transcode.c - ahead-of-time RISC-V (RV32IM) -> "our ops" rewriter.
  *
- * Two passes, because op layout is NOT 1:1 with the instruction stream (auipc
- * materializes to a 2-word op, and -- later -- fusion compacts and the C extension
- * mixes 2- and 4-byte instructions). So `ops[pc>>2]` is not a given; the transcoder
- * resolves it:
+ * Two passes:
  *
  *   pass 1  walk the instructions; record each one's op-word offset in
  *           map[orig_pc>>1], and total the output size.
  *   pass 2  emit each op, resolving every branch/jal target's original pc through
- *           that map to a baked op-relative displacement, and materializing auipc's
- *           value (orig_pc + imm) as a constant -- so nothing at run time needs the
- *           original pc.
+ *           that map to a baked op-relative displacement.
  *
- * The map is internal: it exists only to resolve targets during pass 2. At run time
- * the cursor IS the (transcoded) pc, direct targets are baked, and jal writes the
- * return op offset, so the evaluator needs no map. See transcode.h for the word
- * layout. (auipc is the one op that spills a second word -- its 32-bit value.)
+ * For RV32IM today, op layout IS 1:1 with the instruction stream (one word per
+ * 4-byte instruction, op-word offset == pc/4 everywhere), so the map is currently
+ * the identity and pass 2's resolution is a formality -- but it's the real
+ * mechanism, not a shortcut, because op-index==pc/4 is NOT safe to assume in
+ * general: see op_words()'s note on why auipc stays unspilled, which is the
+ * concrete reason this can't be "ops[pc>>2]" by convention. The C extension
+ * (variable 2/4-byte instructions) and any compacting op fusion both need a real
+ * pass-1 layout + pass-2 resolution, which is what this already is.
+ *
+ * Direct branch/jal targets resolve at transcode time (baked, no runtime map).
+ * jalr does not: its target is data-dependent, so it can only be resolved at run
+ * time, and ONLY works because op-index==pc/4 holds everywhere right now (see
+ * op_words()). That equality is the thing that must not be broken without also
+ * giving jalr a real address resolution -- which RV32IM does not need, but C-ext
+ * and fusion will.
  */
 #include <stdlib.h>
 
@@ -100,8 +106,19 @@ static void decode(const uint8_t *code, uint32_t off, Dec *d) {
     }
 }
 
-/* Output op words for an op. One per instruction today; reserved for fused/spilled
- * ops later. */
+/* Output op words for an op. One per instruction for RV32IM: auipc stays a single
+ * word (its value is computed at run time from the live cursor, which equals the
+ * original pc exactly as long as nothing spills -- see purva.c's h_auipc). Baking
+ * auipc's value here would spill a second word, which breaks jalr: a jalr target
+ * computed via auipc+arith (the standard PIC indirect-jump idiom) is an ORIGINAL
+ * address, but the evaluator resolves jalr by treating its target as a TRANSCODED
+ * op-word offset (ops[t>>2]) -- correct only when offset==pc/4 holds everywhere.
+ * Confirmed by reproduction: baking auipc made riscv-arch-test I/jal-01 (which
+ * contains exactly this `auipc a3,0; addi a3,a3,N; jr a3` idiom) jump into the
+ * middle of an unrelated nop run and spin forever. So nothing here may diverge
+ * op-index from pc/4 without also giving jalr a real address->op-index resolution,
+ * which RV32IM does not need (no spilling) but the C extension and any fusion that
+ * compacts the stream will. */
 static int op_words(uint8_t op) { (void)op; return 1; }
 
 /* Resolve a branch/jal target's original pc to its op-word offset. A target outside
