@@ -7,10 +7,13 @@
  *
  *   1. decode-ahead (decode_one, driven from RiscvEmulatorLoop): from pc, lower
  *      each raw instruction -- 32-bit or compressed -- into an 8-byte
- *      RiscvEmulatorDecoded_t { imm, op, rd, rs1, rs2 } in an internal buffer,
- *      until the first control transfer (its last record) or the buffer / code
- *      window fills. Decode reads only the code bytes; it never reads register
- *      values, so a whole run is decoded before any of it runs.
+ *      RiscvEmulatorDecoded_t { imm, op, rd, rs1, rs2 } in an internal buffer.
+ *      It traces THROUGH unconditional jumps -- a jal/j target is static, so the
+ *      run continues at the target (the jump is replaced by just its link write,
+ *      or nothing for a plain j) -- and stops only at a conditional branch, an
+ *      indirect jump (jalr), a trap, a full buffer, or the code window's end.
+ *      Decode reads only the code bytes; it never reads register values, so a
+ *      whole run is decoded before any of it runs.
  *
  *   2. direct-threaded execution (RiscvEmulatorDefaultEval): a computed-goto jump
  *      table indexed by the leaf op, where each handler ends by jumping STRAIGHT
@@ -425,9 +428,10 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         uint32_t cap = room < RISCV_BLOCK_MAX ? (uint32_t)room : RISCV_BLOCK_MAX;
         uint32_t pc = s->pc, n = 0, last_pc = pc;
 
-        /* loop 1: decode ahead until the first control transfer (its last record),
-         * a full buffer, or the code window's end. Code is read-only, so nothing
-         * eval does can invalidate what we decode here. */
+        /* loop 1: decode ahead, tracing THROUGH unconditional jumps (their target
+         * is static), until a conditional branch / indirect jump / trap (the run's
+         * last record), a full buffer, or the code window's end. Code is read-only,
+         * so nothing eval does can invalidate what we decode here. */
         while (n < cap) {
             if (!code || pc >= code_len || code_len - pc < 2) break;
             uint16_t lo = (uint16_t)(code[pc] | code[pc + 1] << 8);
@@ -435,6 +439,20 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             if (width == 4 && code_len - pc < 4) break;   /* 32-bit straddles end */
             decode_one(&block[n], code, pc);
             last_pc = pc;
+            if (block[n].op == RISCV_OP_JAL) {
+                /* Unconditional jump to a statically-known target: trace across it.
+                 * Its only lasting effect is the link write, so replace the jump
+                 * with that (a LUI of the return address) -- or nothing, for a plain
+                 * j -- and keep decoding at the target. The jump never reaches eval
+                 * as a control transfer; execution flows straight into the target,
+                 * which is the next record. */
+                uint32_t target = block[n].imm;           /* the baked absolute target */
+                if (block[n].rd) { block[n].op = RISCV_OP_LUI; block[n].imm = pc + width; }
+                else             { block[n].op = RISCV_OP_NOP; }
+                n++;
+                pc = target;
+                continue;
+            }
             pc += width;
             if (is_terminator(block[n++].op)) break;
         }
