@@ -10,8 +10,8 @@ the handlers you put in the state; nothing vectors anywhere.
 
 ```
 emu/
-  purv.h      public interface — the state struct + the calls you need (~90 lines)
-  purv.c      the whole engine behind purv.h (hand-written, ~325 lines)
+  purv.h      public interface — the state struct + the calls you need (~85 lines)
+  purv.c      the whole engine behind purv.h (hand-written, ~305 lines)
   act/        userspace ACT conformance vs Spike golden signatures (make act)
   purg.c/.h   the earlier engine, mechanically generated from atoom (g = generated;
               kept for reference, not built — see "How the engine is organized")
@@ -33,13 +33,14 @@ public, so you set it up by writing its fields -- there are no trivial get/set
 wrappers. Map memory, assign the handlers it calls, set the pc, and run a batch:
 
 ```c
-RiscvEmulatorState_t *st = RiscvEmulatorCreate(sp_top);   /* or a plain stack value */
-st->mem[0]  = (RiscvEmulatorRegion_t){ ram, ram_len, /*writable=*/1 };  /* region 0 */
-st->ecall   = on_ecall;        /* int (*)(state): nonzero -> stop the run loop */
-st->ebreak  = on_ebreak;
-st->illegal = on_illegal;
-st->pc      = entry;
-uint64_t ran = RiscvEmulatorLoop(st, code, code_len, code_base, max);   /* runs a batch */
+RiscvEmulatorState_t st = {0};                /* allocate it yourself (stack or heap) */
+st.x[2]    = sp_top;                           /* sp */
+st.mem[0]  = (RiscvEmulatorRegion_t){ ram, ram_len, /*writable=*/1 };  /* region 0 */
+st.ecall   = on_ecall;          /* int (*)(state): nonzero -> stop the run loop */
+st.ebreak  = on_ebreak;
+st.illegal = on_illegal;
+st.pc      = entry;
+uint64_t ran = RiscvEmulatorLoop(&st, code, code_len, code_base, max);  /* runs a batch */
 ```
 
 The address space is **8 evenly spaced regions** (`st->mem[0..7]`), each up to
@@ -48,10 +49,12 @@ unmapped/out-of-bounds address reads zero; a store to a read-only or
 out-of-bounds address is dropped. Instruction *fetch* comes from the code window
 passed to `RiscvEmulatorLoop` (`code`/`code_len`/`code_base`); a pc outside it
 ends the batch. `ecall`/`ebreak`/`illegal` are the only handlers, and each
-returns nonzero to stop the run loop. The engine offers functions only for real
-work: `RiscvEmulatorLoop`, `RiscvEmulatorRead/WriteMemory`, and Create/Destroy/Init.
-The state struct is also naturally sized per target -- smaller on a 32-bit host,
-where its pointers are 4 bytes -- and the engine builds and runs on both.
+returns nonzero to stop the run loop. The engine exposes essentially one
+function -- `RiscvEmulatorLoop` (plus an optional `RiscvEmulatorInit` that just
+zeroes the struct and sets sp/pc); you allocate the state, write its fields, and
+to touch guest memory from outside you index `st.mem[]` yourself. The struct is
+also naturally sized per target -- smaller on a 32-bit host, where its pointers
+are 4 bytes -- and the engine builds and runs on both.
 
 ## Build
 
@@ -132,8 +135,8 @@ The stub serves a `riscv:rv32` target description (the 33 registers `x0..x31`,
 single-step, continue, software breakpoints (`Z0`/`z0`, tracked in the stub rather
 than by patching guest code), Ctrl-C to interrupt a run, and a program exit
 reported back to gdb. It drives the engine purely through `purv.h` — stepping with
-`RiscvEmulatorLoop` (one instruction at a time), reaching guest memory through
-`RiscvEmulatorRead/WriteMemory` — so the engine is untouched. `--gdb=FD` composes with the
+`RiscvEmulatorLoop` (one instruction at a time), reaching guest memory by walking
+`state->mem[]` — so the engine is untouched. `--gdb=FD` composes with the
 other modes (`--user`, plain run-to-halt): gdb just takes over execution.
 
 ### Reverse execution (time travel)
@@ -227,7 +230,7 @@ silently dropped; such loads read zero.
 
 `purv.c` is hand-written (so are `purv.h` and `main.c`). It keeps atoom's premise
 — the host owns the memory map; the engine reaches the world only through the
-hooks above — but trims the redundancy of the original, in ~325 lines. Two ideas
+hooks above — but trims the redundancy of the original, in ~305 lines. Two ideas
 do most of that:
 
 - **Registers are indices into `x[32]`, not pointers.** `x0` is never written, so

@@ -3,9 +3,9 @@
  *
  * Built only when PURV_GDBSTUB is defined. It serves the RSP on a connected fd
  * handed in by a launcher (no listening here) and drives the engine through the
- * public purv.h surface: registers and PC via the state struct's fields, memory
- * via RiscvEmulatorRead/WriteMemory, execution one instruction at a time via
- * RiscvEmulatorLoop. Software breakpoints are tracked here (gdb's Z0/z0)
+ * public purv.h surface: registers, PC, and memory through the state struct's
+ * fields (state->mem[] for guest memory), execution one instruction at a time
+ * via RiscvEmulatorLoop. Software breakpoints are tracked here (gdb's Z0/z0)
  * rather than by patching guest code. A target description is served so a stock
  * riscv:rv32 gdb knows the 33-register layout (x0..x31, pc) without extra setup.
  */
@@ -150,6 +150,30 @@ static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
     else if (i)  st->x[i] = v;              /* x0 stays zero */
 }
 
+/* Guest memory by walking the state's regions (the public struct exposes them).
+ * Out-of-range reads give zero; out-of-range / read-only writes are dropped. */
+static void mem_read(const RiscvEmulatorState_t *st, uint32_t addr, uint8_t *dst, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t a = addr + i; uint8_t v = 0;
+        if (a >= RAM_ORIGIN) {
+            const RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
+            uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
+            if (r->ptr && off < r->len) v = r->ptr[off];
+        }
+        dst[i] = v;
+    }
+}
+static void mem_write(RiscvEmulatorState_t *st, uint32_t addr, const uint8_t *src, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t a = addr + i;
+        if (a >= RAM_ORIGIN) {
+            RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
+            uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
+            if (r->ptr && r->writable && off < r->len) r->ptr[off] = src[i];
+        }
+    }
+}
+
 /* -------------------------------------------------------------- breakpoints */
 
 static uint32_t g_bp[GDB_MAX_BP];
@@ -226,7 +250,7 @@ static int step_reverse(RiscvEmulatorState_t *st) {
     Frame *f = &g_hist[(g_head + g_count - 1) % HIST_FRAMES];
     if (f->overflow) { g_count--; return -1; }   /* can't faithfully undo */
     for (int i = f->nw - 1; i >= 0; i--)         /* restore memory (g_cur NULL: not re-recorded) */
-        RiscvEmulatorWriteMemory(st, f->w[i].addr, f->w[i].old, f->w[i].len);
+        mem_write(st, f->w[i].addr, f->w[i].old, f->w[i].len);
     for (int i = 1; i < 32; i++) st->x[i] = f->reg[i];
     st->pc = st->npc = f->reg[32];
     g_count--;
@@ -398,7 +422,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
             char *o = out;
             for (uint32_t i = 0; i < len; i++) {
                 uint8_t b = 0;
-                RiscvEmulatorReadMemory(st, addr + i, &b, 1);
+                mem_read(st, addr + i, &b, 1);
                 *o++ = hexd[b >> 4]; *o++ = hexd[b & 0xf];
             }
             *o = '\0';
@@ -413,7 +437,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
             if (*p == ':') p++;
             for (uint32_t i = 0; i < len && hexval((unsigned char)p[0]) >= 0; i++, p += 2) {
                 uint8_t b = (uint8_t)((hexval((unsigned char)p[0]) << 4) | hexval((unsigned char)p[1]));
-                RiscvEmulatorWriteMemory(st, addr + i, &b, 1);
+                mem_write(st, addr + i, &b, 1);
             }
             gdb_send(fd, "OK");
             break;

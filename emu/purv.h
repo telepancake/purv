@@ -57,12 +57,10 @@ struct RiscvEmulatorState {
     RiscvEmulatorTrapFn   ecall, ebreak, illegal;
 };
 
-/* ---- Lifecycle (convenience; you may also just zero a state and set fields) ---- */
-/* Init zeroes the state, sets sp (x[2]) to initial_sp, and parks pc at a reset
- * vector. Create heap-allocates an initialized state; Destroy frees it. */
-RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp);
-void                  RiscvEmulatorDestroy(RiscvEmulatorState_t *state);
-void                  RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp);
+/* Optional convenience: zero the state, set sp (x[2]) to initial_sp, and park pc
+ * at a reset vector. Equivalent to `RiscvEmulatorState_t st = {0}; st.x[2] = sp;`
+ * -- allocate the struct yourself (stack or heap); there is no create/destroy. */
+void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp);
 
 /* ---- The VM ----
  * Execute up to `max` instructions and return the number actually executed.
@@ -83,11 +81,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *state,
                            const uint8_t *code, uint32_t code_len, uint32_t code_base,
                            uint64_t max);
 
-/* ---- Guest memory through the mapped regions (OOB reads zero; OOB / read-only
- *      writes are dropped). For hosts/debuggers that don't own the storage. ---- */
-void RiscvEmulatorReadMemory(const RiscvEmulatorState_t *state, uint32_t addr,
-                             void *dst, uint32_t len);
-void RiscvEmulatorWriteMemory(RiscvEmulatorState_t *state, uint32_t addr,
-                              const void *src, uint32_t len);
+/* (To read or write guest memory from outside the engine, index state->mem[]
+ * directly: region i covers [RAM_ORIGIN + i*RISCV_REGION_SIZE, + region.len).) */
 
 #endif /* PURV_H_ */

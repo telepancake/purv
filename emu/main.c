@@ -81,11 +81,8 @@ static int on_ecall(RiscvEmulatorState_t *state) {
     uint32_t ret;
     switch (num) {
     case 64:                              /* write(fd, buf, len) */
-        for (uint32_t i = 0; i < a2; i++) {
-            uint8_t b = 0;
-            RiscvEmulatorReadMemory(state, a1 + i, &b, 1);
-            putchar(b);
-        }
+        for (uint32_t i = 0; i < a2; i++)
+            putchar(in_ram(a1 + i, 1) ? g_ram[(a1 + i) - RAM_ORIGIN] : 0);
         ret = a2;
         fflush(stdout);
         (void)a0;                         /* fd ignored: 1/2 both -> stdout */
@@ -303,8 +300,9 @@ int main(int argc, char **argv) {
 
     uint32_t entry = load_elf(elf);
 
-    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + g_ram_size);  /* sp = top of RAM */
-    if (!st) { fprintf(stderr, "purv: cannot allocate emulator state\n"); return 2; }
+    RiscvEmulatorState_t state;
+    RiscvEmulatorInit(&state, RAM_ORIGIN + g_ram_size);   /* sp = top of RAM */
+    RiscvEmulatorState_t *st = &state;
 
     /* Map the flat RAM as region 0 and assign the trap handlers; the engine
      * reaches the outside world only through these. */
@@ -336,7 +334,6 @@ int main(int argc, char **argv) {
         /* Hand control to gdb: it steps/continues the engine over the RSP. The
          * guest's console still goes to stdout; the RSP rides the provided fd. */
         RiscvEmulatorGdbServe(st, g_gdb_fd, &g_halt, &g_exit, g_ram, g_ram_size, RAM_ORIGIN);
-        RiscvEmulatorDestroy(st);
         return g_exit;
     }
 #endif
@@ -374,7 +371,6 @@ int main(int argc, char **argv) {
         if (i >= max_insns) { fprintf(stderr, "purv: instruction cap reached\n"); return 2; }
         uint32_t a0 = st->x[10];
         printf("%d (0x%08x)\n", (int32_t)a0, a0);
-        RiscvEmulatorDestroy(st);
         return 0;
     }
 
@@ -383,6 +379,5 @@ int main(int argc, char **argv) {
         if (!g_have_sig) { fprintf(stderr, "purv: no begin/end_signature symbols\n"); return 2; }
         dump_signature(sigfile, gran);
     }
-    RiscvEmulatorDestroy(st);
     return g_exit;
 }

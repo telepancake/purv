@@ -290,10 +290,13 @@ int main(int argc, char **argv) {
     uint32_t heap_base = (g_image_end + 15u) & ~15u;
     heap_init(heap_base, RAM_ORIGIN + RAM_BYTES - STACK_RESERVE);
 
+#ifdef PURV_TAGGED
     RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
-#ifndef PURV_TAGGED
-    /* purv: map the flat RAM as region 0 and assign the trap handlers. */
+#else
+    /* purv: allocate the state, map the flat RAM as region 0, assign handlers. */
+    RiscvEmulatorState_t state = {0};
+    RiscvEmulatorState_t *st = &state;
     st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, RAM_BYTES, 1 };
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
@@ -339,6 +342,8 @@ int main(int argc, char **argv) {
                 ms, (unsigned long long)i, ms > 0 ? i / (ms * 1000.0) : 0.0);
     }
 
+#ifdef PURV_TAGGED
     RiscvEmulatorDestroy(st);
+#endif
     return g_exit;
 }

@@ -17,7 +17,6 @@
  * indices into x[32]; x0 is never written, so it reads as a hard zero.
  */
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "purv.h"
@@ -298,26 +297,10 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s,
     return k;
 }
 
-/* ----------------------------------------------------------- lifecycle + memory */
+/* ------------------------------------------------------------------ init */
 
 void RiscvEmulatorInit(RiscvEmulatorState_t *s, uint32_t initial_sp) {
     memset(s, 0, sizeof *s);              /* clears registers, memory map, handlers */
     s->x[2] = initial_sp;                 /* sp */
     s->pc = s->npc = ROM_ORIGIN;
-}
-
-RiscvEmulatorState_t *RiscvEmulatorCreate(uint32_t initial_sp) {
-    RiscvEmulatorState_t *s = calloc(1, sizeof *s);
-    if (s) RiscvEmulatorInit(s, initial_sp);
-    return s;
-}
-void RiscvEmulatorDestroy(RiscvEmulatorState_t *s) { free(s); }
-
-void RiscvEmulatorReadMemory(const RiscvEmulatorState_t *s, uint32_t addr, void *dst, uint32_t len) {
-    uint8_t *d = dst;
-    for (uint32_t i = 0; i < len; i++) d[i] = (uint8_t)mem_load(s, addr + i, 1);
-}
-void RiscvEmulatorWriteMemory(RiscvEmulatorState_t *s, uint32_t addr, const void *src, uint32_t len) {
-    const uint8_t *b = src;
-    for (uint32_t i = 0; i < len; i++) mem_store(s, addr + i, 1, b[i]);
 }

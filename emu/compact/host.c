@@ -127,8 +127,8 @@ int main(int argc, char **argv) {
     uint32_t entry = load_flat(argv[1]);
     heap_init((g_image_end + 15u) & ~15u, RAM_ORIGIN + RAM_BYTES - 1024u * 1024u);
 
-    RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
-    if (!st) { fprintf(stderr, "compact: cannot create state\n"); return 2; }
+    RiscvEmulatorState_t state = {0};
+    RiscvEmulatorState_t *st = &state;
     st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, RAM_BYTES, 1 };  /* flat image -> region 0 */
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
@@ -150,6 +150,5 @@ int main(int argc, char **argv) {
             g_halt = 1; g_exit = 1; break;
         }
     }
-    RiscvEmulatorDestroy(st);
     return g_exit;
 }
