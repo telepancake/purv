@@ -26,12 +26,16 @@
 enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
        OP = 0x33, LUI = 0x37, BRANCH = 0x63, JALR = 0x67, JAL = 0x6f, SYSTEM = 0x73 };
 
-/* ---- memory: resolve a guest address to one of the four regions ---- */
-/* The half (addr >> 31) selects a pair of adjacent regions; within it the two
- * grow toward each other -- region[half*2] up from the half's base, region[half*2
- * + 1] down from RISCV_HALF. Returns host storage for [addr, addr+n) or NULL. */
+/* ---- memory: one address translation, used by every load and store ---- */
+/* mem_xlate maps [addr, addr+n) to host storage, or NULL on a miss (and on a
+ * write to the read-only lower half). The half (addr >> 31) selects a pair of
+ * adjacent regions that grow toward each other: region[half*2] up from the half's
+ * base, region[half*2+1] down from RISCV_HALF. The load/store sites read/write the
+ * bytes explicitly per width (little-endian, so the byte-or / byte-store idioms
+ * compile to a single unaligned sized access). */
 static inline __attribute__((always_inline))
-uint8_t *mem_resolve(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
+uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
+    if (write && addr < RISCV_HALF) return (uint8_t *)0;     /* lower half is read-only */
     const RiscvEmulatorRegion_t *r = &s->region[(addr >> 31) << 1];
     uint32_t lo = addr & (RISCV_HALF - 1);
     if (lo + n <= r[0].len) return r[0].ptr + lo;            /* grows up from the base */
@@ -40,45 +44,12 @@ uint8_t *mem_resolve(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
     return (uint8_t *)0;
 }
 
-/* A load of n bytes (1/2/4), zero-extended. Readable in either half; a miss goes
- * to the callback, whose return supplies the (low n bytes of the) loaded word.
- * The width is known from the opcode, so we read it directly -- the byte-or idiom
- * is recognized as a single (unaligned, little-endian) load, no memcpy. */
-static uint32_t mem_load(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
-    const uint8_t *p = mem_resolve(s, addr, n);
-    if (!p) {
-        uint32_t v = s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0;
-        return n == 4 ? v : (v & ((1u << (8 * n)) - 1));
-    }
-    switch (n) {
-    case 1:  return p[0];
-    case 2:  return (uint32_t)p[0] | (uint32_t)p[1] << 8;
-    default: return (uint32_t)p[0] | (uint32_t)p[1] << 8
-                  | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-    }
-}
-/* A store of the low n bytes of val (width known from the opcode). Allowed only in
- * the writable upper half; a store to the read-only lower half or a miss goes to
- * the callback. The byte writes coalesce into one sized (little-endian) store. */
-static void mem_store(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, uint32_t val) {
-    uint8_t *p = (addr & RISCV_HALF) ? mem_resolve(s, addr, n) : (uint8_t *)0;
-    if (!p) { if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, val); return; }
-    switch (n) {
-    case 1:  p[0] = (uint8_t)val; break;
-    case 2:  p[0] = (uint8_t)val; p[1] = (uint8_t)(val >> 8); break;
-    default: p[0] = (uint8_t)val;        p[1] = (uint8_t)(val >> 8);
-             p[2] = (uint8_t)(val >> 16); p[3] = (uint8_t)(val >> 24); break;
-    }
-}
+static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i] = v; }
 
 /* Sign-extend the low `bits` of v. */
 static int32_t sext(uint32_t v, int bits) {
     int sh = 32 - bits;
     return (int32_t)(v << sh) >> sh;
-}
-
-static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) {
-    if (i) s->x[i] = v;               /* writes to x0 are discarded */
 }
 
 /* The M extension: rd = a <op> b, selected by funct3. */
@@ -273,14 +244,35 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         if (f3 == 3 || f3 > 5) goto illegal;
         addr = a + imm; n = 1u << (f3 & 3);
         if (rd) {                             /* a load into x0 has no effect */
-            uint32_t v = mem_load(s, addr, n);
-            wr(s, rd, f3 & 4 ? v : (uint32_t)sext(v, 8 << (f3 & 3)));  /* sign-ext unless LBU/LHU */
+            uint8_t *p = mem_xlate(s, addr, n, 0);            /* translate once */
+            uint32_t v;
+            if (p) switch (f3) {                              /* dispatch by width + sign */
+            case 0:  v = (uint32_t)(int32_t)(int8_t)p[0]; break;                        /* LB  */
+            case 1:  v = (uint32_t)(int32_t)(int16_t)(p[0] | p[1] << 8); break;         /* LH  */
+            case 2:  v = (uint32_t)p[0] | (uint32_t)p[1] << 8
+                       | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; break;            /* LW  */
+            case 4:  v = p[0]; break;                                                   /* LBU */
+            default: v = (uint32_t)p[0] | (uint32_t)p[1] << 8; break;                   /* LHU */
+            } else {                                          /* miss -> callback supplies it */
+                v = s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0;
+                v = f3 & 4 ? (n == 4 ? v : v & ((1u << (8 * n)) - 1))
+                           : (uint32_t)sext(v, 8 * n);
+            }
+            wr(s, rd, v);
         }
         goto done;
     store:
         if (f3 > 2) goto illegal;
         addr = a + imm; n = 1u << f3;
-        mem_store(s, addr, n, b);
+        {
+            uint8_t *p = mem_xlate(s, addr, n, 1);            /* translate once (write) */
+            if (p) switch (f3) {                              /* dispatch by width */
+            case 0:  p[0] = (uint8_t)b; break;                                          /* SB */
+            case 1:  p[0] = (uint8_t)b; p[1] = (uint8_t)(b >> 8); break;                 /* SH */
+            default: p[0] = (uint8_t)b;        p[1] = (uint8_t)(b >> 8);
+                     p[2] = (uint8_t)(b >> 16); p[3] = (uint8_t)(b >> 24); break;        /* SW */
+            } else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, b);
+        }
         goto done;
     branch: {
         int take;
