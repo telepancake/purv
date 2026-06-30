@@ -52,22 +52,6 @@ static int32_t sext(uint32_t v, int bits) {
     return (int32_t)(v << sh) >> sh;
 }
 
-/* The M extension: rd = a <op> b, selected by funct3. */
-static uint32_t muldiv(uint32_t f3, uint32_t a, uint32_t b) {
-    switch (f3) {
-    case 0: return a * b;                                                   /* MUL    */
-    case 1: return (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32);    /* MULH   */
-    case 2: return (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32); /* MULHSU */
-    case 3: return (uint32_t)(((uint64_t)a * b) >> 32);                     /* MULHU  */
-    case 4: return b == 0 ? 0xffffffffu                                     /* DIV    */
-                 : (a == 0x80000000u && (int32_t)b == -1) ? a : (uint32_t)((int32_t)a / (int32_t)b);
-    case 5: return b == 0 ? 0xffffffffu : a / b;                            /* DIVU   */
-    case 6: return b == 0 ? a                                               /* REM    */
-                 : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b);
-    default: return b == 0 ? a : a % b;                                     /* REMU   */
-    }
-}
-
 /* ----------------------------------------------------------------- the VM */
 
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
@@ -237,8 +221,20 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         }
         wr(s, rd, r);
         goto done;
-    mul:
-        wr(s, rd, muldiv(f3, a, b));
+    mul:                                                              /* RV32M: rd = a <op> b */
+        switch (f3) {
+        case 0: r = a * b; break;                                                   /* MUL    */
+        case 1: r = (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32); break;    /* MULH   */
+        case 2: r = (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32); break; /* MULHSU */
+        case 3: r = (uint32_t)(((uint64_t)a * b) >> 32); break;                     /* MULHU  */
+        case 4: r = b == 0 ? 0xffffffffu                                            /* DIV    */
+                    : (a == 0x80000000u && (int32_t)b == -1) ? a : (uint32_t)((int32_t)a / (int32_t)b); break;
+        case 5: r = b == 0 ? 0xffffffffu : a / b; break;                            /* DIVU   */
+        case 6: r = b == 0 ? a                                                      /* REM    */
+                    : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b); break;
+        default: r = b == 0 ? a : a % b; break;                                     /* REMU   */
+        }
+        wr(s, rd, r);
         goto done;
     load:
         if (f3 == 3 || f3 > 5) goto illegal;
