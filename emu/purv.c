@@ -104,7 +104,6 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     const uint8_t *code = s->region[RISCV_CODE].ptr;   /* instruction-fetch window... */
     uint32_t code_len = s->region[RISCV_CODE].len;     /* ...based at 0 */
     uint64_t k = 0;
-    int stop = 0;
 
     /* Outer loop: validate pc and size a window of instructions that can be
      * fetched without a bounds check -- inside the window pc only steps forward,
@@ -112,7 +111,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * runs the window straight-line; a branch/jump assigns pc directly and breaks
      * back here to re-validate the target. (The inner body keeps the old indent so
      * the diff stays the size of the actual change, not a whitespace reflow.) */
-    while (k < max && !stop) {
+    while (k < max) {
         uint32_t base = pc;
         if (!code || base >= code_len || code_len - base < 2) break;
         uint32_t safe;
@@ -121,7 +120,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             safe = 1;
         } else safe = (code_len - base) / 4;      /* worst case (all 32-bit), this many fit */
 
-        for (uint32_t i = 0; i < safe && k < max && !stop; i++) {
+        for (uint32_t i = 0; i < safe && k < max; i++) {
         k++;
         uint32_t off = pc;                        /* current insn; fetch is in range by the window */
 
@@ -307,13 +306,13 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         wr(s, rd, pc + imm); goto done;
     ebreak:
         s->pc = pc; s->inst = inst;
-        if (s->ebreak ? s->ebreak(s) : 1) stop = 1;    /* default: a breakpoint stops */
+        if (s->ebreak ? s->ebreak(s) : 1) goto out;    /* default: a breakpoint stops */
         goto done;
     system:
         if (f3 == 0 && rd == 0 && rs1 == 0) {
             if (imm == 0x000) {                        /* ECALL -> handler (syscall) */
                 s->pc = pc; s->inst = inst;
-                if (s->ecall && s->ecall(s)) stop = 1; /* default: nop, keep running */
+                if (s->ecall && s->ecall(s)) goto out; /* nonzero (e.g. exit) stops at the ecall */
                 goto done;
             }
             if (imm == 0x001) goto ebreak;             /* EBREAK */
@@ -321,12 +320,13 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         /* CSR / MRET / WFI: not a userspace engine -- fall through to illegal. */
     illegal:                                           /* rare: call the handler directly */
         s->pc = pc; s->inst = inst;
-        if (s->illegal ? s->illegal(s) : 1) stop = 1;  /* default: illegal stops */
+        if (s->illegal ? s->illegal(s) : 1) goto out;  /* default: illegal stops */
     done:                                              /* sequential: advance pc, stay in window */
         pc += width;
         continue;
         }   /* inner: run the safe window straight-line */
     }       /* outer: re-validate pc after each control transfer / window end */
+    out:
     s->pc = pc;                          /* leave the resume point in the state */
     return k;
 }
@@ -349,5 +349,5 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *s,
     s->region[RISCV_STACK]  = stack;      /* read/write, grows down, ends at the last address */
     s->callback = default_callback;       /* no-op until the host installs its own */
     s->x[2] = 0;                          /* sp = 0 == 2^32, one past the top of the stack */
-    s->pc = s->npc = 0;                   /* code is based at 0 */
+    s->pc = 0;                            /* code is based at 0 */
 }

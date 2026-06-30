@@ -146,7 +146,7 @@ static uint32_t reg_get(RiscvEmulatorState_t *st, uint32_t i) {
 }
 
 static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
-    if (i >= 32) st->pc = st->npc = v;      /* seed both so the next step resumes here */
+    if (i >= 32) st->pc = v;                /* the next step resumes at pc */
     else if (i)  st->x[i] = v;              /* x0 stays zero */
 }
 
@@ -249,7 +249,7 @@ static int step_reverse(RiscvEmulatorState_t *st) {
     for (int i = f->nw - 1; i >= 0; i--)         /* restore memory (g_cur NULL: not re-recorded) */
         mem_write(st, f->w[i].addr, f->w[i].old, f->w[i].len);
     for (int i = 1; i < 32; i++) st->x[i] = f->reg[i];
-    st->pc = st->npc = f->reg[32];
+    st->pc = f->reg[32];
     g_count--;
     return 1;
 }
@@ -440,7 +440,7 @@ void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
         case 'c':                            /* continue [addr] */
         case 's': {                          /* step [addr] */
             if (exited) { gdb_send(fd, wmsg); break; }
-            if (buf[1]) { const char *p = buf + 1; st->pc = st->npc = parse_hex(&p); }
+            if (buf[1]) { const char *p = buf + 1; st->pc = parse_hex(&p); }
             int r = gdb_run(st, fd, buf[0] == 'c', halted);
             if (r == STOP_EXIT) {
                 exited = 1;

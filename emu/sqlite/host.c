@@ -211,7 +211,6 @@ static inline uint32_t rget(const RiscvEmulatorState_t *s, int i)   { return s->
 static inline void     rset(RiscvEmulatorState_t *s, int i, uint32_t v) { s->x[i] = v; }
 static inline void     spc(RiscvEmulatorState_t *s, uint32_t v)    { s->pc = v; }
 static inline uint32_t gpc(const RiscvEmulatorState_t *s)          { return s->pc; }
-static inline uint32_t gnpc(const RiscvEmulatorState_t *s)         { return s->npc; }
 #endif
 
 /* A guest byte for the write syscall -- it may point into any region (the stack
