@@ -222,19 +222,11 @@ static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
 }
 #else
 static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    const RiscvEmulatorRegion_t *r; uint32_t off;
-    if (a & RISCV_HALF) {                              /* upper half: heap, then stack */
-        if (a - RISCV_HALF < s->heap.len)             { r = &s->heap;  off = a - RISCV_HALF; }
-        else { uint32_t sb = (uint32_t)(0u - s->stack.len);
-               if (a >= sb)                            { r = &s->stack; off = a - sb; }
-               else return 0; }
-    } else {                                          /* lower half: code, then rodata */
-        if (a < s->code.len)                           { r = &s->code;  off = a; }
-        else { uint32_t rb = RISCV_HALF - s->rodata.len;
-               if (s->rodata.len && a >= rb)           { r = &s->rodata; off = a - rb; }
-               else return 0; }
-    }
-    return (r->ptr && off < r->len) ? r->ptr[off] : 0;
+    const RiscvEmulatorRegion_t *r = &s->region[(a >> 31) << 1];
+    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
+    if (lo < r[0].len)  return r[0].ptr[lo];
+    if (lo >= down && r[1].len) return r[1].ptr[lo - down];
+    return 0;
 }
 #endif
 

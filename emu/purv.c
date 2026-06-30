@@ -27,44 +27,32 @@ enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
        OP = 0x33, LUI = 0x37, BRANCH = 0x63, JALR = 0x67, JAL = 0x6f, SYSTEM = 0x73 };
 
 /* ---- memory: resolve a guest address to one of the four regions ---- */
-/* Returns host storage for [addr, addr+n) or NULL if the address+width is not
- * fully inside a region. *writable says whether stores are allowed there: the
- * upper half (heap, stack) is read/write, the lower half (code, rodata) read-only.
- * The two regions in each half grow toward each other from its ends. */
-static uint8_t *mem_resolve(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int *writable) {
-    if (addr & RISCV_HALF) {                                  /* upper half: read/write */
-        *writable = 1;
-        uint32_t hoff = addr - RISCV_HALF;                    /* heap: [RISCV_HALF, +len) */
-        if (s->heap.ptr && hoff + n <= s->heap.len) return s->heap.ptr + hoff;
-        uint32_t sbase = (uint32_t)(0u - s->stack.len);       /* stack: [2^32-len, 2^32) */
-        if (s->stack.ptr && addr >= sbase && addr - sbase + n <= s->stack.len)
-            return s->stack.ptr + (addr - sbase);
-    } else {                                                  /* lower half: read-only */
-        *writable = 0;
-        if (s->code.ptr && addr + n <= s->code.len) return s->code.ptr + addr;  /* code: [0,len) */
-        uint32_t rbase = RISCV_HALF - s->rodata.len;          /* rodata: [HALF-len, HALF) */
-        if (s->rodata.ptr && addr >= rbase && addr - rbase + n <= s->rodata.len)
-            return s->rodata.ptr + (addr - rbase);
-    }
+/* The half (addr >> 31) selects a pair of adjacent regions; within it the two
+ * grow toward each other -- region[half*2] up from the half's base, region[half*2
+ * + 1] down from RISCV_HALF. Returns host storage for [addr, addr+n) or NULL. */
+static uint8_t *mem_resolve(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
+    const RiscvEmulatorRegion_t *r = &s->region[(addr >> 31) << 1];
+    uint32_t lo = addr & (RISCV_HALF - 1);
+    if (lo + n <= r[0].len) return r[0].ptr + lo;            /* grows up from the base */
+    uint32_t down = RISCV_HALF - r[1].len;                   /* grows down from RISCV_HALF */
+    if (lo >= down && lo + n <= RISCV_HALF) return r[1].ptr + (lo - down);
     return (uint8_t *)0;
 }
 
-/* A load of n bytes, zero-extended. In-region anywhere readable; a miss goes to
- * the callback, whose return supplies the (low n bytes of the) loaded word. */
+/* A load of n bytes, zero-extended. Readable in either half; a miss goes to the
+ * callback, whose return supplies the (low n bytes of the) loaded word. */
 static uint32_t mem_load(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n) {
-    int w;
-    uint8_t *p = mem_resolve(s, addr, n, &w);
+    uint8_t *p = mem_resolve(s, addr, n);
     uint32_t v = 0;
     if (p) { memcpy(&v, p, n); return v; }
     v = s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0;
     return n == 4 ? v : (v & ((1u << (8 * n)) - 1));
 }
-/* A store of the low n bytes of val. Allowed only in the writable (upper) half; a
- * store to read-only memory or a miss goes to the callback. */
+/* A store of the low n bytes of val. Allowed only in the writable upper half; a
+ * store to the read-only lower half or a miss goes to the callback. */
 static void mem_store(RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, uint32_t val) {
-    int w;
-    uint8_t *p = mem_resolve(s, addr, n, &w);
-    if (p && w) memcpy(p, &val, n);
+    uint8_t *p = (addr & RISCV_HALF) ? mem_resolve(s, addr, n) : (uint8_t *)0;
+    if (p) memcpy(p, &val, n);
     else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, val);
 }
 
@@ -98,8 +86,8 @@ static uint32_t muldiv(uint32_t f3, uint32_t a, uint32_t b) {
 
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t pc = s->pc;              /* resume where we left off */
-    const uint8_t *code = s->code.ptr;        /* instruction-fetch window... */
-    uint32_t code_len = s->code.len;          /* ...based at 0 */
+    const uint8_t *code = s->region[RISCV_CODE].ptr;   /* instruction-fetch window... */
+    uint32_t code_len = s->region[RISCV_CODE].len;     /* ...based at 0 */
     uint64_t k = 0;
     int stop = 0;
 
@@ -331,10 +319,10 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *s,
                        RiscvEmulatorRegion_t code, RiscvEmulatorRegion_t rodata,
                        RiscvEmulatorRegion_t heap, RiscvEmulatorRegion_t stack) {
     memset(s, 0, sizeof *s);              /* clears registers, regions, handlers */
-    s->code = code;                       /* [0, len): instruction fetch + read-only data */
-    s->rodata = rodata;                   /* read-only data, just below RISCV_HALF */
-    s->heap = heap;                       /* read/write, from RISCV_HALF up */
-    s->stack = stack;                     /* read/write, grows down, ends at the last address */
+    s->region[RISCV_CODE]   = code;       /* [0, len): instruction fetch + read-only data */
+    s->region[RISCV_RODATA] = rodata;     /* read-only data, just below RISCV_HALF */
+    s->region[RISCV_HEAP]   = heap;       /* read/write, from RISCV_HALF up */
+    s->region[RISCV_STACK]  = stack;      /* read/write, grows down, ends at the last address */
     s->callback = default_callback;       /* no-op until the host installs its own */
     s->x[2] = 0;                          /* sp = 0 == 2^32, one past the top of the stack */
     s->pc = s->npc = 0;                   /* code is based at 0 */

@@ -283,9 +283,9 @@ do most of that:
 `RiscvEmulatorLoop(state, max)` runs a *batch* of up to `max` instructions in one
 call — the fetch → decode → execute step is the body of an internal loop, so there
 is no per-instruction call boundary — and returns how many it ran. The pc lives in
-the state; instructions are fetched from `state->code` (based at 0), data resolves
-to one of the four regions by a single bit-31 half-test, and an access the regions
-can't satisfy calls `state->callback`.
+the state; instructions are fetched from `state->region[RISCV_CODE]` (based at 0),
+data resolves to one of the four regions by indexing `region[(addr>>31)<<1]` and
+checking the two regions of that half, and a miss calls `state->callback`.
 
 Correctness is **verified against an independent reference** — the ACT suite
 diffed against Spike golden signatures (`make act`, 75/75 in scope; see above and

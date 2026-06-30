@@ -99,23 +99,14 @@ static uint32_t on_oob(RiscvEmulatorState_t *state, int op, uint32_t addr, uint3
  * result in a0. Only what single-threaded console programs need; everything else
  * returns -ENOSYS. Enabled by --user; without it an ecall is a nop and execution
  * continues (the signature-dump suites halt via the tohost word we poll). */
-/* Read a guest byte through the region map -- the write buffer may live in any of
- * the four regions (text/rodata, heap, or the stack). Mirrors the engine's
- * address routing: the half decides which two regions to try. */
+/* Read a guest byte the way the engine resolves one: the half picks a pair of
+ * regions, the lower grows up from the base, the upper grows down from RISCV_HALF. */
 static uint8_t guest_byte(const RiscvEmulatorState_t *st, uint32_t a) {
-    const RiscvEmulatorRegion_t *r; uint32_t off;
-    if (a & RISCV_HALF) {                              /* upper half: heap, then stack */
-        if (a - RISCV_HALF < st->heap.len)            { r = &st->heap;  off = a - RISCV_HALF; }
-        else { uint32_t sb = (uint32_t)(0u - st->stack.len);
-               if (a >= sb)                            { r = &st->stack; off = a - sb; }
-               else return 0; }
-    } else {                                          /* lower half: code, then rodata */
-        if (a < st->code.len)                          { r = &st->code;  off = a; }
-        else { uint32_t rb = RISCV_HALF - st->rodata.len;
-               if (st->rodata.len && a >= rb)          { r = &st->rodata; off = a - rb; }
-               else return 0; }
-    }
-    return (r->ptr && off < r->len) ? r->ptr[off] : 0;
+    const RiscvEmulatorRegion_t *r = &st->region[(a >> 31) << 1];
+    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
+    if (lo < r[0].len)  return r[0].ptr[lo];
+    if (lo >= down && r[1].len) return r[1].ptr[lo - down];
+    return 0;
 }
 
 static int on_ecall(RiscvEmulatorState_t *state) {

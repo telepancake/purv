@@ -150,37 +150,27 @@ static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
     else if (i)  st->x[i] = v;              /* x0 stays zero */
 }
 
-/* Guest memory by walking the state's four regions (the public struct exposes
- * them): the half decides which two to try -- lower [0): code then rodata
- * (read-only); upper [RISCV_HALF): heap then stack (read/write). Out-of-range
- * reads give zero; reads/writes to read-only memory still read but never write. */
-static const RiscvEmulatorRegion_t *region_of(const RiscvEmulatorState_t *st, uint32_t a,
-                                              uint32_t *off, int *writable) {
-    if (a & RISCV_HALF) {
-        *writable = 1;
-        if (a - RISCV_HALF < st->heap.len)  { *off = a - RISCV_HALF; return &st->heap; }
-        uint32_t sb = (uint32_t)(0u - st->stack.len);
-        if (a >= sb)                        { *off = a - sb;         return &st->stack; }
-    } else {
-        *writable = 0;
-        if (a < st->code.len)               { *off = a;             return &st->code; }
-        uint32_t rb = RISCV_HALF - st->rodata.len;
-        if (st->rodata.len && a >= rb)      { *off = a - rb;        return &st->rodata; }
-    }
-    return (const RiscvEmulatorRegion_t *)0;
+/* Guest memory resolved like the engine does: the half picks a pair of regions,
+ * the lower grows up from the base, the upper grows down from RISCV_HALF. Returns
+ * a byte pointer or NULL (out of range). Writes are allowed only in the writable
+ * upper half, so the caller checks the half before storing. */
+static uint8_t *byte_at(const RiscvEmulatorState_t *st, uint32_t a) {
+    const RiscvEmulatorRegion_t *r = &st->region[(a >> 31) << 1];
+    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
+    if (lo < r[0].len)          return r[0].ptr + lo;
+    if (lo >= down && r[1].len) return r[1].ptr + (lo - down);
+    return (uint8_t *)0;
 }
 static void mem_read(const RiscvEmulatorState_t *st, uint32_t addr, uint8_t *dst, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
-        uint32_t off; int w;
-        const RiscvEmulatorRegion_t *r = region_of(st, addr + i, &off, &w);
-        dst[i] = (r && r->ptr && off < r->len) ? r->ptr[off] : 0;
+        uint8_t *p = byte_at(st, addr + i);
+        dst[i] = p ? *p : 0;
     }
 }
 static void mem_write(RiscvEmulatorState_t *st, uint32_t addr, const uint8_t *src, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
-        uint32_t off; int w;
-        const RiscvEmulatorRegion_t *r = region_of(st, addr + i, &off, &w);
-        if (r && w && r->ptr && off < r->len) ((uint8_t *)r->ptr)[off] = src[i];
+        uint8_t *p = (addr + i) & RISCV_HALF ? byte_at(st, addr + i) : (uint8_t *)0;
+        if (p) *p = src[i];
     }
 }
 
