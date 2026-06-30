@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# pvcc - build C/H sources into a purva image in one command.
+#
+#   pvcc foo.c bar.c -o foo.img              link as a program (needs _start)
+#   pvcc fn.c --lib -o fn.img                link as a library (no _start; entry=0,
+#                                              call functions directly via --invoke)
+#
+# Wraps the finicky part: the right clang freestanding flags, purva.ld, and
+# --emit-relocs (the transcoder needs the kept relocations to find function
+# pointers stored in data -- see transcode.h/tctool.c), then runs `transcode` to
+# produce the image. Always keeps the linked .elf next to the image (same base
+# name, .elf suffix) -- pass it to purva's --symbols= for --invoke / signature
+# symbol resolution; the image itself carries no symbols by design.
+#
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+LD_SCRIPT="$HERE/purva.ld"
+TRANSCODE="$HERE/transcode"
+
+GUESTCC="${GUESTCC:-clang}"
+GUEST_ARCH="--target=riscv32 -march=rv32im -mabi=ilp32"
+GUEST_CFLAGS="-ffreestanding -nostdlib -fno-builtin -fno-stack-protector -O2"
+RVLD="${RVLD:-ld.lld}"
+
+die() { echo "pvcc: $*" >&2; exit 2; }
+[ -x "$TRANSCODE" ] || die "transcode not built (run: make -C $HERE transcode)"
+
+out="a.img"
+lib=0
+sources=()
+extra_cflags=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    --lib) lib=1; shift ;;
+    -h|--help)
+      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *.c|*.S) sources+=("$1"); shift ;;
+    *) extra_cflags+=("$1"); shift ;;     # pass through -I/-D/-f.../-W... etc.
+  esac
+done
+[ "${#sources[@]}" -gt 0 ] || die "no source files given"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+objs=()
+for src in "${sources[@]}"; do
+  obj="$work/$(basename "$src").o"
+  $GUESTCC $GUEST_ARCH $GUEST_CFLAGS "${extra_cflags[@]}" -c "$src" -o "$obj" \
+    || die "compile failed: $src"
+  objs+=("$obj")
+done
+
+elf="${out%.img}.elf"
+entry_flag="-e _start"
+[ "$lib" = 1 ] && entry_flag="--entry=0"
+$RVLD -m elf32lriscv -T "$LD_SCRIPT" --emit-relocs $entry_flag "${objs[@]}" -o "$elf" \
+  || die "link failed"
+
+"$TRANSCODE" "$elf" "$out" || die "transcode failed"
+
+echo "pvcc: $out  (symbols in $elf -- pass --symbols=$elf to purva for --invoke/signature)"
