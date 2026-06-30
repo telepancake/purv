@@ -36,8 +36,13 @@
 
 /* ------------------------------------------------------------------ memory */
 
-#define RAM_BYTES (256u * 1024 * 1024)
-static uint8_t *g_ram;
+#define RAM_BYTES   (256u * 1024 * 1024)
+#define STACK_BASE  (RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE)  /* region 7 */
+#define STACK_BYTES (16u * 1024 * 1024)
+static uint8_t *g_ram;                    /* code + data + heap (region 0) */
+#ifndef PURV_TAGGED
+static uint8_t *g_stack;                  /* stack (region 7); purvs keeps its stack in region 0 */
+#endif
 
 static int in_ram(uint32_t a, uint32_t n) {
     return a >= RAM_ORIGIN && (uint64_t)a + n <= (uint64_t)RAM_ORIGIN + RAM_BYTES;
@@ -119,18 +124,16 @@ static uint32_t host_realloc(uint32_t ap, uint32_t n) {
 
 /* ------------------------------------------------------------- engine hooks */
 
-/* Read guest memory (the host owns g_ram, mapped as the engine's region 0). */
-static void mem_read(uint32_t addr, void *dst, uint32_t len) {
-    if (in_ram(addr, len)) memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
-    else memset(dst, 0, len);
-}
-
 static void service_hostcall(RiscvEmulatorState_t *st);
 
 #ifdef PURV_TAGGED
 /* purvs is the older, machine-mode tagged engine: it still reaches the host
  * through link-time memory + trap hooks. Tags are ignored here (we only time the
  * engine's per-instruction tag tracking, not enforce a policy). */
+static void mem_read(uint32_t addr, void *dst, uint32_t len) {
+    if (in_ram(addr, len)) memcpy(dst, &g_ram[addr - RAM_ORIGIN], len);
+    else memset(dst, 0, len);
+}
 static void mem_write(uint32_t addr, const void *src, uint32_t len) {
     if (in_ram(addr, len)) memcpy(&g_ram[addr - RAM_ORIGIN], src, len);
     else { fprintf(stderr, "purv-sqlite: stray store 0x%08x len %u\n", addr, len); g_halt = 1; g_exit = 1; }
@@ -190,6 +193,21 @@ static inline uint32_t gpc(const RiscvEmulatorState_t *s)          { return s->p
 static inline uint32_t gnpc(const RiscvEmulatorState_t *s)         { return s->npc; }
 #endif
 
+/* A guest byte for the write syscall -- it may point into any region (the stack
+ * is its own region now), so purv walks the region map; purvs reads region 0. */
+#ifdef PURV_TAGGED
+static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
+    (void)s; return in_ram(a, 1) ? g_ram[a - RAM_ORIGIN] : 0;
+}
+#else
+static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
+    if (a < RAM_ORIGIN) return 0;
+    const RiscvEmulatorRegion_t *r = &s->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
+    uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
+    return (r->ptr && off < r->len) ? r->ptr[off] : 0;
+}
+#endif
+
 /* ------------------------------------------------ host-function service loop */
 
 static void service_hostcall(RiscvEmulatorState_t *st) {
@@ -206,7 +224,7 @@ static void service_hostcall(RiscvEmulatorState_t *st) {
         char buf[4096];
         while (left) {
             uint32_t chunk = left > sizeof buf ? (uint32_t)sizeof buf : left;
-            mem_read(p, buf, chunk);
+            for (uint32_t j = 0; j < chunk; j++) buf[j] = (char)gbyte(st, p + j);
             ssize_t wr = write(a0 == 2 ? 2 : 1, buf, chunk);
             if (wr < 0) break;
             p += chunk; left -= chunk;
@@ -283,26 +301,30 @@ int main(int argc, char **argv) {
     if (!g_ram) { fprintf(stderr, "OOM\n"); return 2; }
 
     uint32_t entry = load_elf(argv[1]);
-
-    /* Heap arena: from just past the loaded image up to a stack reserve below
-     * the top of RAM. Grows on demand via the malloc host calls. */
-    #define STACK_RESERVE (16u * 1024 * 1024)
-    uint32_t heap_base = (g_image_end + 15u) & ~15u;
-    heap_init(heap_base, RAM_ORIGIN + RAM_BYTES - STACK_RESERVE);
+    uint32_t heap_base = (g_image_end + 15u) & ~15u;   /* heap: just past the image */
 
 #ifdef PURV_TAGGED
+    /* purvs keeps its stack at the top of region 0, so reserve it from the heap. */
+    heap_init(heap_base, RAM_ORIGIN + RAM_BYTES - 16u * 1024 * 1024);
     RiscvEmulatorState_t *st = RiscvEmulatorCreate(RAM_ORIGIN + RAM_BYTES);
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
+    rset(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of region 0 */
 #else
-    /* purv: allocate the state, map the flat RAM as region 0, assign handlers. */
-    RiscvEmulatorState_t state = {0};
+    /* purv: the stack is its own region (region 7), so the heap uses all of
+     * region 0. Init wires code + stack + sp; we add region 0 and the handlers. */
+    g_stack = calloc(1, STACK_BYTES);
+    if (!g_stack) { fprintf(stderr, "OOM\n"); return 2; }
+    heap_init(heap_base, RAM_ORIGIN + RAM_BYTES);
+    RiscvEmulatorRegion_t code  = { g_ram, RAM_BYTES, 1 };
+    RiscvEmulatorRegion_t stack = { g_stack, STACK_BYTES, 1 };
+    RiscvEmulatorState_t state;
+    RiscvEmulatorInit(&state, code, stack);   /* sp = top of region 7 */
     RiscvEmulatorState_t *st = &state;
-    st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, RAM_BYTES, 1 };
+    st->mem[0] = code;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
 #endif
-    rset(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of RAM */
     spc(st, entry);
 
     struct timespec t0, t1;
@@ -323,7 +345,7 @@ int main(int argc, char **argv) {
     while (i < max_insns && !g_halt) {
         uint64_t budget = max_insns - i;
         if (budget > SLICE) budget = SLICE;
-        uint64_t ran = RiscvEmulatorLoop(st, g_ram, RAM_BYTES, RAM_ORIGIN, budget);
+        uint64_t ran = RiscvEmulatorLoop(st, budget);
         i += ran;
         if (g_halt) break;
         if (ran < budget) {                  /* pc left RAM: stray fetch */

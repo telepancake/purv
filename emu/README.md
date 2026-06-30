@@ -10,8 +10,8 @@ the handlers you put in the state; nothing vectors anywhere.
 
 ```
 emu/
-  purv.h      public interface — the state struct + the calls you need (~85 lines)
-  purv.c      the whole engine behind purv.h (hand-written, ~305 lines)
+  purv.h      public interface — the state struct + the calls you need (~90 lines)
+  purv.c      the whole engine behind purv.h (hand-written, ~310 lines)
   act/        userspace ACT conformance vs Spike golden signatures (make act)
   purg.c/.h   the earlier engine, mechanically generated from atoom (g = generated;
               kept for reference, not built — see "How the engine is organized")
@@ -30,31 +30,37 @@ host; write your own and link against the engine.
 
 The engine is **self-contained: no link-time host hooks**. The state struct is
 public, so you set it up by writing its fields -- there are no trivial get/set
-wrappers. Map memory, assign the handlers it calls, set the pc, and run a batch:
+wrappers. `RiscvEmulatorInit` zeroes the struct and wires the two regions every
+program needs (the code window and the stack); you then map any data regions,
+assign the handlers, and run a batch:
 
 ```c
-RiscvEmulatorState_t st = {0};                /* allocate it yourself (stack or heap) */
-st.x[2]    = sp_top;                           /* sp */
-st.mem[0]  = (RiscvEmulatorRegion_t){ ram, ram_len, /*writable=*/1 };  /* region 0 */
+RiscvEmulatorState_t st;                       /* allocate it yourself (stack or heap) */
+RiscvEmulatorRegion_t code  = { ram,   ram_len,   /*writable=*/1 };  /* fetch window */
+RiscvEmulatorRegion_t stack = { stkbuf, stk_len,  /*writable=*/1 };  /* -> region 7 */
+RiscvEmulatorInit(&st, code, stack);            /* sets st.code, st.mem[7], sp, pc */
+st.mem[0]  = (RiscvEmulatorRegion_t){ ram, ram_len, 1 };  /* data: region 0 */
 st.ecall   = on_ecall;          /* int (*)(state): nonzero -> stop the run loop */
 st.ebreak  = on_ebreak;
 st.illegal = on_illegal;
-st.pc      = entry;
-uint64_t ran = RiscvEmulatorLoop(&st, code, code_len, code_base, max);  /* runs a batch */
+st.pc      = entry;                             /* defaults to 0x80000000 */
+uint64_t ran = RiscvEmulatorLoop(&st, max);     /* runs a batch of up to `max` */
 ```
 
 The address space is **8 evenly spaced regions** (`st->mem[0..7]`), each up to
 256 MiB, based at `0x80000000`, `0x90000000`, … `0xF0000000`. A data load from an
 unmapped/out-of-bounds address reads zero; a store to a read-only or
-out-of-bounds address is dropped. Instruction *fetch* comes from the code window
-passed to `RiscvEmulatorLoop` (`code`/`code_len`/`code_base`); a pc outside it
-ends the batch. `ecall`/`ebreak`/`illegal` are the only handlers, and each
-returns nonzero to stop the run loop. The engine exposes essentially one
-function -- `RiscvEmulatorLoop` (plus an optional `RiscvEmulatorInit` that just
-zeroes the struct and sets sp/pc); you allocate the state, write its fields, and
-to touch guest memory from outside you index `st.mem[]` yourself. The struct is
-also naturally sized per target -- smaller on a 32-bit host, where its pointers
-are 4 bytes -- and the engine builds and runs on both.
+out-of-bounds address is dropped. Instruction *fetch* comes from `st.code` (a
+separate window based at `0x80000000`, never one of the data regions); a pc
+outside it ends the batch. The **stack is always region 7** (`st.mem[7]`,
+`0xF0000000`): `RiscvEmulatorInit` takes it as its second argument, points
+`mem[7]` at it, and sets `sp` to the top of that region. `ecall`/`ebreak`/`illegal`
+are the only handlers, and each returns nonzero to stop the run loop. The engine
+exposes essentially two functions -- `RiscvEmulatorLoop` and `RiscvEmulatorInit`;
+you allocate the state, write its fields, and to touch guest memory from outside
+you index `st.mem[]` yourself. The struct is also naturally sized per target --
+smaller on a 32-bit host, where its pointers are 4 bytes -- and the engine builds
+and runs on both.
 
 ## Build
 
@@ -219,7 +225,8 @@ from `0x80000000`; the host maps host storage into them by writing `st->mem[i]`.
 | region | base address | `main.c` use                                |
 |-------:|--------------|---------------------------------------------|
 | 0      | `0x80000000` | flat RAM backing array (`--ram=` bytes), writable |
-| 1..7   | `0x90000000`…`0xF0000000` | unmapped (reads 0, stores dropped) |
+| 1..6   | `0x90000000`…`0xE0000000` | unmapped (reads 0, stores dropped) |
+| 7      | `0xF0000000` | user stack (`--user`), writable; `sp` starts at its top |
 
 There is no MMIO: console output is the `write` syscall (`--user`) and a
 conformance test halts by writing the `tohost` word, which the host polls (both
@@ -230,7 +237,7 @@ silently dropped; such loads read zero.
 
 `purv.c` is hand-written (so are `purv.h` and `main.c`). It keeps atoom's premise
 — the host owns the memory map; the engine reaches the world only through the
-hooks above — but trims the redundancy of the original, in ~305 lines. Two ideas
+hooks above — but trims the redundancy of the original, in ~310 lines. Two ideas
 do most of that:
 
 - **Registers are indices into `x[32]`, not pointers.** `x0` is never written, so
@@ -244,11 +251,11 @@ do most of that:
   instruction decodes a field it won't use. Reserved/illegal encodings `goto
   illegal`, which calls the host's illegal hook.
 
-`RiscvEmulatorLoop(state, code, code_len, code_base, max)` runs a *batch* of up
-to `max` instructions in one call — the fetch → decode → execute step is the body
-of an internal loop, so there is no per-instruction call boundary — and returns
-how many it ran. The pc lives in the state; instructions are fetched from the
-code window, data goes through the mapped regions.
+`RiscvEmulatorLoop(state, max)` runs a *batch* of up to `max` instructions in one
+call — the fetch → decode → execute step is the body of an internal loop, so there
+is no per-instruction call boundary — and returns how many it ran. The pc lives in
+the state; instructions are fetched from `state->code`, data goes through the
+mapped regions (`state->mem[]`).
 
 Correctness is **verified against an independent reference** — the ACT suite
 diffed against Spike golden signatures (`make act`, 76/76 in scope; see above and

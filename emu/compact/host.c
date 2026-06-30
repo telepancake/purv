@@ -18,11 +18,20 @@
 #include "../purv.h"
 #include "hostcalls.h"
 
-#define RAM_BYTES (64u * 1024 * 1024)
-static uint8_t *g_ram;
+#define RAM_BYTES   (64u * 1024 * 1024)
+#define STACK_BASE  (RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE)  /* region 7 */
+#define STACK_BYTES (4u * 1024 * 1024)
+static uint8_t *g_ram;                   /* code + data + heap (region 0) */
+static uint8_t *g_stack;                 /* stack (region 7) */
 
 static int in_ram(uint32_t a, uint32_t n) {
     return a >= RAM_ORIGIN && (uint64_t)a + n <= (uint64_t)RAM_ORIGIN + RAM_BYTES;
+}
+/* Read a guest byte through the region map (region 0 RAM or region 7 stack). */
+static uint8_t guest_byte(uint32_t a) {
+    if (a >= RAM_ORIGIN && a < RAM_ORIGIN + RAM_BYTES) return g_ram[a - RAM_ORIGIN];
+    if (a >= STACK_BASE && a < STACK_BASE + STACK_BYTES) return g_stack[a - STACK_BASE];
+    return 0;
 }
 
 static int      g_halt, g_exit;
@@ -92,8 +101,7 @@ static void service(RiscvEmulatorState_t *st) {
     switch (fn) {
     case HOSTCALL_WRITE:
         for (uint32_t i = 0; i < a2; i++) {
-            uint8_t b = 0;
-            if (in_ram(a1 + i, 1)) b = g_ram[(a1 + i) - RAM_ORIGIN];
+            uint8_t b = guest_byte(a1 + i);
             if (write(a0 == 2 ? 2 : 1, &b, 1) < 0) break;
         }
         ret = a2;
@@ -122,18 +130,23 @@ static uint32_t load_flat(const char *path) {
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <flat-image>\n", argv[0]); return 2; }
     g_ram = calloc(1, RAM_BYTES);
-    if (!g_ram) { fprintf(stderr, "compact: OOM\n"); return 2; }
+    g_stack = calloc(1, STACK_BYTES);
+    if (!g_ram || !g_stack) { fprintf(stderr, "compact: OOM\n"); return 2; }
 
     uint32_t entry = load_flat(argv[1]);
-    heap_init((g_image_end + 15u) & ~15u, RAM_ORIGIN + RAM_BYTES - 1024u * 1024u);
+    heap_init((g_image_end + 15u) & ~15u, RAM_ORIGIN + RAM_BYTES);   /* heap uses all of region 0 */
 
-    RiscvEmulatorState_t state = {0};
+    /* code (fetch) and region 0 (data) both view the flat image; stack is its
+     * own region. Init wires code + stack + sp; we add region 0 and handlers. */
+    RiscvEmulatorRegion_t code  = { g_ram, RAM_BYTES, 1 };
+    RiscvEmulatorRegion_t stack = { g_stack, STACK_BYTES, 1 };
+    RiscvEmulatorState_t state;
+    RiscvEmulatorInit(&state, code, stack);
     RiscvEmulatorState_t *st = &state;
-    st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, RAM_BYTES, 1 };  /* flat image -> region 0 */
+    st->mem[0] = code;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
-    st->x[2] = RAM_ORIGIN + RAM_BYTES;                          /* sp */
     st->pc = entry;
 
     /* pc lives in the state; run in slices off the flat RAM image. */
@@ -142,7 +155,7 @@ int main(int argc, char **argv) {
     while (i < CAP && !g_halt) {
         uint64_t budget = CAP - i;
         if (budget > SLICE) budget = SLICE;
-        uint64_t ran = RiscvEmulatorLoop(st, g_ram, RAM_BYTES, RAM_ORIGIN, budget);
+        uint64_t ran = RiscvEmulatorLoop(st, budget);
         i += ran;
         if (g_halt) break;
         if (ran < budget) {                  /* pc left RAM: stray fetch */

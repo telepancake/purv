@@ -42,9 +42,11 @@ typedef struct {
 /* The whole VM state. Set it up by writing the fields:
  *   - pc:       the next instruction to execute (the run loop resumes here);
  *   - x[1..31]: registers (x[0] reads as zero; the engine never writes it);
- *   - mem[i]:   map region i (a data load from an unmapped/out-of-bounds address
+ *   - code:     the instruction-fetch window, based at RAM_ORIGIN -- the engine
+ *               reads instructions only from here, never from mem[];
+ *   - mem[i]:   data region i (a load from an unmapped/out-of-bounds address
  *               reads zero; a store to a read-only/out-of-bounds address is
- *               dropped);
+ *               dropped). mem[RISCV_REGIONS-1] is conventionally the stack;
  *   - ecall/ebreak/illegal: the handlers the engine calls.
  * The remaining fields (npc, inst, trap) are engine-internal scratch. */
 struct RiscvEmulatorState {
@@ -53,33 +55,34 @@ struct RiscvEmulatorState {
     uint32_t inst;                               /* internal: raw word of the current insn */
     uint32_t x[32];
     uint8_t  trap;                               /* internal: pending illegal flag */
+    RiscvEmulatorRegion_t code;                  /* instruction fetch, based at RAM_ORIGIN */
     RiscvEmulatorRegion_t mem[RISCV_REGIONS];
     RiscvEmulatorTrapFn   ecall, ebreak, illegal;
 };
 
-/* Optional convenience: zero the state, set sp (x[2]) to initial_sp, and park pc
- * at a reset vector. Equivalent to `RiscvEmulatorState_t st = {0}; st.x[2] = sp;`
- * -- allocate the struct yourself (stack or heap); there is no create/destroy. */
-void RiscvEmulatorInit(RiscvEmulatorState_t *state, uint32_t initial_sp);
+/* Optional convenience: zero the state, then map `code` as the instruction-fetch
+ * window (based at RAM_ORIGIN) and `stack` as the last data region
+ * (mem[RISCV_REGIONS-1], based at the top of the address space). sp (x[2]) is set
+ * to the top of the stack region, and pc to RAM_ORIGIN. Allocate the struct
+ * yourself (stack or heap); there is no create/destroy. */
+void RiscvEmulatorInit(RiscvEmulatorState_t *state,
+                       RiscvEmulatorRegion_t code, RiscvEmulatorRegion_t stack);
 
 /* ---- The VM ----
  * Execute up to `max` instructions and return the number actually executed.
  * Execution resumes at state->pc and leaves state->pc at the next instruction.
  *
- * Instructions are fetched ONLY from the code window: `code` points at the host
- * bytes for guest address `code_base` and spans `code_len` bytes. A pc outside
- * [code_base, code_base+code_len) ends the batch and is left in state->pc (a
- * short return -- fewer than `max` -- with pc outside the window is how you
- * detect it). Data loads/stores go through state->mem; only fetch uses the
- * window.
+ * Instructions are fetched ONLY from state->code, the window based at RAM_ORIGIN:
+ * a pc outside [RAM_ORIGIN, RAM_ORIGIN + code.len) ends the batch and is left in
+ * state->pc (a short return -- fewer than `max` -- with pc outside the window is
+ * how you detect it). Data loads/stores go through state->mem; only fetch uses
+ * the code window.
  *
  * Loop also stops when `max` is reached, or an ecall/ebreak/illegal handler
  * returns nonzero. A halt the host decides by other means (e.g. polling a tohost
  * word it owns) is invisible to the engine; run Loop in bounded slices and check
  * between them. */
-uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *state,
-                           const uint8_t *code, uint32_t code_len, uint32_t code_base,
-                           uint64_t max);
+uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint64_t max);
 
 /* (To read or write guest memory from outside the engine, index state->mem[]
  * directly: region i covers [RAM_ORIGIN + i*RISCV_REGION_SIZE, + region.len).) */

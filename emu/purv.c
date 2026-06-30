@@ -21,8 +21,6 @@
 
 #include "purv.h"
 
-#define ROM_ORIGIN  0x20000000u           /* reset vector if the host sets no pc */
-
 /* Base opcodes (instruction[6:0]). */
 enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
        OP = 0x33, LUI = 0x37, BRANCH = 0x63, JALR = 0x67, JAL = 0x6f, SYSTEM = 0x73 };
@@ -75,20 +73,21 @@ static uint32_t muldiv(uint32_t f3, uint32_t a, uint32_t b) {
 
 /* ----------------------------------------------------------------- the VM */
 
-uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s,
-                           const uint8_t *code, uint32_t code_len, uint32_t code_base,
-                           uint64_t max) {
+uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t pc = s->pc;              /* resume where we left off */
+    const uint8_t *code = s->code.ptr;        /* instruction-fetch window... */
+    uint32_t code_len = s->code.len;          /* ...based at RAM_ORIGIN */
     uint64_t k = 0;
     int stop = 0;
 
     /* Each iteration runs one instruction; the whole step is inlined here, so
      * there is no per-instruction call. */
     for (; k < max && !stop; k++) {
-        /* Fetch from the caller's code window. A pc not (fully) inside it ends
-         * the batch -- the engine fetches only from the provided code. */
-        uint32_t off = pc - code_base;
-        if (pc < code_base || off + 2 > code_len) break;
+        /* Fetch from the code window (based at RAM_ORIGIN). A pc not (fully)
+         * inside it ends the batch -- the engine fetches only from state->code. */
+        if (!code || pc < RAM_ORIGIN) break;
+        uint32_t off = pc - RAM_ORIGIN;
+        if (off + 2 > code_len) break;
 
         uint32_t rd = 0, rs1 = 0, a = 0, b = 0, f3 = 0, f7 = 0, imm = 0, r, addr, n;
 
@@ -299,8 +298,12 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s,
 
 /* ------------------------------------------------------------------ init */
 
-void RiscvEmulatorInit(RiscvEmulatorState_t *s, uint32_t initial_sp) {
+void RiscvEmulatorInit(RiscvEmulatorState_t *s,
+                       RiscvEmulatorRegion_t code, RiscvEmulatorRegion_t stack) {
     memset(s, 0, sizeof *s);              /* clears registers, memory map, handlers */
-    s->x[2] = initial_sp;                 /* sp */
-    s->pc = s->npc = ROM_ORIGIN;
+    s->code = code;                       /* instruction fetch, based at RAM_ORIGIN */
+    s->mem[RISCV_REGIONS - 1] = stack;    /* stack is the last region */
+    /* sp starts at the top of the stack region (its base + its size). */
+    s->x[2] = RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE + stack.len;
+    s->pc = s->npc = RAM_ORIGIN;          /* code starts at RAM_ORIGIN */
 }

@@ -33,10 +33,15 @@
 
 /* ------------------------------------------------------------------ memory */
 
-/* Flat RAM, mapped as the engine's region 0 (RAM_ORIGIN..). */
+/* Flat RAM, mapped as the engine's region 0 (RAM_ORIGIN..) for code + data +
+ * heap, and a separate stack buffer mapped as the last region (region 7, based
+ * at STACK_BASE). */
 #define PURV_RAM_DEFAULT (256u * 1024u * 1024u)
+#define STACK_BASE  (RAM_ORIGIN + (RISCV_REGIONS - 1) * RISCV_REGION_SIZE)  /* 0xF0000000 */
+#define STACK_BYTES (16u * 1024u * 1024u)
 static uint8_t *g_ram;
 static uint32_t g_ram_size;
+static uint8_t *g_stack;
 
 /* Run/termination state shared with the handlers. */
 static int      g_halt;                  /* set by a handler/poll to stop the loop */
@@ -72,6 +77,15 @@ static int on_illegal(RiscvEmulatorState_t *state) {
  * result in a0. Only what single-threaded console programs need; everything else
  * returns -ENOSYS. Enabled by --user; without it an ecall is a nop and execution
  * continues (the signature-dump suites halt via the tohost word we poll). */
+/* Read a guest byte through the region map -- the write buffer may be anywhere
+ * (often the stack, which is its own region), not just region 0. */
+static uint8_t guest_byte(const RiscvEmulatorState_t *st, uint32_t a) {
+    if (a < RAM_ORIGIN) return 0;
+    const RiscvEmulatorRegion_t *r = &st->mem[(a - RAM_ORIGIN) / RISCV_REGION_SIZE];
+    uint32_t off = (a - RAM_ORIGIN) % RISCV_REGION_SIZE;
+    return (r->ptr && off < r->len) ? r->ptr[off] : 0;
+}
+
 static int on_ecall(RiscvEmulatorState_t *state) {
     if (!g_user_mode) return 0;          /* no syscall ABI requested: keep running */
     uint32_t num = state->x[17];         /* a7 */
@@ -82,7 +96,7 @@ static int on_ecall(RiscvEmulatorState_t *state) {
     switch (num) {
     case 64:                              /* write(fd, buf, len) */
         for (uint32_t i = 0; i < a2; i++)
-            putchar(in_ram(a1 + i, 1) ? g_ram[(a1 + i) - RAM_ORIGIN] : 0);
+            putchar(guest_byte(state, a1 + i));
         ret = a2;
         fflush(stdout);
         (void)a0;                         /* fd ignored: 1/2 both -> stdout */
@@ -217,20 +231,21 @@ static void dump_signature(const char *path, uint32_t gran) {
 #define MAGIC_RET 0xdeadbee0u            /* sentinel return address for --invoke */
 
 static void gpoke(uint32_t addr, uint32_t v) {
-    memcpy(&g_ram[addr - RAM_ORIGIN], &v, 4);
+    memcpy(&g_stack[addr - STACK_BASE], &v, 4);
 }
 
 /* Build the initial process stack (RISC-V Linux ABI): sp points at argc,
  * followed by the argv pointers, a NULL, an empty envp, and an AT_NULL auxv.
- * Argument strings are copied just below the top of RAM. Returns the new sp. */
+ * Built in the stack region (region 7); argument strings sit just below its top.
+ * Returns the new sp. */
 static uint32_t setup_user_stack(int argc, char **argv) {
-    uint32_t sp = RAM_ORIGIN + g_ram_size;
+    uint32_t sp = STACK_BASE + STACK_BYTES;
     uint32_t ptr[64];
     if (argc > 64) argc = 64;
     for (int i = argc - 1; i >= 0; i--) {
         uint32_t len = (uint32_t)strlen(argv[i]) + 1;
         sp -= len;
-        memcpy(&g_ram[sp - RAM_ORIGIN], argv[i], len);
+        memcpy(&g_stack[sp - STACK_BASE], argv[i], len);
         ptr[i] = sp;
     }
     sp &= ~15u;
@@ -296,17 +311,21 @@ int main(int argc, char **argv) {
     if (!elf) { usage(argv[0]); return 2; }
 
     g_ram = calloc(1, g_ram_size);
-    if (!g_ram) { fprintf(stderr, "purv: cannot allocate %u bytes RAM\n", g_ram_size); return 2; }
+    g_stack = calloc(1, STACK_BYTES);
+    if (!g_ram || !g_stack) { fprintf(stderr, "purv: cannot allocate RAM\n"); return 2; }
 
     uint32_t entry = load_elf(elf);
 
+    /* code (fetch) and region 0 (data) both view the flat RAM at RAM_ORIGIN
+     * (von Neumann); the stack is its own buffer in the last region. Init wires
+     * up code + stack + sp; we add region 0 and the handlers. */
+    uint32_t code_len = g_ram_size < RISCV_REGION_SIZE ? g_ram_size : RISCV_REGION_SIZE;
+    RiscvEmulatorRegion_t code  = { g_ram, code_len, 1 };
+    RiscvEmulatorRegion_t stack = { g_stack, STACK_BYTES, 1 };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, RAM_ORIGIN + g_ram_size);   /* sp = top of RAM */
+    RiscvEmulatorInit(&state, code, stack);
     RiscvEmulatorState_t *st = &state;
-
-    /* Map the flat RAM as region 0 and assign the trap handlers; the engine
-     * reaches the outside world only through these. */
-    st->mem[0] = (RiscvEmulatorRegion_t){ g_ram, g_ram_size, 1 };
+    st->mem[0] = code;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
@@ -333,7 +352,7 @@ int main(int argc, char **argv) {
     if (g_gdb_fd >= 0) {
         /* Hand control to gdb: it steps/continues the engine over the RSP. The
          * guest's console still goes to stdout; the RSP rides the provided fd. */
-        RiscvEmulatorGdbServe(st, g_gdb_fd, &g_halt, &g_exit, g_ram, g_ram_size, RAM_ORIGIN);
+        RiscvEmulatorGdbServe(st, g_gdb_fd, &g_halt, &g_exit);
         return g_exit;
     }
 #endif
@@ -350,7 +369,7 @@ int main(int argc, char **argv) {
     while (i < max_insns && !g_halt) {
         uint64_t budget = max_insns - i;
         if (budget > SLICE) budget = SLICE;
-        uint64_t ran = RiscvEmulatorLoop(st, g_ram, g_ram_size, RAM_ORIGIN, budget);
+        uint64_t ran = RiscvEmulatorLoop(st, budget);
         i += ran;
         if (g_halt) break;
         if (g_have_tohost) {                      /* HTIF tohost: a nonzero write ends the run */

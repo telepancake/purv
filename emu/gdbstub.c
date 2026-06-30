@@ -221,13 +221,10 @@ void RiscvEmulatorGdbRecordStore(uint32_t address, const void *old_bytes, uint8_
     memcpy(g_cur->w[i].old, old_bytes, length);
 }
 
-/* The code window the engine fetches from (set by RiscvEmulatorGdbServe). The
- * pc lives in the state, so a single step is just Loop with max == 1. */
-static const uint8_t *g_code;
-static uint32_t       g_code_len, g_code_base;
-
+/* The pc and the code window both live in the state, so a single step is just
+ * Loop with max == 1. */
 static void step_one(RiscvEmulatorState_t *st) {
-    RiscvEmulatorLoop(st, g_code, g_code_len, g_code_base, 1);
+    RiscvEmulatorLoop(st, 1);
 }
 
 /* Step one instruction while recording it into the history ring. */
@@ -365,11 +362,9 @@ static void handle_q(int fd, const char *buf) {
 /* -------------------------------------------------------------- serve loop */
 
 void RiscvEmulatorGdbServe(RiscvEmulatorState_t *st, int fd,
-                           const int *halted, const int *exitcode,
-                           const uint8_t *code, uint32_t code_len, uint32_t code_base) {
+                           const int *halted, const int *exitcode) {
     char buf[GDB_BUF], out[GDB_BUF], wmsg[8] = "S05";
     int exited = 0;
-    g_code = code; g_code_len = code_len; g_code_base = code_base;
     g_nbp = 0;
     g_noack = 0;
     g_head = g_count = 0;
