@@ -1,10 +1,11 @@
 /*
  * main.c - host/driver for the purva evaluator.
  *
- * It runs a .tc transcoded binary produced by the standalone `transcode` tool -- it
- * never loads an ELF or decodes an instruction. It reads the .tc (tcfile.h), maps
- * its memory image into the engine regions, installs the transcoded program, and
- * drives RiscvEmulatorLoop in slices, exactly as the purv/purvs drivers do.
+ * The upper layer, identical in shape to the purv/purvs driver: it loads the ELF
+ * (memory image, symbols, entry) and services syscalls. The only difference is that
+ * execution runs over a pre-transcoded op array supplied with --ops (produced by the
+ * standalone `transcode` tool) instead of decoding instructions. The evaluator never
+ * sees the ELF; the host never decodes.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -12,14 +13,13 @@
 #include <string.h>
 
 #include "purva.h"        /* purv.h + transcode.h + RiscvEmulatorSetProgram */
-#include "../purvhost.h"  /* region buffers + guest-byte reads              */
-#include "tcfile.h"
+#include "../purvhost.h"
 
 #define CODE_BYTES        (64u * 1024u * 1024u)
 #define PURV_HEAP_DEFAULT (256u * 1024u * 1024u)
 #define STACK_BYTES       (16u * 1024u * 1024u)
 #define STACK_MEM_BASE    ((uint32_t)(0u - STACK_BYTES))
-static uint8_t *g_heap, *g_stack;
+static uint8_t *g_code, *g_heap, *g_stack;
 static uint32_t g_heap_size;
 
 static int      g_halt;
@@ -37,7 +37,14 @@ static int in_heap(uint32_t addr, uint32_t len) {
 /* ------------------------------------------------ trap handlers */
 
 static int on_illegal(RiscvEmulatorState_t *state) {
-    fprintf(stderr, "purva: illegal instruction 0x%08x at pc=0x%08x\n", state->inst, state->pc);
+    /* The evaluator does not carry raw instruction words; recover this one from the
+     * code region (the host has the bytes) just for the diagnostic. */
+    uint32_t pc = state->pc, raw = 0;
+    if (pc + 4 <= state->region[RISCV_CODE].len) {
+        const uint8_t *c = state->region[RISCV_CODE].ptr + pc;
+        raw = (uint32_t)c[0] | c[1] << 8 | c[2] << 16 | (uint32_t)c[3] << 24;
+    }
+    fprintf(stderr, "purva: illegal instruction 0x%08x at pc=0x%08x\n", raw, pc);
     g_halt = 1; g_exit = 1;
     return 1;
 }
@@ -121,9 +128,25 @@ static uint32_t setup_user_stack(int argc, char **argv) {
     return sp;
 }
 
+/* Read a .ops file: n_ops = size/4. Appends an ILLEGAL sentinel so a run that falls
+ * off the end traps instead of reading past the array. */
+static uint32_t *load_ops(const char *path, uint32_t *n_out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "purva: cannot read %s\n", path); exit(2); }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint32_t n = (uint32_t)(sz / 4);
+    uint32_t *ops = malloc(((size_t)n + 1) * 4);
+    if (fread(ops, 4, n, f) != n) { fprintf(stderr, "purva: short read on %s\n", path); exit(2); }
+    fclose(f);
+    ops[n] = (uint32_t)RISCV_OP_ILLEGAL << 26;            /* off-the-end sentinel */
+    *n_out = n;
+    return ops;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [options] <prog.tc> [program args...]\n"
+        "usage: %s --ops=FILE [options] <elf> [program args...]\n"
+        "  --ops=FILE                    transcoded op array (from the transcode tool)\n"
         "  --signature=FILE              dump signature region (RISCOF DUT)\n"
         "  --signature-granularity=N     bytes per signature word (default 4)\n"
         "  --invoke=SYM                  call function SYM, print return (a0)\n"
@@ -135,7 +158,7 @@ static void usage(const char *argv0) {
 }
 
 int main(int argc, char **argv) {
-    const char *tcpath = NULL, *sigfile = NULL, *invoke = NULL;
+    const char *elf = NULL, *sigfile = NULL, *invoke = NULL, *opsfile = NULL;
     uint32_t gran = 4;
     uint64_t max_insns = 256ull * 1024 * 1024;
     uint32_t args[8]; int nargs = 0;
@@ -144,7 +167,8 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strncmp(a, "--signature-granularity=", 24)) gran = (uint32_t)strtoul(a + 24, 0, 0);
+        if (!strncmp(a, "--ops=", 6)) opsfile = a + 6;
+        else if (!strncmp(a, "--signature-granularity=", 24)) gran = (uint32_t)strtoul(a + 24, 0, 0);
         else if (!strncmp(a, "--signature=", 12)) sigfile = a + 12;
         else if (!strncmp(a, "--invoke=", 9)) invoke = a + 9;
         else if (!strncmp(a, "--arg=", 6)) {
@@ -158,37 +182,33 @@ int main(int argc, char **argv) {
         else if (a[0] == '-') { fprintf(stderr, "purva: unknown option %s\n", a); return 2; }
         else if (gargc < 64) gargv[gargc++] = argv[i];
     }
-    if (gargc) tcpath = gargv[0];
-    if (!tcpath) { usage(argv[0]); return 2; }
-
-    /* Load the transcoded binary and map its memory image into the regions. */
-    TcImage img;
-    if (tc_read(tcpath, &img) != 0) { fprintf(stderr, "purva: cannot read %s\n", tcpath); return 2; }
+    if (gargc) elf = gargv[0];
+    if (!elf || !opsfile) { usage(argv[0]); return 2; }
 
     PurvHost host;
     if (purvhost_alloc(&host, CODE_BYTES, g_heap_size, STACK_BYTES) != 0) return 2;
-    g_heap = host.heap; g_stack = host.stack;
-    memcpy(host.code, img.lower, img.code_len);            /* code + rodata (lower half) */
-    if (img.udata_len) memcpy(host.heap, img.udata, img.udata_len);  /* initial data    */
-    host.entry = img.entry; host.data_end = img.data_end;
-    g_brk = (img.data_end + 0xFFFu) & ~0xFFFu;
+    g_code = host.code; g_heap = host.heap; g_stack = host.stack;
+    purvhost_load_elf(&host, elf);
+    g_brk = (host.data_end + 0xFFFu) & ~0xFFFu;
+
+    /* Install the transcoded program; its extent is the code window. */
+    uint32_t n_ops;
+    uint32_t *ops = load_ops(opsfile, &n_ops);
+    Transcoded prog = { ops, n_ops, n_ops * 4 };
 
     RiscvEmulatorState_t state;
     purvhost_init(&host, &state);
     RiscvEmulatorState_t *st = &state;
-    st->region[RISCV_CODE].len = img.code_len;             /* image extent, not capacity */
+    st->region[RISCV_CODE].len = prog.code_len;            /* transcoded image extent */
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
     st->callback = on_oob;
-
-    /* Install the transcoded program -- the evaluator runs this, decoding nothing. */
-    Transcoded prog = { img.ops, img.n_ops, img.map, img.code_len };
     RiscvEmulatorSetProgram(&prog);
 
-    uint32_t start = img.entry;
+    uint32_t start = host.entry;
     if (invoke) {
-        if (!tc_sym(&img, invoke, &start)) {
+        if (!purvhost_sym(&host, invoke, &start)) {
             fprintf(stderr, "purva: symbol '%s' not found\n", invoke); return 2;
         }
         st->x[1] = MAGIC_RET;
@@ -196,9 +216,9 @@ int main(int argc, char **argv) {
     } else if (g_user_mode) {
         st->x[2] = setup_user_stack(gargc, gargv);
     } else {
-        g_have_tohost = tc_sym(&img, "tohost", &g_tohost);
-        g_have_sig    = tc_sym(&img, "begin_signature", &g_begin_sig) &
-                        tc_sym(&img, "end_signature", &g_end_sig);
+        g_have_tohost = purvhost_sym(&host, "tohost", &g_tohost);
+        g_have_sig    = purvhost_sym(&host, "begin_signature", &g_begin_sig) &
+                        purvhost_sym(&host, "end_signature", &g_end_sig);
     }
 
     st->pc = start;

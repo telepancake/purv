@@ -1,39 +1,35 @@
 /*
- * transcode.h - ahead-of-time RISC-V -> "our ops" rewriter (interface).
+ * transcode.h - ahead-of-time RISC-V (RV32IM) -> "our ops" rewriter (interface).
  *
- * The transcoder is the decode pass lifted out of the run loop and run ONCE over a
- * whole RV32IM code image, instead of per straight-line run. It lowers each 4-byte
- * instruction into a packed 32-bit op word (a couple of ops spill one extra word),
- * and builds a pc->word-offset map so a control transfer can find its destination.
- * It is standalone: it reads code bytes and writes op words, and depends on nothing
- * but this header -- no engine state, no registers, no memory map.
+ * Pure code transformation: it lowers each 4-byte instruction into exactly ONE
+ * packed 32-bit op word -- one to one with the instruction stream -- so the op for
+ * guest pc is simply ops[pc>>2]. No side table, no memory image, no symbols: those
+ * are the host's (upper-layer) job, exactly as for purv. The tool's whole output is
+ * the op array.
  *
- * The packed op word: our leaf op in the top 6 bits (so the evaluator dispatches
- * with op = w >> 26, no mask), then the register indices and a 16-bit immediate:
+ * Packed op word: our leaf op in the top 6 bits (dispatch is w>>26, no mask), then
+ * the operands. The immediate is a displacement/value, NOT an absolute address --
+ * the evaluator derives pc from its op cursor, so jumps stay pc-relative and fit:
  *
- *   reg-reg          op[31:26] rd[25:21] rs1[20:16] .......... rs2[4:0]
+ *   reg-reg          op[31:26] rd[25:21] rs1[20:16] rs2[15:11]
  *   reg-imm / load   op[31:26] rd[25:21] rs1[20:16] imm[15:0]
  *   store            op[31:26] rs2[25:21] rs1[20:16] imm[15:0]
- *   branch           op[31:26] rs2[25:21] rs1[20:16] ;  word1 = target pc
- *   jal              op[31:26] rd[25:21]            ;  word1 = target pc
+ *   branch           op[31:26] rs1[25:21] rs2[20:16] disp[15:0]   (byte displacement)
+ *   jal              op[31:26] rd[25:21]  disp[20:0]              (byte displacement)
  *   jalr             op[31:26] rd[25:21] rs1[20:16] imm[15:0]
- *   lui              op[31:26] rd[25:21]            ;  word1 = 32-bit value
- *   nop              op[31:26]
- *   ecall/ebreak/illegal  op[31:26]                ;  word1 = raw instruction word
+ *   lui / auipc      op[31:26] rd[25:21]  uimm20[19:0]
+ *   nop / ecall / ebreak / illegal   op[31:26]
  *
- * Branch/jal carry their absolute target pc, mapped to an op at run time; this keeps
- * the rewriter simple (a tighter build would bake the output offset and drop the
- * word). lui/trap spill because their payload exceeds 16 bits.
+ * (auipc is its own op -- it needs the live pc, which the evaluator has -- so unlike
+ * a baked absolute it fits one word. lui keeps only the 20-bit upper immediate.)
  */
 #ifndef TRANSCODE_H_
 #define TRANSCODE_H_
 
 #include <stdint.h>
 
-/* Our flat leaf ops -- one per evaluator handler. Decode folds the 32-bit forms,
- * funct3/funct7, and the operand source into this one byte (ADDI distinct from ADD).
- * The order is fixed: the evaluator's jump table and the imm/terminator range tests
- * depend on it. (RV32IM only -- no compressed; the transcoder asserts 4-byte steps.) */
+/* Our flat leaf ops -- one per evaluator handler. Order is fixed: the jump table and
+ * the range tests in emit/eval depend on it. RV32IM only (no compressed). */
 enum {
     RISCV_OP_ADD, RISCV_OP_SLL, RISCV_OP_SLT, RISCV_OP_SLTU,
     RISCV_OP_XOR, RISCV_OP_SRL, RISCV_OP_OR,  RISCV_OP_AND,
@@ -46,34 +42,30 @@ enum {
     RISCV_OP_SB, RISCV_OP_SH, RISCV_OP_SW,
     RISCV_OP_BEQ, RISCV_OP_BNE, RISCV_OP_BLT, RISCV_OP_BGE, RISCV_OP_BLTU, RISCV_OP_BGEU,
     RISCV_OP_JAL, RISCV_OP_JALR,
-    RISCV_OP_LUI, RISCV_OP_NOP,
+    RISCV_OP_LUI, RISCV_OP_AUIPC, RISCV_OP_NOP,
     RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,
     RISCV_OP_COUNT
 };
 
-/* Packed-op field accessors (shared by the transcoder's emit and the evaluator). */
-#define TC_OP(w)   ((uint32_t)(w) >> 26)
-#define TC_RD(w)   (((w) >> 21) & 31)
-#define TC_RS1(w)  (((w) >> 16) & 31)
-#define TC_RS2L(w) ((w) & 31)            /* reg-reg: rs2 in the low 5 bits          */
-#define TC_RS2H(w) (((w) >> 21) & 31)    /* store/branch: rs2 in the rd slot        */
-#define TC_IMM(w)  ((int32_t)(int16_t)(w))   /* sign-extended 16-bit immediate      */
+/* Packed-op field accessors. A/B/C are the three register slots; which register each
+ * holds depends on the class (see the layout above), so handlers pick by name. */
+#define TC_OP(w)    ((uint32_t)(w) >> 26)
+#define TC_A(w)     (((w) >> 21) & 31)   /* rd, or rs1 (branch), or rs2 (store)   */
+#define TC_B(w)     (((w) >> 16) & 31)   /* rs1, or rs2 (branch)                  */
+#define TC_C(w)     (((w) >> 11) & 31)   /* rs2 (reg-reg)                         */
+#define TC_IMM(w)   ((int32_t)(int16_t)(w))                       /* 16-bit signed */
+#define TC_JOFF(w)  ((int32_t)(((w) & 0x1fffffu) << 11) >> 11)    /* 21-bit signed */
+#define TC_UIMM(w)  ((w) & 0xfffffu)                              /* 20-bit upper  */
 
-/* map entry for an address that is not an instruction start (or out of the image). */
-#define TC_SENTINEL 0xffffffffu
-
-/* A transcoded program: the packed op stream, and map[pc>>1] -> word offset in it
- * (TC_SENTINEL for a non-instruction pc). code_len is the image extent swept. */
+/* A transcoded program: just the op array (ops[pc>>2]) and how far the code runs. */
 typedef struct {
     uint32_t *ops;
-    uint32_t  n_ops;
-    uint32_t *map;
-    uint32_t  code_len;
+    uint32_t  n_ops;       /* == code_len/4                     */
+    uint32_t  code_len;    /* image extent in bytes             */
 } Transcoded;
 
-/* Transcode RV32IM code [0, len) into *out (allocates ops + map). Reads only the
- * code bytes. Free with transcode_free. */
+/* Transcode RV32IM code [0, len) into *out (allocates out->ops). Reads only the
+ * code bytes; produces one op word per 4-byte instruction. Free out->ops yourself. */
 void transcode(const uint8_t *code, uint32_t len, Transcoded *out);
-void transcode_free(Transcoded *out);
 
 #endif /* TRANSCODE_H_ */

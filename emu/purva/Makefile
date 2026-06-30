@@ -1,12 +1,13 @@
-# purva - AOT pipeline: a standalone transcode tool + an evaluator that runs its output.
+# purva - AOT pipeline: standalone transcode tool + an evaluator that runs its output.
 #
-#   make            build ./transcode (the tool) and ./purva (the evaluator)
-#   make test       build, transcode the RV32IM examples to .tc, run them on purva
+#   make            build ./transcode (tool) and ./purva (evaluator)
+#   make test       transcode the RV32IM examples and run them on purva
 #
-# `transcode in.elf out.tc` is the ONLY thing that decodes RISC-V: it lowers a whole
-# RV32IM image into a packed op stream + memory image (.tc, see tcfile.h). `purva
-# out.tc` loads that and threads over it with a computed goto -- it never sees a raw
-# instruction, and does not even link transcode.c.
+# `transcode in.elf out.ops` is the ONLY thing that decodes RISC-V: one packed op
+# word per instruction (ops[pc>>2]); nothing else. `purva --ops=out.ops in.elf` runs
+# it -- the host still loads the ELF for memory + symbols (the upper layer, like the
+# purv driver); the evaluator just threads the ops and never decodes or links the
+# transcoder.
 
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra
@@ -23,13 +24,11 @@ LDFLAGS  ?= -m elf32lriscv -T $(GUEST_LD)
 .PHONY: all test clean
 all: transcode purva
 
-# The tool decodes RISC-V; the evaluator does not (note: purva omits transcode.c).
-transcode: tctool.c transcode.c transcode.h tcfile.h ../purv.h ../purvhost.h
+transcode: tctool.c transcode.c transcode.h ../purv.h ../purvhost.h
 	$(CC) $(CFLAGS) tctool.c transcode.c -o $@
-purva: purva.c main.c purva.h transcode.h tcfile.h ../purv.h ../purvhost.h
+purva: purva.c main.c purva.h transcode.h ../purv.h ../purvhost.h
 	$(CC) $(CFLAGS) purva.c main.c -o $@
 
-# RV32IM example elfs (local names; don't clobber purvs's rv32imc builds).
 fn.elf: $(EX)/fn.c $(GUEST_LD)
 	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o fn.o
 	$(RVLD) $(LDFLAGS) --entry=0 fn.o -o $@
@@ -40,21 +39,20 @@ hello.elf args.elf: %.elf: $(EX)/%.c $(GUEST_LD)
 	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o $*.o
 	$(RVLD) $(LDFLAGS) -e _start $*.o -o $@
 
-# elf -> .tc via the transcode tool.
-%.tc: %.elf transcode
+%.ops: %.elf transcode
 	./transcode $< $@
 
-test: transcode purva fn.tc sigtest.tc hello.tc args.tc
+test: transcode purva fn.ops sigtest.ops hello.ops args.ops
 	@echo "== wasm-style function calls =="
-	@printf "square(7)   = "; ./purva --invoke=square --arg=7   fn.tc
-	@printf "sum_to(100) = "; ./purva --invoke=sum_to --arg=100 fn.tc
-	@printf "fib(20)     = "; ./purva --invoke=fib    --arg=20  fn.tc
+	@printf "square(7)   = "; ./purva --ops=fn.ops --invoke=square --arg=7   fn.elf
+	@printf "sum_to(100) = "; ./purva --ops=fn.ops --invoke=sum_to --arg=100 fn.elf
+	@printf "fib(20)     = "; ./purva --ops=fn.ops --invoke=fib    --arg=20  fn.elf
 	@echo "== userspace program (ecall syscalls) =="
-	@./purva --user hello.tc
-	@./purva --user args.tc one two
+	@./purva --ops=hello.ops --user hello.elf
+	@./purva --ops=args.ops --user args.elf one two
 	@echo "== conformance signature dump =="
-	@./purva --signature=out.sig sigtest.tc && \
+	@./purva --ops=sigtest.ops --signature=out.sig sigtest.elf && \
 	  echo "signature:" && sed 's/^/  /' out.sig
 
 clean:
-	rm -f transcode purva *.o *.elf *.tc out.sig
+	rm -f transcode purva *.o *.elf *.ops out.sig
