@@ -113,8 +113,14 @@ static uint8_t branch_op(uint32_t f3) {
  * downstream needs the instruction's own pc. The case structure mirrors purv's
  * fused decode/execute switch; each former `goto <action>` becomes a leaf op plus
  * the operand fields that action consumed. A trailing fixup stores the raw word in
- * `imm` for trap ops, which the run loop hands to the host as state->inst. */
-static uint32_t decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t off) {
+ * `imm` for trap ops, which the run loop hands to the host as state->inst.
+ *
+ * always_inline: this is the decode half of the hot loop, and it must stay inlined
+ * into RiscvEmulatorLoop. The cold early-exit helper (fixup_pc) is a second caller,
+ * which would otherwise make the compiler emit decode_one out-of-line -- a real
+ * call per instruction, ~25% more host instructions on the hot path. */
+static inline __attribute__((always_inline))
+uint32_t decode_one(RiscvEmulatorDecoded_t *d, const uint8_t *code, uint32_t off) {
     uint16_t lo = (uint16_t)(code[off] | code[off + 1] << 8);
     uint32_t raw, width;
     /* Set only the fields the op's handler reads (see the payload table in purvs.h).
@@ -421,6 +427,37 @@ uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *s, const RiscvEmulatorDe
     h_end:  return (uint32_t)(d - block);     /* d points at the END sentinel (not real) */
 }
 
+/* ------------------------------------------------------- early-exit pc fixup */
+
+/* Recover the resume pc when an evaluator stops before the run's end. Because the
+ * decode pass omits plain unconditional jumps from the record stream (their only
+ * effect is the pc redirect, which the trace already followed), the loop can't map
+ * "records executed" back to a pc by record count alone. So on a short return we
+ * re-walk the code from the run's start, advancing through `records` emitted
+ * records -- stepping sequential ops by their width and FOLLOWING the omitted/
+ * absorbed jumps -- and land on the resume pc. The first `records` of a run are
+ * never terminators (those are always the run's last record), so the walk only
+ * meets sequential ops and jumps. *insns receives the guest instructions covered
+ * (records plus the jumps traversed). Cold path: only a custom eval that stops
+ * mid-run reaches it. */
+static uint32_t fixup_pc(const uint8_t *code, uint32_t pc, uint32_t records, uint32_t *insns) {
+    uint32_t recs = 0, cnt = 0;
+    RiscvEmulatorDecoded_t d;
+    while (recs < records) {
+        uint32_t width = decode_one(&d, code, pc);
+        cnt++;
+        if (d.op == RISCV_OP_JAL) {     /* a jump: omitted (plain j) or a LUI link (jal) */
+            if (d.rd) recs++;           /* jal kept a link-write record; plain j did not */
+            pc = d.imm;                 /* follow the baked target either way */
+            continue;
+        }
+        recs++;
+        pc += width;
+    }
+    *insns = cnt;
+    return pc;
+}
+
 /* ----------------------------------------------------------------- the VM */
 
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
@@ -430,55 +467,72 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     RiscvEmulatorEvalFn eval = s->eval ? s->eval : RiscvEmulatorDefaultEval;
     uint64_t k = 0;
 
+    /* `win` is the last pc at which a full 4-byte fetch is in bounds; while pc stays
+     * <= win (the overwhelmingly common case, a well-predicted branch) a fetch needs
+     * no bounds check. Only the window tail -- or a traced jump landing near/past the
+     * end -- re-checks carefully. */
+    uint32_t win = code_len >= 4 ? code_len - 4 : 0;
+
     /* Each iteration: decode a straight-line run from pc, then thread-execute it.
-     * The two halves of purv's old inner loop, now separated. */
+     * `n` counts records emitted for eval; `insns` counts guest instructions -- they
+     * differ because plain unconditional jumps are traced across and OMITTED from the
+     * record stream (only their pc redirect matters, and the trace follows it), so k
+     * (the returned instruction count) advances by `insns`, not by record count. */
     while (k < max) {
         uint64_t room = max - k;
-        uint32_t cap = room < RISCV_BLOCK_MAX ? (uint32_t)room : RISCV_BLOCK_MAX;
-        uint32_t pc = s->pc, n = 0, last_pc = pc;
+        /* One bound for both the buffer and the budget: records <= guest instructions,
+         * so capping guest instructions (insns) at min(room, BLOCK_MAX) keeps n <=
+         * BLOCK_MAX implicitly -- a single compare in the hot loop, not two. */
+        uint32_t lim = room < RISCV_BLOCK_MAX ? (uint32_t)room : RISCV_BLOCK_MAX;
+        uint32_t pc = s->pc, run_pc = pc, n = 0, insns = 0, last_pc = pc;
 
-        /* loop 1: decode ahead, tracing THROUGH unconditional jumps (their target
-         * is static), until a conditional branch / indirect jump / trap (the run's
-         * last record), a full buffer, or the code window's end. Code is read-only,
-         * so nothing eval does can invalidate what we decode here.
-         *
-         * `win` is the last pc at which a full 4-byte fetch is in bounds; while pc
-         * stays <= win (the overwhelmingly common case, and a well-predicted branch)
-         * a fetch needs no bounds check. Only at the window's tail -- or after a
-         * traced jump lands near/past the end -- do we re-check carefully. */
-        uint32_t win = code_len >= 4 ? code_len - 4 : 0;
-        if (code) while (n < cap) {
+        /* loop 1: decode ahead, tracing THROUGH unconditional jumps (static targets),
+         * until a conditional branch / indirect jump / trap (the run's last record),
+         * the buffer/budget cap, or the code window's end. Code is read-only, so
+         * nothing eval does can invalidate what we decode. */
+        if (code) while (insns < lim) {
             if (pc > win) {                               /* tail / out-of-window: check */
                 if (pc >= code_len || code_len - pc < 2) break;
                 if (((code[pc] | code[pc + 1] << 8) & 3) == 3 && code_len - pc < 4) break;
             }
             uint32_t width = decode_one(&block[n], code, pc);
-            last_pc = pc;
+            insns++;
             if (block[n].op == RISCV_OP_JAL) {
-                /* Unconditional jump to a statically-known target: trace across it.
-                 * Its only lasting effect is the link write, so replace the jump
-                 * with that (a LUI of the return address) -- or nothing, for a plain
-                 * j -- and keep decoding at the target. The jump never reaches eval
-                 * as a control transfer; execution flows straight into the target,
-                 * which is the next record. */
+                /* Statically-known target: trace across it. A jal's lasting effect is
+                 * its link write, so keep that as a LUI record; a plain j has no
+                 * effect at all, so OMIT it (don't emit a record) -- execution just
+                 * flows into the target, the next record. Either way, decode on at
+                 * the target. (insns already counted the jump; the fixup re-walk and
+                 * decode agree on this, so an early exit recovers pc correctly.) */
                 uint32_t target = block[n].imm;           /* the baked absolute target */
-                if (block[n].rd) { block[n].op = RISCV_OP_LUI; block[n].imm = pc + width; }
-                else             { block[n].op = RISCV_OP_NOP; }
-                n++;
+                if (block[n].rd) {                        /* jal: keep the link write */
+                    block[n].op = RISCV_OP_LUI; block[n].imm = pc + width;
+                    last_pc = pc; n++;
+                }                                         /* plain j: omitted */
                 pc = target;
                 continue;
             }
+            last_pc = pc;
             pc += width;
             if (is_terminator(block[n++].op)) break;
         }
-        if (n == 0) break;                    /* pc outside the code window: nothing to run */
+        if (insns == 0) break;                /* pc outside the code window: nothing to run */
 
         uint32_t end_pc = pc;                 /* fall-through / link / continue address */
-        block[n].op = RISCV_OP_END;           /* sentinel terminates the threaded dispatch */
         s->pc = end_pc;                       /* preset: sequential ops and not-taken branches land here */
+        if (n == 0) { k += insns; continue; } /* the run was only omitted jumps */
+
+        block[n].op = RISCV_OP_END;           /* sentinel terminates the threaded dispatch */
 
         /* loop 2: threaded execution of the decoded run (the pluggable half). */
-        k += eval(s, block);
+        uint32_t ran = eval(s, block);
+        if (ran < n) {                        /* eval stopped early: re-walk to recover pc */
+            uint32_t done;
+            s->pc = fixup_pc(code, run_pc, ran, &done);
+            k += done;
+            continue;
+        }
+        k += insns;                           /* full run: every record executed */
 
         /* A trap terminates the run without executing in eval: set the faulting pc
          * and raw word, then call the host handler (it may stop or resume). */
