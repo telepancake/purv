@@ -1,149 +1,91 @@
-# purvs — secure (tagged-memory) purv
+# purvs — monadic purv (decode-ahead + pluggable threaded eval)
 
-A pointer-safety variant of purv. The emulator (`purvs.c`/`purvs.h`) carries a
-**tag per register** alongside the value and propagates it across every
-operation — values are computed exactly as before, but a parallel datapath the
-program can't see tracks provenance. Memory carries a tag per word too; the host
-(`main.c`) is the memory system and the policy (object table, bounds, W^X).
+A restructuring of purv that separates **decoding** from **execution**, so the
+value semantics become a swappable plug rather than something baked into the
+interpreter loop. purv's inner loop fuses fetch, decode, and execute; purvs cuts
+that loop in two:
 
 ```
 purvs/
-  purvs.c, purvs.h   the emulator: forked from purv, with the tag register file
-                     and per-operation tag propagation added
-  main.c             the memory system + policy: object table, bounds/W^X checks,
-                     malloc/free syscalls. The run loop just steps the emulator.
-  examples/safe.c    demo: ok / oob / uaf / cross / addp / ... / xdata / wcode
+  purvs.c, purvs.h   the engine: decode-ahead + the default threaded evaluator
+  main.c             the host/driver (shared with purv: ELF loader, syscalls,
+                     conformance signature dump). Identical to purv's main.c.
 ```
 
-## Tags
+## The two halves
 
-| tag        | meaning                                                        |
-|------------|---------------------------------------------------------------|
-| `NOTAG`    | value the CPU made up — immediates, `sp`, arithmetic of untagged |
-| object id  | a pointer into a specific allocation (handed out by `malloc`)  |
-| code tag   | a reserved high range (`CODE_TAG_BASE..`) marking a memory cell as executable; one per loaded executable segment |
-| `BAD`      | corrupted provenance (e.g. a pointer built from two objects)   |
+1. **Decode-ahead.** From the current `pc`, the engine walks the code window and
+   lowers each raw instruction — 32-bit or compressed — into a wide
+   `RiscvEmulatorDecoded_t` in an internal buffer, stopping at the first control
+   transfer (kept as the run's last record) or when the buffer / code window is
+   exhausted. Decode reads only the code bytes: it records register **indices**
+   and immediates, never register **values** (those change as earlier
+   instructions in the run execute). Because code lives in the read-only lower
+   half, nothing execution does can invalidate a decoded run.
 
-Propagation, decoded in parallel for each instruction:
+2. **Threaded execution.** A pluggable evaluator (`state->eval`, default
+   `RiscvEmulatorDefaultEval`) threads through the decoded buffer with a
+   **computed-goto jump table** indexed by the record's leaf op. Each handler
+   ends by dispatching the next record directly ("token threading"), with no
+   loop-top round-trip.
 
-Propagation is **operation-aware** — only additive offsetting keeps a pointer:
+## Our opcodes ≠ their opcodes
 
-```
-  result of rd, by op and operand provenance (N=int, P=pointer, B=bad):
+The decoded `op` is **our** flat leaf opcode, one per evaluator handler (`ADD`,
+`SUB`, `LB`, `BEQ`, …) — there is deliberately no 1:1 correspondence with the
+RISC-V encoding. Decode folds the base opcode, `funct3`, and `funct7` into that
+single byte, so the evaluator dispatches in one indexed jump with **no secondary
+decode**. A few operand-source fields remain on the record (`rs1`/`rs2`/`rd`,
+`imm`, and `b_imm` — whether an ALU op's second operand is the immediate or
+`x[rs2]`); everything else is encoded by the op itself.
 
-  op           N,N | P,N  | N,P  | P,P same | P,P diff | any B
-  ------------ ----+------+------+----------+----------+------
-  add           N  |  P   |  P   |    B     |    B     |   B
-  sub (a-b)     N  |  P   |  B   |    N     |    B     |   B
-  slt/sltu      N  |  N   |  N   |    N     |    B     |   B
-  and/or/xor    N  | P/B* | P/B* |    B     |    B     |   B
-  sll/srl/sra   N  |  B   |  B   |    B     |    B     |   B
-  mul/div/rem   N  |  B   |  B   |    B     |    B     |   B
-```
+| record field | meaning |
+|--------------|---------|
+| `op`         | our leaf opcode (`RISCV_OP_*`), the jump-table index |
+| `rd/rs1/rs2` | register indices |
+| `imm`        | immediate / shift amount, pre-extended for the op |
+| `b_imm`      | ALU: second operand is `imm` (1) or `x[rs2]` (0) |
+| `width`      | encoded length (2 or 4), for `pc += width` |
+| `ends_block` | this record ends the decoded run (control transfer / trap) |
 
-Reasoning per op:
-- **add**: `ptr + int` is a valid offset (`P`); `ptr + ptr` is meaningless (`B`).
-- **sub** (non-commutative): `ptr - int` is an offset (`P`); `int - ptr` is
-  nonsense (`B`); `ptr - ptr` same object is a scalar difference (`N`), across
-  objects is `B`.
-- **slt/sltu**: the result is a boolean (`N`), unless it compares two different
-  objects, which is meaningless (`B`).
-- **and/or/xor** (`P/B*`): masking a pointer with a constant keeps the tag **iff
-  the constant only touches the low (page-local) bits** — i.e. alignment
-  (`p & ~15`), or setting/toggling low bits — since that just adjusts the address
-  and the dereference is still bounds-checked. Touching high bits is forging
-  (`B`); mixing two pointers' bits is `B`.
-- **shifts, mul/div/rem**: not addressing — any pointer in poisons the result
-  (`B`), even though the address may still look valid.
-- **B is sticky**: any bad operand gives `B`.
-
-## Memory and the callbacks
-
-The engine has no memory; it reaches the world only through tagged hooks the
-host implements — `RiscvEmulatorFetch` (instruction read), `RiscvEmulatorLoad`
-(data read), `RiscvEmulatorStore` (data write), and `RiscvEmulatorControlTransfer`
-(every taken jump/call/branch/return). The memory hooks make the tags explicit:
+## The pluggable evaluator
 
 ```c
-uint32_t RiscvEmulatorFetch(uint32_t addr,                 void *dst,       uint8_t len); /* -> cell tag */
-uint32_t RiscvEmulatorLoad (uint32_t addr, tag_t addr_tag, void *dst,       uint8_t len); /* -> value tag */
-void     RiscvEmulatorStore(uint32_t addr, tag_t addr_tag, const void *src, tag_t val_tag, uint8_t len);
+typedef uint32_t (*RiscvEmulatorEvalFn)(RiscvEmulatorState_t *state,
+                                        const RiscvEmulatorDecoded_t *block,
+                                        uint32_t count, int *halt);
 ```
 
-**The tag of a memory cell is the memory system's business** — checked against
-the pointer on access, recorded on store, returned on load. Tagged memory
-(`g_mem_tag`, one tag per word) lives entirely behind the hooks. All policy
-(bounds, executability, W^X) is there too; the engine sees none of it.
+`eval` is handed the whole decoded run and executes it in order, leaving
+`state->pc` at the next instruction and returning the number of records it ran;
+it sets `*halt` to stop the engine (a terminal `ecall`, a breakpoint, an illegal
+instruction). It is the **one place value semantics live** — the default does
+ordinary RV32IMC computation, and an alternative (tag/provenance tracking, taint,
+tracing, symbolic execution, …) is a drop-in replacement that reuses the same
+decode pass and run loop. `RiscvEmulatorInit` installs the default; assign
+`state->eval` to swap it.
 
-The register tags live **in the emulator** (`reg_tag[32]`, propagated by every
-instruction — see above). For the access in flight the engine hands the hook the
-base-pointer's tag and (for a store) the value's tag as the explicit
-`addr_tag`/`val_tag` arguments, and a load's returned tag flows straight back
-into the destination register. The engine computes the real effective address
-and passes it down — never recomputed by the host. So a pointer stored to memory
-and loaded back recovers its tag, while bytes the program never wrote read as
-`NOTAG` (the memory system's initial state).
-
-**Control transfers are policed by tag, not by re-checking every fetch.** The
-engine carries the tag of the cell it is executing (`pc_tag`, from the fetch
-hook's return) and the tag of each branch target — a register's tag for an
-indirect jump (`JALR`, `C.JR/C.JALR`), the current code tag for a PC-relative
-one. On every taken jump/call/branch/return it calls `RiscvEmulatorControlTransfer`
-with both as tagged addresses. The host allows a target only through a *code
-pointer*: `NOTAG` (a return address or PC-relative target) or a code tag (a
-function pointer minted by the loader for each executable ELF segment). An
-indirect jump through a data object tag or a `BAD` pointer — calling into a heap
-buffer, say — is rejected. Symmetrically, `RiscvEmulatorStore` refuses to write a
-code-tagged cell (**W^X**), so the executable image can't be modified. (A data
-load of a code-tagged cell reads as `NOTAG`: code is executable, not a data
-pointer.)
-
-## Checks
-
-`malloc` is a syscall that allocates, records `[base,size)`, and returns a
-pointer **with a fresh object tag**. `free` retires the object. Inside the
-load/store callback the memory system checks the base pointer's tag against the
-object *before* performing the access:
-
-- `NOTAG` → allowed (untracked memory: stack, globals, MMIO)
-- object id → must be live and the access must fall within `[base,size)`
-- `BAD` → rejected
-
-So out-of-bounds, cross-object, and use-after-free accesses are all caught, and a
-violation refuses the access (the load fills zero / the store is dropped).
+The earlier tagged-memory purv (a per-register provenance datapath) is the
+natural first alternate evaluator to layer back on top of this split.
 
 ## Demo
+
+`make test` builds the engine and runs the same example programs purv runs
+(wasm-style function calls, a userspace program over `ecall` syscalls, and a
+conformance signature dump):
 
 ```sh
 make test
 ```
 
-```
-== ok ==       in-bounds writes succeeded                         exit=0
-== diff ==     same-object difference is a plain count; loop ok    exit=0
-== align ==    (p & ~15) keeps the tag; in-bounds write ok         exit=0
-== oob ==      out of bounds store ... object 1: [..,..)           exit=134
-== uaf ==      use-after-free / dead object store ... (freed)      exit=134
-== subdiff ==  ptr - ptr across objects -> bad scalar -> caught     exit=134
-== addp ==     ptr + ptr -> bad -> caught                           exit=134
-== rsub ==     int - ptr -> bad -> caught                           exit=134
-== scale ==    shifted pointer (valid address) -> bad -> caught     exit=134
-== cross ==    pointer built from two objects -> bad -> caught      exit=134
-== xdata ==    calling into a data buffer -> non-code pointer -> caught exit=134
-== wcode ==    writing into the code segment -> W^X -> caught       exit=134
-```
+Conformance: the engine passes the RV32IMC userspace ACT suite (the same
+`emu/act` runner purv uses) — point it at this binary with
+`PURV=purvs/purvs ./act/run.sh`.
 
 ## Notes / limits
 
-- Tag propagation decodes 32-bit instructions, so codelets are built
-  `-march=rv32im` (no compressed). The engine still executes RV32IMC; a
-  compressed instruction just leaves the destination tag at `NOTAG`.
-- The per-op rules live in `tag_add` / `tag_sub` / `tag_cmp` / `tag_bitwise` /
-  `tag_other` in purvs.c, dispatched by funct3/funct7 from
-  `RiscvEmulatorPropagateTag`. The table is the contract.
-- "Page-local" for and/or/xor is the low `PAGE_BITS` (12 -> 4 KB) bits, which
-  covers any realistic alignment; a larger alignment would need a bigger bound.
-- Tags are word-granular in memory; sub-word stores clear the word's tag.
-- The engine carries and propagates the tags; the host owns the memory tags and
-  the policy (object table, bounds, W^X). Hardware-style "bad tag" faults raised
-  by the engine itself (rather than at the access) are the natural next step.
+- Execution uses GCC/Clang computed gotos (labels-as-values) for the threaded
+  dispatch; both toolchains the project uses support it.
+- A decoded run ends at the first control transfer, so a conditional branch,
+  jump, or trap is always the run's last record. Long straight-line code is
+  decoded in successive buffer-sized batches.
