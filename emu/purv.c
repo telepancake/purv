@@ -106,25 +106,34 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint64_t k = 0;
     int stop = 0;
 
-    /* Each iteration runs one instruction; the whole step is inlined here, so
-     * there is no per-instruction call. */
-    for (; k < max && !stop; k++) {
-        /* Fetch from the code window (based at 0). A pc not (fully) inside it ends
-         * the batch -- the engine fetches only from state->code. (off >= code_len
-         * also catches a huge pc, so off + N can't wrap.) */
-        uint32_t off = pc;
-        if (!code || off >= code_len || code_len - off < 2) break;
+    /* Outer loop: validate pc and size a window of instructions that can be
+     * fetched without a bounds check -- inside the window pc only steps forward,
+     * so a window sized from code_len keeps every fetch in range. The inner loop
+     * runs the window straight-line; a branch/jump assigns pc directly and breaks
+     * back here to re-validate the target. (The inner body keeps the old indent so
+     * the diff stays the size of the actual change, not a whitespace reflow.) */
+    while (k < max && !stop) {
+        uint32_t base = pc;
+        if (!code || base >= code_len || code_len - base < 2) break;
+        uint32_t safe;
+        if (code_len - base < 4) {                /* tail: only a compressed insn can fit */
+            if (((code[base] | code[base + 1] << 8) & 3) == 3) break;  /* 32-bit straddles end */
+            safe = 1;
+        } else safe = (code_len - base) / 4;      /* worst case (all 32-bit), this many fit */
 
-        /* npc/inst stay in registers across the step; they reach the state only
-         * when a handler needs them (the trap paths below set s->pc/s->inst). */
-        uint32_t rd = 0, rs1 = 0, a = 0, b = 0, f3 = 0, f7 = 0, imm = 0, r, addr, n, npc, inst;
+        for (uint32_t i = 0; i < safe && k < max && !stop; i++) {
+        k++;
+        uint32_t off = pc;                        /* current insn; fetch is in range by the window */
+
+        /* inst/width stay in registers; they reach the state only when a handler
+         * needs them (the trap paths below set s->pc/s->inst). */
+        uint32_t rd = 0, rs1 = 0, a = 0, b = 0, f3 = 0, f7 = 0, imm = 0, r, addr, n, width, inst;
 
         uint16_t lo = (uint16_t)(code[off] | code[off + 1] << 8);
         if ((lo & 3) == 3) {                                  /* ---- 32-bit ---- */
-            if (code_len - off < 4) break;                    /* op straddles window end */
             uint32_t w = lo | (uint32_t)(code[off + 2] | code[off + 3] << 8) << 16;
             inst = w;
-            npc = pc + 4;
+            width = 4;
             rd = (w >> 7) & 31; rs1 = (w >> 15) & 31; f3 = (w >> 12) & 7;
             switch (w & 0x7f) {
             case OPIMM:                                       /* reg-immediate */
@@ -165,7 +174,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t shamt = ((c >> 2) & 0x1f) | ((c >> 12) & 1) << 5;
             int32_t  ci = sext(shamt, 6);                                 /* CI 6-bit imm */
             inst = lo;
-            npc = pc + 2;
+            width = 2;
             rd = (c >> 7) & 31;
             switch (((c >> 13) & 7) << 2 | (c & 3)) {
             case 0 << 2 | 0:                          /* C.ADDI4SPN -> addi rd', sp, uimm */
@@ -285,13 +294,13 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         case 7: take = a >= b; break;                                  /* BGEU */
         default: goto illegal;
         }
-        if (take) npc = pc + imm;
+        if (take) { pc = pc + imm; break; }       /* taken: assign pc, leave the window */
         goto done;
     }
     jal:
-        wr(s, rd, npc); npc = pc + imm; goto done;
+        wr(s, rd, pc + width); pc = pc + imm; break;
     jalr:
-        addr = (a + imm) & ~1u; wr(s, rd, npc); npc = addr; goto done;
+        addr = (a + imm) & ~1u; wr(s, rd, pc + width); pc = addr; break;
     lui:
         wr(s, rd, imm); goto done;
     auipc:
@@ -313,9 +322,11 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     illegal:                                           /* rare: call the handler directly */
         s->pc = pc; s->inst = inst;
         if (s->illegal ? s->illegal(s) : 1) stop = 1;  /* default: illegal stops */
-    done:
-        pc = npc;
-    }
+    done:                                              /* sequential: advance pc, stay in window */
+        pc += width;
+        continue;
+        }   /* inner: run the safe window straight-line */
+    }       /* outer: re-validate pc after each control transfer / window end */
     s->pc = pc;                          /* leave the resume point in the state */
     return k;
 }
