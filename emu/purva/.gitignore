@@ -1,0 +1,6 @@
+transcode
+purva
+*.o
+*.elf
+*.tc
+*.sig
