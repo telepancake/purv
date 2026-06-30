@@ -311,11 +311,12 @@ uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *s, const RiscvEmulatorDe
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
         [RISCV_OP_END] = &&h_end,
     };
-    const RiscvEmulatorDecoded_t *d;
-    uint32_t i = 0, a, b;
+    const RiscvEmulatorDecoded_t *d = block;
+    uint32_t a, b;
 
-    #define NEXT() do { d = &block[i++]; goto *tbl[d->op]; } while (0)
-    NEXT();
+    /* Walk the run by advancing d; NEXT steps to the next record and dispatches. */
+    #define NEXT() do { goto *tbl[(++d)->op]; } while (0)
+    goto *tbl[d->op];                         /* initial dispatch on block[0] */
 
     /* ---- ALU reg-reg (rd = x[rs1] <op> x[rs2]) ---- */
     h_add:  wr(s, d->rd, s->x[d->rs1] + s->x[d->rs2]);                          NEXT();
@@ -403,9 +404,9 @@ uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *s, const RiscvEmulatorDe
     h_nop:  NEXT();
 
     /* ---- traps: stop; the run loop sets pc/inst and calls the host handler ---- */
-    h_trap: return i;
+    h_trap: return (uint32_t)(d - block + 1); /* d points at the trap, which counts */
     #undef NEXT
-    h_end:  return i - 1;                     /* the END sentinel was fetched but is not real */
+    h_end:  return (uint32_t)(d - block);     /* d points at the END sentinel (not real) */
 }
 
 /* ----------------------------------------------------------------- the VM */
