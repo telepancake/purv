@@ -164,7 +164,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_trap: {
         uint32_t pc_ = (uint32_t)(p - base) << 2;
         uint8_t op = TC_OP(w);
-        s->pc = pc_; k++;
+        s->pc = pc_; s->inst = w; k++;     /* inst is OUR packed op word, not raw RISC-V */
         int stop = (op == RISCV_OP_ECALL)  ? (s->ecall   ? s->ecall(s)   : 0)
                  : (op == RISCV_OP_EBREAK) ? (s->ebreak  ? s->ebreak(s)  : 1)
                  :                           (s->illegal ? s->illegal(s) : 1);

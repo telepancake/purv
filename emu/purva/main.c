@@ -1,11 +1,17 @@
 /*
  * main.c - host/driver for the purva evaluator.
  *
- * The upper layer, identical in shape to the purv/purvs driver: it loads the ELF
- * (memory image, symbols, entry) and services syscalls. The only difference is that
- * execution runs over a pre-transcoded op array supplied with --ops (produced by the
- * standalone `transcode` tool) instead of decoding instructions. The evaluator never
- * sees the ELF; the host never decodes.
+ * Runs a purva IMAGE (image.h) directly: no ELF loading, no decoding, no separate
+ * --ops file. The image already carries everything execution needs (the op array,
+ * read-only data, initial writable data, minimum bss/stack sizes); main.c just maps
+ * those into the engine's regions and drives the run loop, exactly as the
+ * purv/purvs drivers do.
+ *
+ * The image has no symbol table by design (image.h) -- the engine never had one
+ * (same as purv). A mode that needs a name (--invoke=SYM, or the conformance
+ * tohost/begin_signature/end_signature symbols) resolves it from the ORIGINAL ELF
+ * via --symbols=, read only for its symbol table; it is never used for memory or
+ * execution.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -13,53 +19,34 @@
 #include <string.h>
 
 #include "purva.h"        /* purv.h + transcode.h + RiscvEmulatorSetProgram */
-#include "../purvhost.h"
+#include "image.h"
+#include "../purvhost.h"  /* PurvHost / purvhost_slurp / purvhost_sym (symbols only) */
 
-#define CODE_BYTES        (64u * 1024u * 1024u)
 #define PURV_HEAP_DEFAULT (256u * 1024u * 1024u)
-#define STACK_BYTES       (16u * 1024u * 1024u)
-#define STACK_MEM_BASE    ((uint32_t)(0u - STACK_BYTES))
-static uint8_t *g_code, *g_heap, *g_stack;
-static uint32_t g_heap_size;
+#define STACK_MEM_BASE(stack_len) ((uint32_t)(0u - (stack_len)))
+static uint8_t *g_heap, *g_stack;
+static uint32_t g_heap_size, g_stack_size;
 
 static int      g_halt;
 static int      g_exit = 1;
 static int      g_user_mode;
 static uint32_t g_brk;
 
-static int      g_have_tohost, g_have_sig;
-static uint32_t g_tohost, g_begin_sig, g_end_sig;
+static PurvHost  g_symhost;       /* --symbols=: ELF bytes kept ONLY for name lookup */
+static int       g_have_symbols;
+static int       g_have_tohost, g_have_sig;
+static uint32_t  g_tohost, g_begin_sig, g_end_sig;
 
 static int in_heap(uint32_t addr, uint32_t len) {
     return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_size;
 }
 
-/* Highest lower-half (code+rodata) byte the image occupies: the data window for
- * loads. It differs from the op array's extent now that auipc spills a word, so the
- * host sets it from the ELF rather than from the op count. */
-static uint32_t lower_half_extent(const PurvHost *h) {
-    PurvElf32_Ehdr eh; memcpy(&eh, h->elf, sizeof eh);
-    uint32_t end = 0;
-    for (int i = 0; i < eh.e_phnum; i++) {
-        PurvElf32_Phdr ph;
-        memcpy(&ph, h->elf + eh.e_phoff + (long)i * eh.e_phentsize, sizeof ph);
-        if (ph.p_type != PURV_PT_LOAD || ph.p_memsz == 0) continue;
-        if (ph.p_vaddr < RISCV_HALF) { uint32_t e = ph.p_vaddr + ph.p_memsz; if (e > end) end = e; }
-    }
-    return (end + 3u) & ~3u;
-}
-
 /* ------------------------------------------------ trap handlers */
 
 static int on_illegal(RiscvEmulatorState_t *state) {
-    /* The evaluator does not carry raw instruction words; recover this one from the
-     * code region (the host has the bytes) just for the diagnostic. */
-    uint32_t pc = state->pc, raw = 0;
-    if (pc + 4 <= state->region[RISCV_CODE].len) {
-        const uint8_t *c = state->region[RISCV_CODE].ptr + pc;
-        raw = (uint32_t)c[0] | c[1] << 8 | c[2] << 16 | (uint32_t)c[3] << 24;
-    }
-    fprintf(stderr, "purva: illegal instruction 0x%08x at pc=0x%08x\n", raw, pc);
+    /* state->inst is OUR packed op word (set by the evaluator), not a RISC-V
+     * instruction -- the image carries no raw RISC-V bytes to recover one from. */
+    fprintf(stderr, "purva: illegal op 0x%08x at pc=0x%08x\n", state->inst, state->pc);
     g_halt = 1; g_exit = 1;
     return 1;
 }
@@ -99,6 +86,14 @@ static int on_ecall(RiscvEmulatorState_t *state) {
 }
 static int on_ebreak(RiscvEmulatorState_t *state) { (void)state; return 1; }
 
+/* ------------------------------------------------------------------- symbols */
+
+/* Resolve `name` from --symbols=<elf>, if one was given. 0 if no name found / no
+ * --symbols= was passed. Reads only the symbol table -- never touches memory. */
+static int sym(const char *name, uint32_t *out) {
+    return g_have_symbols && purvhost_sym(&g_symhost, name, out);
+}
+
 /* ------------------------------------------------------------------- signature */
 
 static void dump_signature(const char *path, uint32_t gran) {
@@ -121,7 +116,7 @@ static void dump_signature(const char *path, uint32_t gran) {
 
 #define MAGIC_RET 0xdeadbee0u
 
-static void gpoke(uint32_t addr, uint32_t v) { memcpy(&g_stack[addr - STACK_MEM_BASE], &v, 4); }
+static void gpoke(uint32_t addr, uint32_t v) { memcpy(&g_stack[addr - STACK_MEM_BASE(g_stack_size)], &v, 4); }
 
 static uint32_t setup_user_stack(int argc, char **argv) {
     uint32_t sp = 0, ptr[64] = {0};
@@ -129,7 +124,7 @@ static uint32_t setup_user_stack(int argc, char **argv) {
     for (int i = argc - 1; i >= 0; i--) {
         uint32_t len = (uint32_t)strlen(argv[i]) + 1;
         sp -= len;
-        memcpy(&g_stack[sp - STACK_MEM_BASE], argv[i], len);
+        memcpy(&g_stack[sp - STACK_MEM_BASE(g_stack_size)], argv[i], len);
         ptr[i] = sp;
     }
     sp &= ~15u;
@@ -143,37 +138,22 @@ static uint32_t setup_user_stack(int argc, char **argv) {
     return sp;
 }
 
-/* Read a .ops file: n_ops = size/4. Appends an ILLEGAL sentinel so a run that falls
- * off the end traps instead of reading past the array. */
-static uint32_t *load_ops(const char *path, uint32_t *n_out) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "purva: cannot read %s\n", path); exit(2); }
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    uint32_t n = (uint32_t)(sz / 4);
-    uint32_t *ops = malloc(((size_t)n + 1) * 4);
-    if (fread(ops, 4, n, f) != n) { fprintf(stderr, "purva: short read on %s\n", path); exit(2); }
-    fclose(f);
-    ops[n] = (uint32_t)RISCV_OP_ILLEGAL << 26;            /* off-the-end sentinel */
-    *n_out = n;
-    return ops;
-}
-
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s --ops=FILE [options] <elf> [program args...]\n"
-        "  --ops=FILE                    transcoded op array (from the transcode tool)\n"
-        "  --signature=FILE              dump signature region (RISCOF DUT)\n"
-        "  --signature-granularity=N     bytes per signature word (default 4)\n"
-        "  --invoke=SYM                  call function SYM, print return (a0)\n"
-        "  --arg=N                       integer argument for --invoke (repeatable)\n"
-        "  --user                        run as userspace program (ecall -> syscall)\n"
-        "  --ram=BYTES                   heap size at 0x80000000 (default 256 MiB)\n"
-        "  --max-insns=N                 instruction cap (default 256M)\n",
+        "usage: %s <prog.img> [options] [program args...]\n"
+        "  --symbols=ELF                  resolve --invoke/signature symbols from this ELF\n"
+        "  --signature=FILE               dump signature region (RISCOF DUT)\n"
+        "  --signature-granularity=N      bytes per signature word (default 4)\n"
+        "  --invoke=SYM                   call function SYM, print return (a0)\n"
+        "  --arg=N                        integer argument for --invoke (repeatable)\n"
+        "  --user                         run as userspace program (ecall -> syscall)\n"
+        "  --ram=BYTES                    heap size at 0x80000000 (default 256 MiB)\n"
+        "  --max-insns=N                  instruction cap (default 256M)\n",
         argv0);
 }
 
 int main(int argc, char **argv) {
-    const char *elf = NULL, *sigfile = NULL, *invoke = NULL, *opsfile = NULL;
+    const char *imgpath = NULL, *symelf = NULL, *sigfile = NULL, *invoke = NULL;
     uint32_t gran = 4;
     uint64_t max_insns = 256ull * 1024 * 1024;
     uint32_t args[8]; int nargs = 0;
@@ -182,7 +162,7 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strncmp(a, "--ops=", 6)) opsfile = a + 6;
+        if (!strncmp(a, "--symbols=", 10)) symelf = a + 10;
         else if (!strncmp(a, "--signature-granularity=", 24)) gran = (uint32_t)strtoul(a + 24, 0, 0);
         else if (!strncmp(a, "--signature=", 12)) sigfile = a + 12;
         else if (!strncmp(a, "--invoke=", 9)) invoke = a + 9;
@@ -197,43 +177,65 @@ int main(int argc, char **argv) {
         else if (a[0] == '-') { fprintf(stderr, "purva: unknown option %s\n", a); return 2; }
         else if (gargc < 64) gargv[gargc++] = argv[i];
     }
-    if (gargc) elf = gargv[0];
-    if (!elf || !opsfile) { usage(argv[0]); return 2; }
+    if (gargc) imgpath = gargv[0];
+    if (!imgpath) { usage(argv[0]); return 2; }
 
-    PurvHost host;
-    if (purvhost_alloc(&host, CODE_BYTES, g_heap_size, STACK_BYTES) != 0) return 2;
-    g_code = host.code; g_heap = host.heap; g_stack = host.stack;
-    purvhost_load_elf(&host, elf);
-    g_brk = (host.data_end + 0xFFFu) & ~0xFFFu;
+    Image img;
+    if (image_read(imgpath, &img) != 0) { fprintf(stderr, "purva: cannot read %s\n", imgpath); return 2; }
 
-    /* Install the transcoded program; its extent is the code window. */
-    uint32_t n_ops;
-    uint32_t *ops = load_ops(opsfile, &n_ops);
-    Transcoded prog = { ops, n_ops, n_ops * 4 };
+    if (symelf) {
+        g_symhost.elf = purvhost_slurp(symelf, &g_symhost.elf_len);
+        g_have_symbols = 1;
+    }
+
+    /* region[CODE] backs lower-half DATA access (rodata reads); fetch never goes
+     * through it -- the evaluator runs straight off img.code via SetProgram. The
+     * [0, code_size) portion is left zero: RISC-V never embeds data inline in code
+     * (no literal pools), so nothing should ever read there; rodata is placed
+     * right after, at guest address code_size, matching what every pc-relative
+     * reference to it was baked against (transcode.c's tctool preserves the real
+     * gap, so this holds even with alignment padding). */
+    uint32_t codereg_len = img.code_size + img.rodata_size;
+    uint8_t *codereg = calloc(1, codereg_len ? codereg_len : 1);
+    if (img.rodata_size) memcpy(codereg + img.code_size, img.rodata, img.rodata_size);
+
+    /* region[HEAP]: rwdata followed by zeroed bss/heap space, sized to at least the
+     * image's minimum (the host may map more via --ram=). */
+    g_heap_size = img.bss_size > g_heap_size ? img.bss_size : g_heap_size;
+    g_heap = calloc(1, img.rwdata_size + g_heap_size);
+    if (img.rwdata_size) memcpy(g_heap, img.rwdata, img.rwdata_size);
+    g_brk = RISCV_HALF + img.rwdata_size;
+
+    g_stack_size = img.stack_size > (16u * 1024 * 1024) ? img.stack_size : (16u * 1024 * 1024);
+    g_stack = calloc(1, g_stack_size);
 
     RiscvEmulatorState_t state;
-    purvhost_init(&host, &state);
+    RiscvEmulatorInit(&state,
+        (RiscvEmulatorRegion_t){ codereg, codereg_len },
+        (RiscvEmulatorRegion_t){ 0, 0 },
+        (RiscvEmulatorRegion_t){ g_heap, img.rwdata_size + g_heap_size },
+        (RiscvEmulatorRegion_t){ g_stack, g_stack_size });
     RiscvEmulatorState_t *st = &state;
-    st->region[RISCV_CODE].len = lower_half_extent(&host);  /* data window (original bytes) */
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
     st->callback = on_oob;
+
+    Transcoded prog = { (uint32_t *)img.code, img.code_size / 4, img.code_size };
     RiscvEmulatorSetProgram(&prog);
 
-    uint32_t start = host.entry;
+    uint32_t start = 0;            /* entry is always 0 (image.h) */
     if (invoke) {
-        if (!purvhost_sym(&host, invoke, &start)) {
-            fprintf(stderr, "purva: symbol '%s' not found\n", invoke); return 2;
+        if (!sym(invoke, &start)) {
+            fprintf(stderr, "purva: symbol '%s' not found (pass --symbols=ELF?)\n", invoke); return 2;
         }
         st->x[1] = MAGIC_RET;
         for (int i = 0; i < nargs; i++) st->x[10 + i] = args[i];
     } else if (g_user_mode) {
-        st->x[2] = setup_user_stack(gargc, gargv);
+        st->x[2] = setup_user_stack(gargc, gargv);   /* gargv[0] (the image path) is argv[0] */
     } else {
-        g_have_tohost = purvhost_sym(&host, "tohost", &g_tohost);
-        g_have_sig    = purvhost_sym(&host, "begin_signature", &g_begin_sig) &
-                        purvhost_sym(&host, "end_signature", &g_end_sig);
+        g_have_tohost = sym("tohost", &g_tohost);
+        g_have_sig    = sym("begin_signature", &g_begin_sig) & sym("end_signature", &g_end_sig);
     }
 
     st->pc = start;

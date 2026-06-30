@@ -1,13 +1,15 @@
 # purva - AOT pipeline: standalone transcode tool + an evaluator that runs its output.
 #
 #   make            build ./transcode (tool) and ./purva (evaluator)
-#   make test       transcode the RV32IM examples and run them on purva
+#   make test       transcode the RV32IM examples to .img and run them on purva
 #
-# `transcode in.elf out.ops` is the ONLY thing that decodes RISC-V: one packed op
-# word per instruction (ops[pc>>2]); nothing else. `purva --ops=out.ops in.elf` runs
-# it -- the host still loads the ELF for memory + symbols (the upper layer, like the
-# purv driver); the evaluator just threads the ops and never decodes or links the
-# transcoder.
+# `transcode in.elf out.img` is the ONLY thing that decodes RISC-V: it lowers a
+# whole RV32IM image into a self-contained runnable image (image.h: packed ops +
+# rodata + rwdata, no ELF, no symbols). `purva out.img` runs it directly -- it never
+# sees a raw instruction, and does not even link transcode.c. `in.elf` must be
+# linked with --emit-relocs and purva.ld (separate .text/.rodata, needed so the
+# transcoder can find every code address stored as a data word -- vtable slots,
+# function-pointer globals -- and patch it to the right op index).
 
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra
@@ -18,17 +20,19 @@ GUEST_CFLAGS ?= -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
                 -O2 -Wall -Wextra -Werror -Wpedantic
 RVLD     := ld.lld
 EX       := ../examples
-GUEST_LD := $(EX)/purv.ld
-LDFLAGS  ?= -m elf32lriscv -T $(GUEST_LD)
+GUEST_LD := purva.ld
+LDFLAGS  ?= -m elf32lriscv -T $(GUEST_LD) --emit-relocs
 
 .PHONY: all test clean
 all: transcode purva
 
-transcode: tctool.c transcode.c transcode.h ../purv.h ../purvhost.h
+transcode: tctool.c transcode.c transcode.h image.h ../purv.h ../purvhost.h
 	$(CC) $(CFLAGS) tctool.c transcode.c -o $@
-purva: purva.c main.c purva.h transcode.h ../purv.h ../purvhost.h
+purva: purva.c main.c purva.h transcode.h image.h ../purv.h ../purvhost.h
 	$(CC) $(CFLAGS) purva.c main.c -o $@
 
+# RV32IM example elfs (local names; don't clobber purvs's rv32imc builds). Linked
+# against purva.ld (separate .text/.rodata) with --emit-relocs.
 fn.elf: $(EX)/fn.c $(GUEST_LD)
 	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o fn.o
 	$(RVLD) $(LDFLAGS) --entry=0 fn.o -o $@
@@ -39,20 +43,21 @@ hello.elf args.elf: %.elf: $(EX)/%.c $(GUEST_LD)
 	$(GUESTCC) $(GUEST_ARCH) $(GUEST_CFLAGS) -c $< -o $*.o
 	$(RVLD) $(LDFLAGS) -e _start $*.o -o $@
 
-%.ops: %.elf transcode
+# elf -> .img via the transcode tool.
+%.img: %.elf transcode
 	./transcode $< $@
 
-test: transcode purva fn.ops sigtest.ops hello.ops args.ops
+test: transcode purva fn.img sigtest.img hello.img args.img
 	@echo "== wasm-style function calls =="
-	@printf "square(7)   = "; ./purva --ops=fn.ops --invoke=square --arg=7   fn.elf
-	@printf "sum_to(100) = "; ./purva --ops=fn.ops --invoke=sum_to --arg=100 fn.elf
-	@printf "fib(20)     = "; ./purva --ops=fn.ops --invoke=fib    --arg=20  fn.elf
+	@printf "square(7)   = "; ./purva fn.img --symbols=fn.elf --invoke=square --arg=7
+	@printf "sum_to(100) = "; ./purva fn.img --symbols=fn.elf --invoke=sum_to --arg=100
+	@printf "fib(20)     = "; ./purva fn.img --symbols=fn.elf --invoke=fib    --arg=20
 	@echo "== userspace program (ecall syscalls) =="
-	@./purva --ops=hello.ops --user hello.elf
-	@./purva --ops=args.ops --user args.elf one two
+	@./purva hello.img --user
+	@./purva args.img --user one two
 	@echo "== conformance signature dump =="
-	@./purva --ops=sigtest.ops --signature=out.sig sigtest.elf && \
+	@./purva sigtest.img --symbols=sigtest.elf --signature=out.sig && \
 	  echo "signature:" && sed 's/^/  /' out.sig
 
 clean:
-	rm -f transcode purva *.o *.elf *.ops out.sig
+	rm -f transcode purva *.o *.elf *.img out.sig

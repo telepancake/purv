@@ -68,4 +68,13 @@ typedef struct {
  * code bytes; produces one op word per 4-byte instruction. Free out->ops yourself. */
 void transcode(const uint8_t *code, uint32_t len, Transcoded *out);
 
+#define TC_SENTINEL 0xffffffffu     /* map entry for a non-instruction offset */
+
+/* Build ONLY the orig_pc>>1 -> op-word-offset map (pass 1; no op emission), and
+ * report the resulting op count. For a tool that needs to resolve a CODE ADDRESS to
+ * its op index outside the normal transcode call -- e.g. patching a code pointer
+ * found by a relocation -- not needed by transcode() callers that just run code.
+ * Caller frees the returned array (sized (len>>1)+2). */
+uint32_t *transcode_map(const uint8_t *code, uint32_t len, uint32_t *n_ops_out);
+
 #endif /* TRANSCODE_H_ */

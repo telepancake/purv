@@ -31,8 +31,6 @@
 enum { LOAD = 0x03, MISCMEM = 0x0f, OPIMM = 0x13, AUIPC = 0x17, STORE = 0x23,
        OP = 0x33, LUI = 0x37, BRANCH = 0x63, JALR = 0x67, JAL = 0x6f, SYSTEM = 0x73 };
 
-#define TC_SENTINEL 0xffffffffu          /* map entry for a non-instruction offset */
-
 static int32_t sext(uint32_t v, int bits) { int sh = 32 - bits; return (int32_t)(v << sh) >> sh; }
 
 static uint8_t load_op(uint32_t f3) {
@@ -161,13 +159,13 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
     return at;
 }
 
-void transcode(const uint8_t *code, uint32_t len, Transcoded *out) {
+/* Pass 1, shared by transcode() and transcode_map(): place every instruction's
+ * op-word offset in map[orig_pc>>1], and report the total op count. */
+static void build_map(const uint8_t *code, uint32_t len, uint32_t *map, uint32_t *n_ops) {
     size_t mapn = (size_t)(len >> 1) + 2;
-    uint32_t *map = malloc(mapn * sizeof *map);
     for (size_t i = 0; i < mapn; i++) map[i] = TC_SENTINEL;
     Dec d;
-
-    uint32_t at = 0;                                       /* pass 1: place + size */
+    uint32_t at = 0;
     for (uint32_t off = 0; off + 2 <= len; ) {
         uint16_t lo = code[off] | code[off+1] << 8;
         uint32_t wd = ((lo & 3) == 3) ? 4 : 2;
@@ -177,11 +175,24 @@ void transcode(const uint8_t *code, uint32_t len, Transcoded *out) {
         at += op_words(d.op);
         off += d.width;
     }
-    out->n_ops = at;
-    out->code_len = at * 4;
-    out->ops = malloc(((size_t)at + 2) * sizeof *out->ops);
+    *n_ops = at;
+}
 
-    at = 0;                                                /* pass 2: emit          */
+uint32_t *transcode_map(const uint8_t *code, uint32_t len, uint32_t *n_ops_out) {
+    uint32_t *map = malloc(((size_t)(len >> 1) + 2) * sizeof *map);
+    build_map(code, len, map, n_ops_out);
+    return map;
+}
+
+void transcode(const uint8_t *code, uint32_t len, Transcoded *out) {
+    uint32_t n_ops;
+    uint32_t *map = transcode_map(code, len, &n_ops);
+    out->n_ops = n_ops;
+    out->code_len = n_ops * 4;
+    out->ops = malloc(((size_t)n_ops + 2) * sizeof *out->ops);
+
+    uint32_t at = 0;                                       /* pass 2: emit */
+    Dec d;
     for (uint32_t off = 0; off + 2 <= len; ) {
         uint16_t lo = code[off] | code[off+1] << 8;
         uint32_t wd = ((lo & 3) == 3) ? 4 : 2;

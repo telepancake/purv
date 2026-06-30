@@ -2,5 +2,6 @@ transcode
 purva
 *.o
 *.elf
+*.img
 *.ops
 *.sig
