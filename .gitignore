@@ -16,3 +16,6 @@ riscof_work/
 # Build output
 __pycache__/
 *.pyc
+
+# Claude Code local worktrees / state
+.claude/
