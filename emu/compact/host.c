@@ -16,29 +16,22 @@
 #include <unistd.h>
 
 #include "../purv.h"
+#include "../purvhost.h"
 #include "hostcalls.h"
 
 /* Four engine regions, three host buffers: g_code holds the flat image (text +
  * rodata, read-only lower half at 0, fetched); g_heap is the malloc arena (upper
- * half at RISCV_HALF); g_stack is the stack (top, grows down). */
+ * half at RISCV_HALF); g_stack is the stack (top, grows down). purvhost.h does the
+ * allocation, flat-image load, and region/state wiring; the K&R allocator below
+ * keeps driving g_heap. */
 #define CODE_BYTES     (16u * 1024 * 1024)
 #define HEAP_BYTES     (48u * 1024 * 1024)
 #define STACK_BYTES    (4u * 1024 * 1024)
-#define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* stack ends at the last address */
 static uint8_t *g_code;                  /* flat image: [0, CODE_BYTES) */
 static uint8_t *g_heap;                  /* malloc arena: [RISCV_HALF, +HEAP_BYTES) */
 static uint8_t *g_stack;                 /* stack (grows down) */
 
-static int in_code(uint32_t n) { return (uint64_t)n <= CODE_BYTES; }
-/* Read a guest byte through the region map (flat image, heap, or stack). */
-static uint8_t guest_byte(uint32_t a) {
-    if (a >= STACK_MEM_BASE) return g_stack[a - STACK_MEM_BASE];           /* the stack */
-    if (a >= RISCV_HALF) return (a - RISCV_HALF < HEAP_BYTES) ? g_heap[a - RISCV_HALF] : 0;
-    return (a < CODE_BYTES) ? g_code[a] : 0;                               /* code/rodata */
-}
-
 static int      g_halt, g_exit;
-static uint32_t g_image_end;
 
 /* ---- tiny heap over the guest heap region: K&R allocator with guest-address
  * "pointers" (all in [RISCV_HALF, RISCV_HALF+HEAP_BYTES), the read/write half) --- */
@@ -111,7 +104,7 @@ static void service(RiscvEmulatorState_t *st) {
     switch (fn) {
     case HOSTCALL_WRITE:
         for (uint32_t i = 0; i < a2; i++) {
-            uint8_t b = guest_byte(a1 + i);
+            uint8_t b = purvhost_guest_byte(st, a1 + i);
             if (write(a0 == 2 ? 2 : 1, &b, 1) < 0) break;
         }
         ret = a2;
@@ -124,44 +117,28 @@ static void service(RiscvEmulatorState_t *st) {
     st->x[10] = ret;
 }
 
-/* ----------------------------------------------------------- flat image load */
-
-static uint32_t load_flat(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "compact: cannot open %s: %s\n", path, strerror(errno)); exit(2); }
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    if (n <= 0 || !in_code((uint32_t)n)) { fprintf(stderr, "compact: bad image\n"); exit(2); }
-    if (fread(&g_code[0], 1, (size_t)n, f) != (size_t)n) { fprintf(stderr, "compact: read failed\n"); exit(2); }
-    fclose(f);
-    g_image_end = (uint32_t)n;
-    return 0;                               /* flat: load at 0 (code region), entry there */
-}
+/* --------------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <flat-image>\n", argv[0]); return 2; }
-    g_code  = calloc(1, CODE_BYTES);
-    g_heap  = calloc(1, HEAP_BYTES);
-    g_stack = calloc(1, STACK_BYTES);
-    if (!g_code || !g_heap || !g_stack) { fprintf(stderr, "compact: OOM\n"); return 2; }
 
-    uint32_t entry = load_flat(argv[1]);
+    /* purvhost handles the recurring puzzle: allocate the three buffers, load the
+     * flat image into the code region at 0 (entry there), and wire the four engine
+     * regions + state. We keep pointers for the K&R allocator and install handlers. */
+    PurvHost host;
+    if (purvhost_alloc(&host, CODE_BYTES, HEAP_BYTES, STACK_BYTES) != 0) return 2;
+    g_code = host.code; g_heap = host.heap; g_stack = host.stack;
+    purvhost_load_flat(&host, argv[1]);
     heap_init(RISCV_HALF, RISCV_HALF + HEAP_BYTES);   /* malloc arena = all of the heap region */
 
-    /* code (text+rodata) is the read-only lower half (fetched + read); the heap
-     * and stack are the read/write upper half. Init wires the four regions, sp,
-     * pc, and the default callback; we install the host handlers (rodata unused). */
-    RiscvEmulatorRegion_t code   = { g_code,  CODE_BYTES };
-    RiscvEmulatorRegion_t rodata = { 0, 0 };
-    RiscvEmulatorRegion_t heap   = { g_heap,  HEAP_BYTES };
-    RiscvEmulatorRegion_t stack  = { g_stack, STACK_BYTES };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, code, rodata, heap, stack);
+    purvhost_init(&host, &state);
     RiscvEmulatorState_t *st = &state;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
     st->callback = on_oob;
-    st->pc = entry;
+    st->pc = host.entry;
 
     /* pc lives in the state; run in slices off the flat code image. */
     const uint64_t CAP = 1000ull * 1000 * 1000, SLICE = 1u << 16;

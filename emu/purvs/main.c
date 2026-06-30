@@ -27,6 +27,7 @@
 #include <errno.h>
 
 #include "purvs.h"
+#include "../purvhost.h"
 #ifdef PURV_GDBSTUB
 #include "gdbstub.h"
 #endif
@@ -61,10 +62,8 @@ static int      g_gdb_fd = -1;            /* --gdb=FD: serve gdb on this connect
 static int      g_have_tohost, g_have_sig;
 static uint32_t g_tohost, g_begin_sig, g_end_sig;
 
-/* Is [addr,addr+len) inside the code (lower half) or heap (upper half) buffer? */
-static int in_code(uint32_t addr, uint32_t len) {
-    return addr < RISCV_HALF && (uint64_t)addr + len <= CODE_BYTES;
-}
+/* Is [addr,addr+len) inside the heap (upper half) buffer? (Image placement and the
+ * region/state wiring live in purvhost.h now.) */
 static int in_heap(uint32_t addr, uint32_t len) {
     return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_size;
 }
@@ -99,16 +98,6 @@ static uint32_t on_oob(RiscvEmulatorState_t *state, int op, uint32_t addr, uint3
  * result in a0. Only what single-threaded console programs need; everything else
  * returns -ENOSYS. Enabled by --user; without it an ecall is a nop and execution
  * continues (the signature-dump suites halt via the tohost word we poll). */
-/* Read a guest byte the way the engine resolves one: the half picks a pair of
- * regions, the lower grows up from the base, the upper grows down from RISCV_HALF. */
-static uint8_t guest_byte(const RiscvEmulatorState_t *st, uint32_t a) {
-    const RiscvEmulatorRegion_t *r = &st->region[(a >> 31) << 1];
-    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
-    if (lo < r[0].len)  return r[0].ptr[lo];
-    if (lo >= down && r[1].len) return r[1].ptr[lo - down];
-    return 0;
-}
-
 static int on_ecall(RiscvEmulatorState_t *state) {
     if (!g_user_mode) return 0;          /* no syscall ABI requested: keep running */
     uint32_t num = state->x[17];         /* a7 */
@@ -119,7 +108,7 @@ static int on_ecall(RiscvEmulatorState_t *state) {
     switch (num) {
     case 64:                              /* write(fd, buf, len) */
         for (uint32_t i = 0; i < a2; i++)
-            putchar(guest_byte(state, a1 + i));
+            putchar(purvhost_guest_byte(state, a1 + i));
         ret = a2;
         fflush(stdout);
         (void)a0;                         /* fd ignored: 1/2 both -> stdout */
@@ -142,104 +131,6 @@ static int on_ecall(RiscvEmulatorState_t *state) {
     return g_halt;                        /* exit halts; otherwise keep running in place */
 }
 static int on_ebreak(RiscvEmulatorState_t *state) { (void)state; return 1; }
-
-/* ------------------------------------------------------------- ELF32 loading */
-
-/* Minimal ELF32 little-endian definitions (avoid depending on <elf.h>). */
-typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version,
-    e_entry, e_phoff, e_shoff, e_flags; uint16_t e_ehsize, e_phentsize, e_phnum,
-    e_shentsize, e_shnum, e_shstrndx; } Ehdr32;
-typedef struct { uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz,
-    p_flags, p_align; } Phdr32;
-typedef struct { uint32_t sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size,
-    sh_link, sh_info, sh_addralign, sh_entsize; } Shdr32;
-typedef struct { uint32_t st_name, st_value, st_size; uint8_t st_info, st_other;
-    uint16_t st_shndx; } Sym32;
-
-#define PT_LOAD     1
-#define SHT_SYMTAB  2
-#define EM_RISCV    243
-
-static uint8_t *g_elf;          /* whole file in memory */
-static long     g_elf_len;
-
-static uint8_t *slurp(const char *path, long *len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "purv: cannot open %s: %s\n", path, strerror(errno)); exit(2); }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc((size_t)n);
-    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) {
-        fprintf(stderr, "purv: read failed for %s\n", path); exit(2);
-    }
-    fclose(f);
-    *len = n;
-    return buf;
-}
-
-/* Load PT_LOAD segments into RAM and return the entry point. */
-static uint32_t load_elf(const char *path) {
-    g_elf = slurp(path, &g_elf_len);
-    if (g_elf_len < (long)sizeof(Ehdr32) || memcmp(g_elf, "\177ELF", 4) != 0) {
-        fprintf(stderr, "purv: %s is not an ELF\n", path); exit(2);
-    }
-    Ehdr32 eh;
-    memcpy(&eh, g_elf, sizeof eh);
-    if (eh.e_ident[4] != 1 /* ELFCLASS32 */ || eh.e_machine != EM_RISCV) {
-        fprintf(stderr, "purv: %s is not a 32-bit RISC-V ELF\n", path); exit(2);
-    }
-    for (int i = 0; i < eh.e_phnum; i++) {
-        Phdr32 ph;
-        memcpy(&ph, g_elf + eh.e_phoff + (long)i * eh.e_phentsize, sizeof ph);
-        if (ph.p_type != PT_LOAD || ph.p_memsz == 0) continue;
-        /* lower-half segments (text/rodata) load into the code buffer at their
-         * vaddr; upper-half segments (data/bss) into the heap buffer. */
-        uint8_t *dst; uint32_t base;
-        if (ph.p_vaddr < RISCV_HALF) {
-            if (!in_code(ph.p_vaddr, ph.p_memsz)) {
-                fprintf(stderr, "purv: code segment vaddr=0x%08x size=0x%x too big\n",
-                        ph.p_vaddr, ph.p_memsz); exit(2);
-            }
-            dst = g_code; base = 0;
-        } else {
-            if (!in_heap(ph.p_vaddr, ph.p_memsz)) {
-                fprintf(stderr, "purv: data segment vaddr=0x%08x size=0x%x outside heap\n",
-                        ph.p_vaddr, ph.p_memsz); exit(2);
-            }
-            dst = g_heap; base = RISCV_HALF;
-            uint32_t end = ph.p_vaddr + ph.p_memsz;
-            if (end > g_brk) g_brk = (end + 0xFFF) & ~0xFFFu;   /* heap starts past the data */
-        }
-        if (ph.p_filesz)
-            memcpy(&dst[ph.p_vaddr - base], g_elf + ph.p_offset, ph.p_filesz);
-    }
-    return eh.e_entry;
-}
-
-/* Resolve a symbol by name; returns 1 and sets *out on success. */
-static int sym_lookup(const char *want, uint32_t *out) {
-    Ehdr32 eh;
-    memcpy(&eh, g_elf, sizeof eh);
-    for (int i = 0; i < eh.e_shnum; i++) {
-        Shdr32 sh;
-        memcpy(&sh, g_elf + eh.e_shoff + (long)i * eh.e_shentsize, sizeof sh);
-        if (sh.sh_type != SHT_SYMTAB || sh.sh_entsize == 0) continue;
-        Shdr32 strsh;
-        memcpy(&strsh, g_elf + eh.e_shoff + (long)sh.sh_link * eh.e_shentsize, sizeof strsh);
-        const char *strs = (const char *)(g_elf + strsh.sh_offset);
-        uint32_t n = sh.sh_size / sh.sh_entsize;
-        for (uint32_t s = 0; s < n; s++) {
-            Sym32 sym;
-            memcpy(&sym, g_elf + sh.sh_offset + (long)s * sh.sh_entsize, sizeof sym);
-            if (sym.st_name && strcmp(strs + sym.st_name, want) == 0) {
-                *out = sym.st_value;
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
 
 /* ------------------------------------------------------------------- signature */
 
@@ -275,7 +166,7 @@ static void gpoke(uint32_t addr, uint32_t v) {
  * strings sit just below the top. Returns the new sp. */
 static uint32_t setup_user_stack(int argc, char **argv) {
     uint32_t sp = 0;                                 /* 2^32: one past the last address */
-    uint32_t ptr[64];
+    uint32_t ptr[64] = {0};
     if (argc > 64) argc = 64;
     for (int i = argc - 1; i >= 0; i--) {
         uint32_t len = (uint32_t)strlen(argv[i]) + 1;
@@ -345,23 +236,19 @@ int main(int argc, char **argv) {
     if (gargc) elf = gargv[0];
     if (!elf) { usage(argv[0]); return 2; }
 
-    g_code  = calloc(1, CODE_BYTES);
-    g_heap  = calloc(1, g_heap_size);
-    g_stack = calloc(1, STACK_BYTES);
-    if (!g_code || !g_heap || !g_stack) { fprintf(stderr, "purv: cannot allocate RAM\n"); return 2; }
+    /* purvhost does the recurring setup: allocate the three buffers, load+place the
+     * ELF (text/rodata -> code at 0, data/bss -> heap at RISCV_HALF), and wire the
+     * four engine regions + state. We keep the buffer pointers (handlers and the
+     * signature dump reach g_heap) and install our trap handlers. */
+    PurvHost host;
+    if (purvhost_alloc(&host, CODE_BYTES, g_heap_size, STACK_BYTES) != 0) return 2;
+    g_code = host.code; g_heap = host.heap; g_stack = host.stack;
+    purvhost_load_elf(&host, elf);
+    uint32_t entry = host.entry;
+    g_brk = (host.data_end + 0xFFFu) & ~0xFFFu;               /* brk: past the data, page-aligned */
 
-    uint32_t entry = load_elf(elf);
-
-    /* Map the host buffers into the engine's regions: code (text+rodata) at 0,
-     * heap (data+bss+heap) at RISCV_HALF, stack at the top. rodata is unmapped
-     * (the guest's .rodata rides in the code region). Init wires the regions, sp,
-     * pc, and the default callback; we install the host handlers. */
-    RiscvEmulatorRegion_t code   = { g_code,  CODE_BYTES };
-    RiscvEmulatorRegion_t rodata = { 0, 0 };
-    RiscvEmulatorRegion_t heap   = { g_heap,  g_heap_size };
-    RiscvEmulatorRegion_t stack  = { g_stack, STACK_BYTES };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, code, rodata, heap, stack);
+    purvhost_init(&host, &state);
     RiscvEmulatorState_t *st = &state;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
@@ -370,7 +257,7 @@ int main(int argc, char **argv) {
 
     uint32_t start = entry;
     if (invoke) {
-        if (!sym_lookup(invoke, &start)) {
+        if (!purvhost_sym(&host, invoke, &start)) {
             fprintf(stderr, "purv: symbol '%s' not found\n", invoke); return 2;
         }
         st->x[1] = MAGIC_RET;                                 /* ra: ret -> stop */
@@ -379,9 +266,9 @@ int main(int argc, char **argv) {
     } else if (g_user_mode) {
         st->x[2] = setup_user_stack(gargc, gargv);            /* sp */
     } else {
-        g_have_tohost   = sym_lookup("tohost", &g_tohost);
-        g_have_sig      = sym_lookup("begin_signature", &g_begin_sig) &
-                          sym_lookup("end_signature", &g_end_sig);
+        g_have_tohost   = purvhost_sym(&host, "tohost", &g_tohost);
+        g_have_sig      = purvhost_sym(&host, "begin_signature", &g_begin_sig) &
+                          purvhost_sym(&host, "end_signature", &g_end_sig);
     }
 
     st->pc = start;
