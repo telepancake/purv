@@ -34,6 +34,21 @@ static int in_heap(uint32_t addr, uint32_t len) {
     return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_size;
 }
 
+/* Highest lower-half (code+rodata) byte the image occupies: the data window for
+ * loads. It differs from the op array's extent now that auipc spills a word, so the
+ * host sets it from the ELF rather than from the op count. */
+static uint32_t lower_half_extent(const PurvHost *h) {
+    PurvElf32_Ehdr eh; memcpy(&eh, h->elf, sizeof eh);
+    uint32_t end = 0;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        PurvElf32_Phdr ph;
+        memcpy(&ph, h->elf + eh.e_phoff + (long)i * eh.e_phentsize, sizeof ph);
+        if (ph.p_type != PURV_PT_LOAD || ph.p_memsz == 0) continue;
+        if (ph.p_vaddr < RISCV_HALF) { uint32_t e = ph.p_vaddr + ph.p_memsz; if (e > end) end = e; }
+    }
+    return (end + 3u) & ~3u;
+}
+
 /* ------------------------------------------------ trap handlers */
 
 static int on_illegal(RiscvEmulatorState_t *state) {
@@ -199,7 +214,7 @@ int main(int argc, char **argv) {
     RiscvEmulatorState_t state;
     purvhost_init(&host, &state);
     RiscvEmulatorState_t *st = &state;
-    st->region[RISCV_CODE].len = prog.code_len;            /* transcoded image extent */
+    st->region[RISCV_CODE].len = lower_half_extent(&host);  /* data window (original bytes) */
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;
     st->illegal = on_illegal;
