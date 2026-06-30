@@ -4,6 +4,8 @@ guest.elf
 guest-bench.elf
 host
 host-purvs
+host-pgo
+pgo-data/
 bench-native
 .scale
 native.out
