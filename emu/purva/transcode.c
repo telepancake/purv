@@ -101,13 +101,22 @@ static void decode(const uint8_t *code, uint32_t off, Dec *d) {
     }
     default: d->op = RISCV_OP_ILLEGAL; break;
     }
+    /* A pure register write to x0 is architecturally a nop -- fold it into NOP so
+     * translation drops it entirely (see op_words/emit: NOP emits zero op words).
+     * The evaluator then never sees an x0-destination ALU/LUI/AUIPC op, so those
+     * handlers write s->x[rd] with no x0 guard. (Loads and JAL/JALR still reach the
+     * evaluator with rd==0 -- a load into x0 probes memory, a bare jump discards its
+     * link -- so they keep their own discard.) */
+    if (d->rd == 0 && (d->op <= RISCV_OP_REMU || d->op == RISCV_OP_LUI || d->op == RISCV_OP_AUIPC))
+        d->op = RISCV_OP_NOP;
 }
 
 /* Output op words for an op: 2 for RISCV_OP_AUIPC_ABS (its baked absolute value
- * spills a second word -- see transcode.h), 1 for everything else, including a
- * fused SPILL2 (it covers 8 bytes of original code, but its consumed-byte count is
+ * spills a second word -- see transcode.h), 0 for RISCV_OP_NOP (dropped during
+ * translation -- it occupies no op slot), 1 for everything else, including a fused
+ * SPILL2 (it covers 8 bytes of original code, but its consumed-byte count is
  * reported by try_fuse_spill2's return value, separate from this). */
-static int op_words(uint8_t op) { return op == RISCV_OP_AUIPC_ABS ? 2 : 1; }
+static int op_words(uint8_t op) { return op == RISCV_OP_AUIPC_ABS ? 2 : op == RISCV_OP_NOP ? 0 : 1; }
 
 /* ---- target set: addresses that must keep their own op slot ---- */
 
@@ -304,7 +313,9 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | rd << 21 | (d->imm & 0xfffff);            /* lui value / auipc upper */
     } else if (op == RISCV_OP_AUIPC_ABS) {
         ops[at++] = w0 | rd << 21; ops[at++] = d->target;          /* + baked absolute value */
-    } else {                                                       /* nop / traps   */
+    } else if (op == RISCV_OP_NOP) {
+        /* dropped during translation -- emits zero op words (op_words == 0) */
+    } else {                                                       /* traps (ecall/ebreak/illegal) */
         ops[at++] = w0;
     }
     return at;

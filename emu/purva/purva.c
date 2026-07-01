@@ -30,8 +30,6 @@ static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
 }
 #define TRACE_STEP() do { if (g_itrace) trace_dump(s, p, base); } while (0)
 
-static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i] = v; }
-
 /* A single 4-byte store, written the same way h_sw's does (GCC reliably folds this
  * exact shape into one unaligned mov). The fused prologue handler calls it once per
  * saved register into the contiguous save block. */
@@ -42,31 +40,54 @@ static inline __attribute__((always_inline)) uint32_t ld32(const uint8_t *q) {
     return (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24;
 }
 
+/* Sign-extend the low `bits` of v (the load path uses it for LB/LH). */
+static int32_t sext(uint32_t v, int bits) { int sh = 32 - bits; return (int32_t)(v << sh) >> sh; }
+
 /* Data memory is the two self-describing regions of the state (see purv.h):
  *
  *   s->writable   the stack and heap as ONE contiguous buffer, based at
  *                 RISCV_HALF - stack_len (the stack bottom) and spanning up through
  *                 the heap. Its len is the whole span.
  *   s->readonly   rodata, based at 0 - rodata_len -- it grows down from 0, living at
- *                 small negative addresses.
+ *                 small negative addresses. (Instruction fetch is the op cursor, not
+ *                 a region -- purva's "code" is packed op words, not data.)
  *
- * Instruction fetch is the op cursor (g_prog), never a region -- purva's "code" is
- * packed op words, not data-addressable, so s->readonly holds only rodata. mem_xlate
- * is two base-relative bounded checks: a WRITE tests only the writable region; a
- * READ falls through to rodata. The bound is `rel < len && n <= len - rel`, correct
- * for ANY n -- once rel < len, len - rel can't underflow, and there is no per-access
- * base arithmetic. */
+ * mem_w resolves a WRITABLE block to a host pointer (or NULL); mem_r resolves a
+ * READ block (writable, then read-only). One base-relative bounded check each:
+ * `rel < len && n <= len - rel` is correct for any n -- once rel < len, len - rel
+ * can't underflow. The LOAD/STORE macros build the whole load/store on top of these:
+ * assemble/scatter n little-endian bytes, a miss goes to the callback. The block
+ * pointers are also what the fused prologue/epilogue want (one check per frame). */
 static inline __attribute__((always_inline))
-uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
-    uint32_t rel = addr - s->writable.base;
-    if (rel < s->writable.len && n <= s->writable.len - rel) return s->writable.ptr + rel;
-    if (write) return (uint8_t *)0;
-    rel = addr - s->readonly.base;
-    if (rel < s->readonly.len && n <= s->readonly.len - rel) return s->readonly.ptr + rel;
-    return (uint8_t *)0;
+uint8_t *mem_w(const RiscvEmulatorState_t *s, uint32_t a, uint32_t n) {
+    uint32_t rel = a - s->writable.base;
+    return (rel < s->writable.len && n <= s->writable.len - rel) ? s->writable.ptr + rel : (uint8_t *)0;
 }
-
-static int32_t sext(uint32_t v, int bits) { int sh = 32 - bits; return (int32_t)(v << sh) >> sh; }
+static inline __attribute__((always_inline))
+uint8_t *mem_r(const RiscvEmulatorState_t *s, uint32_t a, uint32_t n) {
+    uint8_t *q = mem_w(s, a, n);
+    if (q) return q;
+    uint32_t rel = a - s->readonly.base;
+    return (rel < s->readonly.len && n <= s->readonly.len - rel) ? s->readonly.ptr + rel : (uint8_t *)0;
+}
+static inline __attribute__((always_inline))
+uint32_t mem_load(RiscvEmulatorState_t *s, uint32_t a, uint32_t n, int sgn) {
+    const uint8_t *q = mem_r(s, a, n);
+    uint32_t v;
+    if (q) { v = q[0]; if (n > 1) v |= (uint32_t)q[1] << 8;
+             if (n > 2) v |= (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; }
+    else v = s->callback(s, RISCV_MEM_LOAD, a, 0);
+    return sgn ? (uint32_t)sext(v, 8 * n) : (n == 4 ? v : v & ((1u << (8 * n)) - 1));
+}
+static inline __attribute__((always_inline))
+void mem_store(RiscvEmulatorState_t *s, uint32_t a, uint32_t n, uint32_t v) {
+    extern uint32_t g_watch;                       /* TEMP debug: store watchpoint */
+    if (g_watch && a == g_watch) fprintf(stderr, "WATCH store ad=0x%x val=0x%x n=%u\n", a, v, n);
+    uint8_t *q = mem_w(s, a, n);
+    if (q) { q[0] = (uint8_t)v; if (n > 1) q[1] = (uint8_t)(v >> 8);
+             if (n > 2) { q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24); } }
+    else s->callback(s, RISCV_MEM_STORE, a, v);
+}
 
 /* PROLOGUE/EPILOGUE regmask bit -> register number, in canonical save rank order
  * (see transcode.h): rank 0=ra, 1=s0, 2=s1, 3..12=s2..s11. */
@@ -115,80 +136,60 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     /* Jump to op index `idx`: count it, budget-check (resume pc = idx<<2), relocate. */
     #define RELOC(idx) do { uint32_t i_ = (idx); k++; \
         if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
+    /* One load, one store. addr = x[rs1] + imm; LOAD writes the sign/zero-extended
+     * result to rd, discarding a load into x0. Loads and JAL/JALR are the only ops
+     * that reach a handler with rd == 0 (a bare jump discards its link, a load into x0
+     * still probes memory) -- the transcoder drops every x0-destination ALU/LUI/AUIPC
+     * op during translation (it is a nop), so those handlers write s->x[...] with no
+     * guard. */
+    #define LOAD(n, sgn)  do { uint32_t rd_ = TC_A(w); \
+        if (rd_) s->x[rd_] = mem_load(s, s->x[TC_B(w)] + TC_IMM(w), (n), (sgn)); } while (0)
+    #define STORE(n)      mem_store(s, s->x[TC_B(w)] + TC_IMM(w), (n), s->x[TC_A(w)])
 
     TRACE_STEP();
     goto *tbl[TC_OP(w)];
 
-    h_add:  wr(s, TC_A(w), s->x[TC_B(w)] + s->x[TC_C(w)]);                          NEXT();
-    h_sub:  wr(s, TC_A(w), s->x[TC_B(w)] - s->x[TC_C(w)]);                          NEXT();
-    h_sll:  wr(s, TC_A(w), s->x[TC_B(w)] << (s->x[TC_C(w)] & 31));                  NEXT();
-    h_slt:  wr(s, TC_A(w), (int32_t)s->x[TC_B(w)] < (int32_t)s->x[TC_C(w)]);        NEXT();
-    h_sltu: wr(s, TC_A(w), s->x[TC_B(w)] < s->x[TC_C(w)]);                          NEXT();
-    h_xor:  wr(s, TC_A(w), s->x[TC_B(w)] ^ s->x[TC_C(w)]);                          NEXT();
-    h_srl:  wr(s, TC_A(w), s->x[TC_B(w)] >> (s->x[TC_C(w)] & 31));                  NEXT();
-    h_sra:  wr(s, TC_A(w), (uint32_t)((int32_t)s->x[TC_B(w)] >> (s->x[TC_C(w)] & 31))); NEXT();
-    h_or:   wr(s, TC_A(w), s->x[TC_B(w)] | s->x[TC_C(w)]);                          NEXT();
-    h_and:  wr(s, TC_A(w), s->x[TC_B(w)] & s->x[TC_C(w)]);                          NEXT();
+    h_add:  s->x[TC_A(w)] = s->x[TC_B(w)] + s->x[TC_C(w)];                          NEXT();
+    h_sub:  s->x[TC_A(w)] = s->x[TC_B(w)] - s->x[TC_C(w)];                          NEXT();
+    h_sll:  s->x[TC_A(w)] = s->x[TC_B(w)] << (s->x[TC_C(w)] & 31);                  NEXT();
+    h_slt:  s->x[TC_A(w)] = (int32_t)s->x[TC_B(w)] < (int32_t)s->x[TC_C(w)];        NEXT();
+    h_sltu: s->x[TC_A(w)] = s->x[TC_B(w)] < s->x[TC_C(w)];                          NEXT();
+    h_xor:  s->x[TC_A(w)] = s->x[TC_B(w)] ^ s->x[TC_C(w)];                          NEXT();
+    h_srl:  s->x[TC_A(w)] = s->x[TC_B(w)] >> (s->x[TC_C(w)] & 31);                  NEXT();
+    h_sra:  s->x[TC_A(w)] = (uint32_t)((int32_t)s->x[TC_B(w)] >> (s->x[TC_C(w)] & 31)); NEXT();
+    h_or:   s->x[TC_A(w)] = s->x[TC_B(w)] | s->x[TC_C(w)];                          NEXT();
+    h_and:  s->x[TC_A(w)] = s->x[TC_B(w)] & s->x[TC_C(w)];                          NEXT();
 
-    h_addi:  wr(s, TC_A(w), s->x[TC_B(w)] + TC_IMM(w));                             NEXT();
-    h_slli:  wr(s, TC_A(w), s->x[TC_B(w)] << (TC_IMM(w) & 31));                     NEXT();
-    h_slti:  wr(s, TC_A(w), (int32_t)s->x[TC_B(w)] < TC_IMM(w));                    NEXT();
-    h_sltiu: wr(s, TC_A(w), s->x[TC_B(w)] < (uint32_t)TC_IMM(w));                   NEXT();
-    h_xori:  wr(s, TC_A(w), s->x[TC_B(w)] ^ (uint32_t)TC_IMM(w));                   NEXT();
-    h_srli:  wr(s, TC_A(w), s->x[TC_B(w)] >> (TC_IMM(w) & 31));                     NEXT();
-    h_ori:   wr(s, TC_A(w), s->x[TC_B(w)] | (uint32_t)TC_IMM(w));                   NEXT();
-    h_andi:  wr(s, TC_A(w), s->x[TC_B(w)] & (uint32_t)TC_IMM(w));                   NEXT();
-    h_srai:  wr(s, TC_A(w), (uint32_t)((int32_t)s->x[TC_B(w)] >> (TC_IMM(w) & 31))); NEXT();
+    h_addi:  s->x[TC_A(w)] = s->x[TC_B(w)] + TC_IMM(w);                             NEXT();
+    h_slli:  s->x[TC_A(w)] = s->x[TC_B(w)] << (TC_IMM(w) & 31);                     NEXT();
+    h_slti:  s->x[TC_A(w)] = (int32_t)s->x[TC_B(w)] < TC_IMM(w);                    NEXT();
+    h_sltiu: s->x[TC_A(w)] = s->x[TC_B(w)] < (uint32_t)TC_IMM(w);                   NEXT();
+    h_xori:  s->x[TC_A(w)] = s->x[TC_B(w)] ^ (uint32_t)TC_IMM(w);                   NEXT();
+    h_srli:  s->x[TC_A(w)] = s->x[TC_B(w)] >> (TC_IMM(w) & 31);                     NEXT();
+    h_ori:   s->x[TC_A(w)] = s->x[TC_B(w)] | (uint32_t)TC_IMM(w);                   NEXT();
+    h_andi:  s->x[TC_A(w)] = s->x[TC_B(w)] & (uint32_t)TC_IMM(w);                   NEXT();
+    h_srai:  s->x[TC_A(w)] = (uint32_t)((int32_t)s->x[TC_B(w)] >> (TC_IMM(w) & 31)); NEXT();
 
-    h_mul:    wr(s, TC_A(w), s->x[TC_B(w)] * s->x[TC_C(w)]); NEXT();
-    h_mulh:   a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; wr(s, TC_A(w), (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32)); NEXT();
-    h_mulhsu: a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; wr(s, TC_A(w), (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32)); NEXT();
-    h_mulhu:  a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; wr(s, TC_A(w), (uint32_t)(((uint64_t)a * b) >> 32)); NEXT();
+    h_mul:    s->x[TC_A(w)] = s->x[TC_B(w)] * s->x[TC_C(w)]; NEXT();
+    h_mulh:   a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; s->x[TC_A(w)] = (uint32_t)(((int64_t)(int32_t)a * (int32_t)b) >> 32); NEXT();
+    h_mulhsu: a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; s->x[TC_A(w)] = (uint32_t)(((int64_t)((uint64_t)(int32_t)a * b)) >> 32); NEXT();
+    h_mulhu:  a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; s->x[TC_A(w)] = (uint32_t)(((uint64_t)a * b) >> 32); NEXT();
     h_div:    a = s->x[TC_B(w)]; b = s->x[TC_C(w)];
-              wr(s, TC_A(w), b == 0 ? 0xffffffffu : (a == 0x80000000u && (int32_t)b == -1) ? a : (uint32_t)((int32_t)a / (int32_t)b)); NEXT();
-    h_divu:   a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; wr(s, TC_A(w), b == 0 ? 0xffffffffu : a / b); NEXT();
+              s->x[TC_A(w)] = b == 0 ? 0xffffffffu : (a == 0x80000000u && (int32_t)b == -1) ? a : (uint32_t)((int32_t)a / (int32_t)b); NEXT();
+    h_divu:   a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; s->x[TC_A(w)] = b == 0 ? 0xffffffffu : a / b; NEXT();
     h_rem:    a = s->x[TC_B(w)]; b = s->x[TC_C(w)];
-              wr(s, TC_A(w), b == 0 ? a : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b)); NEXT();
-    h_remu:   a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; wr(s, TC_A(w), b == 0 ? a : a % b); NEXT();
+              s->x[TC_A(w)] = b == 0 ? a : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b); NEXT();
+    h_remu:   a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; s->x[TC_A(w)] = b == 0 ? a : a % b; NEXT();
 
-    h_lb: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
-            if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
-                wr(s, rd, q ? (uint32_t)(int32_t)(int8_t)q[0]
-                            : (uint32_t)sext(s->callback(s, RISCV_MEM_LOAD, ad, 0), 8)); } }
-          NEXT();
-    h_lh: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
-            if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
-                wr(s, rd, q ? (uint32_t)(int32_t)(int16_t)(q[0] | q[1] << 8)
-                            : (uint32_t)sext(s->callback(s, RISCV_MEM_LOAD, ad, 0), 16)); } }
-          NEXT();
-    h_lw: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
-            if (rd) { uint8_t *q = mem_xlate(s, ad, 4, 0);
-                wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24)
-                            : (s->callback(s, RISCV_MEM_LOAD, ad, 0))); } }
-          NEXT();
-    h_lbu: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
-            if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
-                wr(s, rd, q ? q[0] : ((s->callback(s, RISCV_MEM_LOAD, ad, 0)) & 0xff)); } }
-          NEXT();
-    h_lhu: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
-            if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
-                wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8)
-                            : ((s->callback(s, RISCV_MEM_LOAD, ad, 0)) & 0xffff)); } }
-          NEXT();
+    h_lb:  LOAD(1, 1); NEXT();
+    h_lh:  LOAD(2, 1); NEXT();
+    h_lw:  LOAD(4, 1); NEXT();
+    h_lbu: LOAD(1, 0); NEXT();
+    h_lhu: LOAD(2, 0); NEXT();
 
-    h_sb: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 1, 1);
-            if (q) q[0] = (uint8_t)b; else s->callback(s, RISCV_MEM_STORE, ad, b); }
-          NEXT();
-    h_sh: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 2, 1);
-            if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); } else s->callback(s, RISCV_MEM_STORE, ad, b); }
-          NEXT();
-    h_sw: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 4, 1);
-            extern uint32_t g_watch;
-            if (g_watch && ad == g_watch)
-                fprintf(stderr, "WATCH sw ad=0x%x val=0x%x at op-idx=%u (pc=%u)\n", ad, b, (unsigned)(p - base), (unsigned)(p - base) * 4);
-            if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); q[2] = (uint8_t)(b >> 16); q[3] = (uint8_t)(b >> 24); }
-            else s->callback(s, RISCV_MEM_STORE, ad, b); }
-          NEXT();
+    h_sb:  STORE(1); NEXT();
+    h_sh:  STORE(2); NEXT();
+    h_sw:  STORE(4); NEXT();
 
     h_beq:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a == b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
     h_bne:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a != b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
@@ -197,20 +198,24 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_bltu: a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a <  b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
     h_bgeu: a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a >= b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
 
-    h_jal:  { uint32_t idx = (uint32_t)(p - base); wr(s, TC_A(w), (idx << 2) + 4);
+    /* JAL/JALR write the link register, which is x0 for a bare jump (`j`, `ret`) --
+     * discard that write. */
+    h_jal:  { uint32_t idx = (uint32_t)(p - base), rd = TC_A(w); if (rd) s->x[rd] = (idx << 2) + 4;
               RELOC(idx + (uint32_t)(TC_JOFF(w) >> 2)); }
-    h_jalr: { uint32_t t = (s->x[TC_B(w)] + TC_IMM(w)) & ~1u; wr(s, TC_A(w), ((uint32_t)(p - base) << 2) + 4); k++;
+    h_jalr: { uint32_t t = (s->x[TC_B(w)] + TC_IMM(w)) & ~1u, rd = TC_A(w);
+              if (rd) s->x[rd] = ((uint32_t)(p - base) << 2) + 4;
+              k++;
               if (t >= clen || k >= max) { s->pc = t; return k; }
               p = base + (t >> 2); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; }
 
-    h_lui:   wr(s, TC_A(w), TC_UIMM(w) << 12); NEXT();
+    h_lui:   s->x[TC_A(w)] = TC_UIMM(w) << 12; NEXT();
     /* Cursor-based: correct only when nothing before this op has fused (op-index ==
      * pc/4 still holds). transcode_ex only emits this form when it verified that --
      * see transcode.h's RISCV_OP_AUIPC_ABS note. */
-    h_auipc: wr(s, TC_A(w), ((uint32_t)(p - base) << 2) + (TC_UIMM(w) << 12)); NEXT();
+    h_auipc: s->x[TC_A(w)] = ((uint32_t)(p - base) << 2) + (TC_UIMM(w) << 12); NEXT();
     /* Drift has occurred upstream: the transcoder baked the real absolute value
      * (computed from the TRUE pc, not a drifted cursor) into the next word. */
-    h_auipc_abs: wr(s, TC_A(w), p[1]); k++; p += 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+    h_auipc_abs: s->x[TC_A(w)] = p[1]; k++; p += 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     h_nop:   NEXT();
 
     /* Fused prologue (transcode.h): allocate the frame and save the callee-saved set
@@ -220,7 +225,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_prologue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
         uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];
-        uint8_t *q = mem_xlate(s, sp0 - 4 * cnt, 4 * cnt, 1);      /* one xlate for the whole block */
+        uint8_t *q = mem_w(s, sp0 - 4 * cnt, 4 * cnt);      /* one resolve for the whole block */
         if (q) {
             q += 4 * cnt;                                          /* one past the top slot */
             /* rank order ra,s0,s1,s2..s11 -> descending slots; q steps down only on a set bit. */
@@ -231,7 +236,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         } else {                                                  /* off-stack fallback: per-reg */
             uint32_t addr = sp0, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
-                uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_xlate(s, addr, 4, 1);
+                uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_w(s, addr, 4);
                 if (qq) st32(qq, v); else s->callback(s, RISCV_MEM_STORE, addr, v); }
         }
         s->x[2] = sp0 - frame;
@@ -244,7 +249,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_epilogue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
         uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];
-        uint8_t *q = mem_xlate(s, sp0 + frame - 4 * cnt, 4 * cnt, 0);   /* one xlate for the whole block */
+        uint8_t *q = mem_r(s, sp0 + frame - 4 * cnt, 4 * cnt);   /* one resolve for the whole block */
         if (q) {
             q += 4 * cnt;
             #define REST(bit, reg) if (rmask & (1u << (bit))) { q -= 4; s->x[(reg)] = ld32(q); }
@@ -254,7 +259,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         } else {                                                       /* off-stack fallback: per-reg */
             uint32_t addr = sp0 + frame, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
-                uint8_t *qq = mem_xlate(s, addr, 4, 0);
+                uint8_t *qq = mem_r(s, addr, 4);
                 s->x[rank2reg[r]] = qq ? ld32(qq) : s->callback(s, RISCV_MEM_LOAD, addr, 0); }
         }
         s->x[2] = sp0 + frame;
@@ -276,6 +281,8 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     }
     #undef NEXT
     #undef RELOC
+    #undef LOAD
+    #undef STORE
 }
 
 /* ------------------------------------------------------------------ init */
