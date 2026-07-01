@@ -75,8 +75,6 @@ enum {
     RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,
     RISCV_OP_SPILL2,        /* fused store-pair (peephole-only; decode() never emits it directly) */
     RISCV_OP_AUIPC_ABS,     /* auipc with a baked absolute value (see below; also peephole-only) */
-    RISCV_OP_LOOP,          /* loop head: absorbs the guard branch, sits above the body */
-    RISCV_OP_LOOPEND,       /* loop tail: absorbs the backward branch, sits below the body */
     RISCV_OP_COUNT
 };
 
@@ -119,29 +117,6 @@ enum {
 #define TC_JOFF(w)  ((int32_t)(((w) & 0x1fffffu) << 11) >> 11)    /* 21-bit signed */
 #define TC_UIMM(w)  ((w) & 0xfffffu)                              /* 20-bit upper  */
 #define TC_OFF11(w) ((int32_t)(((w) & 0x7ffu) << 21) >> 21)       /* 11-bit signed (SPILL2) */
-
-/* LOOP / LOOPEND encoding (identical fields):  op[31:26] | rd[25:21] | rs1[20:16] | imm[15:0]
- * rd  = first condition register  (TC_A)
- * rs1 = second condition register (TC_B)
- * imm[7:0]  = body_len (op words between LOOP and LOOPEND, exclusive)
- * imm[11:8] = btype    (the BACKWARD branch's op - RISCV_OP_BEQ; 0=beq..5=bgeu)
- *
- * A guarded loop
- *      hdr-1: guard  (forward branch, skips the loop when the entry test fails)
- *      hdr .. i-1: body
- *      i:     back   (backward branch, repeats the loop while the test holds)
- *      i+1:   past   (first instruction after the loop)
- * becomes
- *      hdr-1: LOOP     (was the guard slot; body_len = i-hdr, btype/regs = back's test)
- *      hdr .. i-1: body   (unchanged, runs through normal dispatch)
- *      i:     LOOPEND  (was the backward-branch slot; same test)
- *      i+1:   past
- * The guard is inverse of back over the same registers targeting past, so ONE test
- * (back's) drives both ends: LOOP enters the body when it holds and skips to past
- * when it doesn't; LOOPEND jumps back to hdr while it holds and falls through to
- * past when it doesn't. Nothing is rewritten at run time -- LOOPEND is a fixed op,
- * so a body `break` (a branch to past, over LOOPEND) and a mid-body syscall that
- * returns out of the loop are both safe with no saved state to strand. */
 
 /* A transcoded program: just the op array and how far the code runs. ops[pc>>2] is
  * a SHORTCUT that only holds when nothing has fused -- see the header note above.
