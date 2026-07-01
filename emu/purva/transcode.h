@@ -88,57 +88,32 @@ enum {
  * second word as RISCV_OP_AUIPC_ABS rather than emitting the ordinary 1-word
  * cursor-based RISCV_OP_AUIPC.
  *
- * A SECOND, independent reason also forces the baked form: a target inside the
- * rodata window that immediately follows code (a rodata pointer -- e.g. loading
- * a string literal or a jump table base) is unsafe to leave in real-ELF
- * coordinates even with ZERO local drift, because the image places rodata right
- * after the TRANSCODED code, whose total byte length generally differs from the
- * ORIGINAL code's once anything ANYWHERE in the whole program has fused or
- * expanded -- a whole-program delta unrelated to this auipc's own local drift. A
- * real-ELF-coordinate value would then be silently misread as an image byte
- * offset by mem_xlate (this was a real, shipped bug: a SQLite jump-table load
- * landed on the wrong rodata byte and jumped to garbage). step() therefore bakes
- * AUIPC_ABS whenever the target falls in that rodata window (transcode.h's
- * TcExternalTargets.rodata_end -- a bare transcode()/NULL ext call has no
- * rodata concept and never triggers this), not only on local drift; tctool.c
- * then corrects every such baked target by the final whole-program delta in a
- * post-pass once n_ops (and hence the delta) is known -- it can only do that
- * for values that ARE baked, which is why this trigger has to live here rather
- * than as a runtime evaluator check. The window is intentionally scoped to
- * rodata specifically, not "anything outside the code window": a target past
- * rodata_end (rwdata, or simply an auipc used to materialize an arbitrary
- * 32-bit constant -- a real idiom, found breaking ACT's I-jal-01 when this was
- * first tried unscoped) needs no correction (rwdata sits at the delta-
- * independent fixed RISCV_HALF boundary; a non-pointer constant was never an
- * address to begin with, so baking it changes nothing but costs a word for no
- * reason -- not unsafe, just pointless, and the cursor positions it shifts
- * mattered to that conformance test's own self-checks).
+ * Both forms compute a value in REAL-ELF coordinates (off + uimm20<<12, whether
+ * from the transcode-time `off` or, when undrifted, the cursor standing in for
+ * it) -- and that is only safe to use unmodified at run time because RODATA
+ * NEVER MOVES: code and rodata are two genuinely separate regions (purv.h's
+ * documented four-region layout -- code at [0, code.len), rodata growing down
+ * from RISCV_HALF, see purva.ld and purva.c's mem_xlate), so a rodata pointer's
+ * real ELF address IS its image address, with no transcoder-side correction
+ * ever needed -- unlike an earlier version of this file, which instead
+ * appended rodata right after code and let its image position drift with the
+ * transcoded code's size, patching every baked pointer for the difference
+ * after the fact. That was real complexity for a self-inflicted problem: once
+ * rodata is anchored to its own fixed architectural boundary instead of
+ * "wherever code happens to end", the problem it was solving doesn't exist.
  *
- * This is NOT the same unsafe bake rejected earlier for jalr: that one broke
- * because op-index diverging from pc/4 made jalr's "treat target as op-index*4"
- * resolution wrong for an indirect jump computed via auipc+arith with no memory
- * store in between (the auipc+jr idiom). That idiom is what SPILL2's protection
- * doesn't cover -- and empirically doesn't occur in real linked code (checked:
- * zero occurrences across a real SQLite build; ld.lld's relaxation collapses
- * every in-range far call to a plain jal). A target INSIDE the code window needs
- * neither bake (cursor-based AUIPC stays correct there as long as undrifted).
- *
- * KNOWN REMAINING GAP (found running the real SQLite benchmark, NOT fixed by
- * the above): auipc+addi can ALSO materialize a code address that gets STORED
- * to memory as data (e.g. `pNew->xMethod = someFunction;`, compiled as
- * auipc+addi computing someFunction's real-ELF address into a register, then a
- * plain `sw` -- no relocation, since this is runtime code, not a link-time
- * initializer; --emit-relocs does keep an R_RISCV_PCREL_HI20 for the auipc,
- * unused by this transcoder today). Loaded back later and used as a jalr
- * target, the stored REAL ELF ADDRESS is wrongly interpreted as an op-index*4
- * value, landing on the wrong instruction (observed: jumping into the middle
- * of a function, skipping its prologue, corrupting the caller's stack). Fixing
- * this needs the auipc to bake a MAP-resolved op-index*4 (not a real address),
- * but the auipc's own contribution is only the rounded hi20 part -- the paired
- * addi/load/store's lo12 completes it post-bake, today via plain register
- * arithmetic that assumes real-ELF units. Doing this safely means resolving
- * the PCREL_HI20/LO12 relocation pair together and rewriting both instructions
- * in a coordinated bake, not attempted here. */
+ * A target INSIDE the code window (target < len) is the one case this doesn't
+ * cover: computing a CODE address (the auipc+jr idiom, or auipc+store used to
+ * materialize a function pointer as data) needs the op-index*4 a jalr can
+ * actually use, not a real-ELF byte offset -- and neither AUIPC form produces
+ * that. This is a known, accepted gap (transcode.h's SPILL2 note references the
+ * same idiom for jalr) -- CONFIRMED as the sole remaining one: with SPILL2
+ * disabled (so op-index == pc/4 always, meaning even an unresolved real-ELF
+ * code address happens to equal the op-index*4 it needs), a real SQLite
+ * workload runs to completion byte-identical to purv for its full ~2.2 billion
+ * instructions; with SPILL2 enabled it still hits this gap partway through, via
+ * auipc+addi materializing a function pointer that gets stored to memory (not
+ * jumped to immediately) and later loaded back and called indirectly. */
 
 /* Packed-op field accessors. A/B/C are the three register slots; which register each
  * holds depends on the class (see the layout above), so handlers pick by name.
@@ -165,26 +140,8 @@ typedef struct {
  * (e.g. via jalr through a function pointer) -- code addresses found by relocations
  * the transcoder itself never sees (it reads only code bytes, never an ELF). NULL
  * means "none known"; the caller must supply every such address for fusion to stay
- * sound -- see SPILL2's contract above.
- *
- * `rodata_end`: the byte offset one past the end of the rodata window that
- * immediately follows code in the FINAL image (i.e. len + rodata_len, in the
- * caller's real-ELF coordinate system) -- only tctool.c (which knows the ELF's
- * section layout) can supply this; 0 means "unknown, no rodata window". When
- * known, it narrows step()'s decision to bake RISCV_OP_AUIPC_ABS for an
- * out-of-code auipc target to ONLY targets that are actually IN that window
- * (real rodata pointers, the case tctool.c's fixup_rodata_auipc post-pass
- * corrects). Without it, step() would otherwise have no way to tell a real
- * rodata reference apart from an auipc used as a generic 32-bit-constant
- * idiom whose "target" lands past `len` only by incidental arithmetic, not
- * because it addresses anything -- baking THAT case is harmless in value (the
- * baked value is identical to what the cheap cursor form would have computed)
- * but costs an extra op word and, empirically, broke ACT's I-jal-01 (a
- * heavy auipc-as-arbitrary-constant user) by shifting cursor positions a
- * conformance test's own self-checks depend on. A bare transcode()/NULL ext
- * call has no rodata concept at all, so it always gets 0 here -- exactly the
- * old (pre-rodata-fix) drift-only behavior, unchanged. */
-typedef struct { const uint32_t *addr; uint32_t n; uint32_t rodata_end; } TcExternalTargets;
+ * sound -- see SPILL2's contract above. */
+typedef struct { const uint32_t *addr; uint32_t n; } TcExternalTargets;
 
 /* Transcode RV32IM code [0, len) into *out (allocates out->ops), folding in `ext`
  * (may be NULL) as additional fusion-unsafe addresses. Reads only the code bytes.

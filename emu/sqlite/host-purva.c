@@ -24,7 +24,7 @@
 
 #define RAM_BYTES   (256u * 1024 * 1024)
 #define STACK_BYTES (16u * 1024 * 1024)
-static uint8_t *g_codereg, *g_heap, *g_stack;
+static uint8_t *g_heap, *g_stack;
 #define g_arena    g_heap
 #define ARENA_BASE RISCV_HALF
 
@@ -109,11 +109,21 @@ static uint32_t on_oob(RiscvEmulatorState_t *st, int op, uint32_t addr, uint32_t
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 
+/* Mirrors purva.c's mem_xlate exactly (code is never data-addressable -- see
+ * image.h -- so the lower half only ever resolves into RODATA, based at
+ * RISCV_HALF - its own length; the upper half is HEAP then STACK, unchanged). */
 static uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    const RiscvEmulatorRegion_t *r = &s->region[(a >> 31) << 1];
-    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
-    if (lo < r[0].len)  return r[0].ptr[lo];
-    if (lo >= down && r[1].len) return r[1].ptr[lo - down];
+    if (a < RISCV_HALF) {
+        const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
+        uint32_t down = RISCV_HALF - rodata->len;
+        return (a >= down) ? rodata->ptr[a - down] : 0;
+    }
+    const RiscvEmulatorRegion_t *heap = &s->region[RISCV_HEAP];
+    uint32_t lo = a & (RISCV_HALF - 1);
+    if (lo < heap->len) return heap->ptr[lo];
+    const RiscvEmulatorRegion_t *stack = &s->region[RISCV_STACK];
+    uint32_t down = RISCV_HALF - stack->len;
+    if (lo >= down) return stack->ptr[lo - down];
     return 0;
 }
 
@@ -175,12 +185,13 @@ int main(int argc, char **argv) {
     Image img;
     if (image_read(argv[1], &img) != 0) { fprintf(stderr, "host-purva: cannot read %s\n", argv[1]); return 2; }
 
-    /* region[CODE]: [0,code_size) unused (no data lives in code, see purva's
-     * main.c), rodata right after -- matches every pc-relative reference the
-     * transcoder baked against the real gap. */
-    uint32_t codereg_len = img.code_size + img.rodata_size;
-    g_codereg = calloc(1, codereg_len ? codereg_len : 1);
-    if (img.rodata_size) memcpy(g_codereg + img.code_size, img.rodata, img.rodata_size);
+    /* region[CODE] and region[RODATA] are genuinely separate regions -- purva.c's
+     * mem_xlate never resolves a data access into region[CODE] at all (purva's
+     * "code" is packed op words, not real RISC-V bytes; see image.h). img.code
+     * and img.rodata (from image_read) are used directly as those two regions;
+     * rodata's guest base is RISCV_HALF - img.rodata_size (purv.h's formula for
+     * a region that grows down from a half's top), not derived from code_size,
+     * so a fusion pass shrinking or growing the op array never moves it. */
 
     /* region[HEAP]: rwdata, then bss (the compiled code's global/static variables --
      * their addresses are baked in at the linker's real offset, right after rwdata,
@@ -198,8 +209,8 @@ int main(int argc, char **argv) {
 
     RiscvEmulatorState_t state;
     RiscvEmulatorInit(&state,
-        (RiscvEmulatorRegion_t){ g_codereg, codereg_len },
-        (RiscvEmulatorRegion_t){ 0, 0 },
+        (RiscvEmulatorRegion_t){ img.code, img.code_size },
+        (RiscvEmulatorRegion_t){ img.rodata, img.rodata_size },
         (RiscvEmulatorRegion_t){ g_heap, heap_len },
         (RiscvEmulatorRegion_t){ g_stack, STACK_BYTES });
     RiscvEmulatorState_t *st = &state;

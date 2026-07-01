@@ -15,12 +15,17 @@
  * two separate sections and has no .rodata rule at all (orphan sections land
  * wherever the linker's default placement puts them).
  *
- * Each category's merge preserves its REAL starting address relative to a fixed
- * boundary (code at 0, rodata right after code, rwdata at RISCV_HALF, bss right
- * after rwdata) by zero-padding any alignment gap rather than assuming none. This
- * matters: a pc-relative `la` of a rodata symbol, or an absolute pointer into bss,
- * was encoded by the linker against the REAL address: if our image silently closed
- * a real gap, every such reference would land on the wrong byte.
+ * Each category's merge preserves its REAL starting address by zero-padding any
+ * alignment gap rather than assuming none. This matters: a pc-relative `la` of a
+ * rodata symbol, or an absolute pointer into bss, was encoded by the linker
+ * against the REAL address: if our image silently closed a real gap, every such
+ * reference would land on the wrong byte. code is fixed at 0 and rwdata at
+ * RISCV_HALF (every purva linker script agrees on both); rodata is READ BACK from
+ * wherever the linker actually placed it (purva.ld: growing down from RISCV_HALF,
+ * a genuinely separate region from code, matching purv.h's documented four-region
+ * layout -- see merge_progbits's MERGE_AUTO_BASE) rather than assumed, so the
+ * image never needs to (and never does) move it relative to what auipc-computed
+ * or relocation-held pointers into it were baked against.
  *
  * What it does, in order:
  *   1. gather code/rodata/rwdata/bss by flags (exact sizes, no name heuristics);
@@ -80,12 +85,29 @@ static void sort_spans(Span *s, int n) {
         while (j >= 0 && s[j].addr > v.addr) { s[j + 1] = s[j]; j--; } s[j + 1] = v; }
 }
 
+#define MERGE_AUTO_BASE 0xffffffffu   /* merge_progbits: use the lowest matching section's own
+                                        * real address as base, whatever the linker chose --
+                                        * see its comment on why rodata needs this. */
+
 /* Merge every matching ALLOC PROGBITS section (exec/write flags as given) into one
  * buffer starting at `base`: a real gap between `base` and the lowest matching
  * section (or between sections) is zero-filled, not closed, so every byte keeps its
  * real relative address. Errors if a matching section starts before `base`
- * (overlap/corruption). *len is the merged extent (0 if nothing matched). */
-static uint8_t *merge_progbits(const Ehdr *eh, int want_exec, int want_write, uint32_t base, uint32_t *len) {
+ * (overlap/corruption). *len is the merged extent (0 if nothing matched); *out_base
+ * reports the base actually used (== `base`, unless it was MERGE_AUTO_BASE).
+ *
+ * `base == MERGE_AUTO_BASE` skips the fixed-base assertion and instead uses the
+ * lowest matching section's OWN real address as base (so there is no gap to
+ * fill -- the buffer starts exactly where the linker put the content). This is
+ * for rodata specifically: unlike code (always 0) and rwdata (always
+ * RISCV_HALF, both fixed architectural boundaries every purva linker script
+ * agrees on), rodata's real link-time address depends on the linker script (see
+ * purva.ld: placed to grow down from RISCV_HALF, matching purv.h's documented
+ * four-region layout) -- and whatever it is, that is what auipc-computed
+ * pointers into it were baked against, so the image must preserve it exactly,
+ * not assume a fixed value or shift it to match anything transcode-time. */
+static uint8_t *merge_progbits(const Ehdr *eh, int want_exec, int want_write, uint32_t base,
+                                uint32_t *len, uint32_t *out_base) {
     Span spans[64]; int n = 0;
     for (int i = 0; i < eh->e_shnum && n < 64; i++) {
         const Shdr *sh = shdr(eh, i);
@@ -94,9 +116,11 @@ static uint8_t *merge_progbits(const Ehdr *eh, int want_exec, int want_write, ui
         if (is_exec != want_exec || is_write != want_write) continue;
         spans[n++] = (Span){ sh->sh_addr, sh->sh_size, g_elf + sh->sh_offset };
     }
-    if (n == 0) { *len = 0; return NULL; }
+    if (n == 0) { *len = 0; if (out_base) *out_base = base == MERGE_AUTO_BASE ? 0 : base; return NULL; }
     sort_spans(spans, n);
-    if (spans[0].addr < base) {
+    if (base == MERGE_AUTO_BASE) {
+        base = spans[0].addr;
+    } else if (spans[0].addr < base) {
         fprintf(stderr, "transcode: section at 0x%x overlaps the previous region (base 0x%x)\n", spans[0].addr, base);
         exit(2);
     }
@@ -104,6 +128,7 @@ static uint8_t *merge_progbits(const Ehdr *eh, int want_exec, int want_write, ui
     uint8_t *buf = calloc(1, end - base);
     for (int i = 0; i < n; i++) memcpy(buf + (spans[i].addr - base), spans[i].bytes, spans[i].size);
     *len = end - base;
+    if (out_base) *out_base = base;
     return buf;
 }
 
@@ -149,29 +174,16 @@ static uint32_t *collect_code_address_relocs(const Ehdr *eh, uint32_t code_len, 
     return out;
 }
 
-/* Patch every R_RISCV_32 relocation in section `ri` whose target value is either a
- * CODE address or a RODATA address -- the two ways a data word anywhere (rodata,
- * rwdata, or a vtable slot in either) can store "the address of something" that
- * this image's layout doesn't put at the same byte offset as the original ELF:
- *
- *   - target < code_len: a code address (a function pointer, a vtable slot).
- *     Resolved through the op-index map and overwritten with op_index*4 (fake-pc
- *     units, like jal's link) -- unchanged from before this function grew a
- *     second case.
- *   - code_len <= target < code_len+rodata_len: a RODATA address (e.g. a `static
- *     const char *` initializer pointing at a string literal -- SQLite alone
- *     stores dozens of these in plain data words, not just instructions). The
- *     image places rodata at prog.n_ops*4, not code_len, once anything in the
- *     whole program has fused or expanded (see fixup_rodata_auipc below, which
- *     does the identical correction for values baked into the op array instead
- *     of into a data word) -- so the same `delta` shift applies here.
- *   - target >= code_len+rodata_len: an rwdata/heap pointer. Always left alone:
- *     rwdata sits at the fixed RISCV_HALF boundary in both the ELF and the
- *     image, independent of how the code transcoded, so no shift is needed (and
- *     this function is never even called with such a target in code_len's
- *     bucket -- the caller only reaches it for rodata/rwdata-hosted sections). */
+/* Patch every R_RISCV_32 relocation in section `ri` whose target value lands inside
+ * the code window [0, code_len): overwrite the word at its (absolute address -
+ * buf_base) in `buf` with its resolved op index * 4. A relocation targeting rodata
+ * or rwdata needs no patching at all: both regions keep their real ELF address
+ * unmodified in the image (rwdata is always at the fixed RISCV_HALF boundary;
+ * rodata is wherever the linker put it -- see merge_progbits's MERGE_AUTO_BASE
+ * comment -- and the image preserves that address exactly), so a relocation's raw
+ * linked value is already correct and is left as-is. */
 static void patch_rela(const Ehdr *eh, int ri, uint32_t buf_base, uint8_t *buf, uint32_t buf_len,
-                        const uint32_t *map, uint32_t code_len, uint32_t rodata_len, int64_t delta) {
+                        const uint32_t *map, uint32_t code_len) {
     const Shdr *rsh = shdr(eh, ri);
     const Shdr *symsh = shdr(eh, rsh->sh_link);
     const Sym  *syms = (const Sym *)(g_elf + symsh->sh_offset);
@@ -181,65 +193,30 @@ static void patch_rela(const Ehdr *eh, int ri, uint32_t buf_base, uint8_t *buf, 
         uint32_t type = relas[i].r_info & 0xff, sym_idx = relas[i].r_info >> 8;
         if (type != R_RISCV_32) continue;
         uint32_t target = syms[sym_idx].st_value + relas[i].r_addend;
-        uint32_t new_value;
-        if (target < code_len) {
-            uint32_t op_index = map[target >> 1];
-            if (op_index == TC_SENTINEL) continue;          /* not an instruction start */
-            new_value = op_index * 4;                        /* fake-pc units, like jal's link */
-        } else if (target < code_len + rodata_len) {
-            new_value = (uint32_t)((int64_t)target - delta); /* real ELF offset -> image offset */
-        } else {
-            continue;                                        /* rwdata/heap: no shift needed */
-        }
+        if (target >= code_len) continue;                  /* not a code address */
+        uint32_t op_index = map[target >> 1];
+        if (op_index == TC_SENTINEL) continue;              /* not an instruction start */
         if (relas[i].r_offset < buf_base || relas[i].r_offset - buf_base + 4 > buf_len) continue;
         uint32_t at = relas[i].r_offset - buf_base;
+        uint32_t new_value = op_index * 4;                  /* fake-pc units, like jal's link */
         buf[at] = (uint8_t)new_value; buf[at + 1] = (uint8_t)(new_value >> 8);
         buf[at + 2] = (uint8_t)(new_value >> 16); buf[at + 3] = (uint8_t)(new_value >> 24);
     }
 }
 
-/* Patch code- and rodata-pointer relocations in every .rela.X section whose
- * target X is the rodata or rwdata buffer (matched by address range, not by
- * name). */
+/* Patch code-pointer relocations in every .rela.X section whose target X is the
+ * rodata or rwdata buffer (matched by address range, not by name). */
 static void patch_all_relas(const Ehdr *eh, uint32_t rodata_base, uint8_t *rodata, uint32_t rodata_len,
                              uint32_t rwdata_base, uint8_t *rwdata, uint32_t rwdata_len,
-                             const uint32_t *map, uint32_t code_len, int64_t delta) {
+                             const uint32_t *map, uint32_t code_len) {
     for (int i = 0; i < eh->e_shnum; i++) {
         const Shdr *sh = shdr(eh, i);
         if (sh->sh_type != SHT_RELA) continue;
         const Shdr *target = shdr(eh, sh->sh_info);     /* section this .rela.X applies to */
         if (rodata_len && target->sh_addr >= rodata_base && target->sh_addr < rodata_base + rodata_len)
-            patch_rela(eh, i, rodata_base, rodata, rodata_len, map, code_len, rodata_len, delta);
+            patch_rela(eh, i, rodata_base, rodata, rodata_len, map, code_len);
         else if (rwdata_len && target->sh_addr >= rwdata_base && target->sh_addr < rwdata_base + rwdata_len)
-            patch_rela(eh, i, rwdata_base, rwdata, rwdata_len, map, code_len, rodata_len, delta);
-    }
-}
-
-/* Correct every baked RISCV_OP_AUIPC_ABS target that points into rodata: step()
- * (transcode.c) bakes such a target unconditionally, in REAL-ELF coordinates,
- * because it can't yet know the whole-program delta between the original code's
- * byte length (`code_len`) and the transcoded code's (`prog.n_ops*4`) -- that
- * delta only exists once the whole pass is done. Now that it's done (the caller
- * computes it once and shares it with patch_rela's identical correction for
- * relocation-held rodata pointers), shift every baked target that lands in
- * [code_len, code_len+rodata_len) -- a rodata pointer -- by that delta,
- * converting it from "byte offset in the original ELF" to "byte offset in this
- * image" (where rodata starts at prog.n_ops*4, not code_len). A target >=
- * code_len+rodata_len is an rwdata/heap pointer instead: those need no
- * correction, since rwdata is always placed at the fixed RISCV_HALF boundary in
- * both the ELF and the image, independent of how code transcoded. */
-static void fixup_rodata_auipc(uint32_t *ops, uint32_t n_ops, uint32_t code_len,
-                                uint32_t rodata_len, int64_t delta) {
-    if (delta == 0) return;
-    for (uint32_t i = 0; i < n_ops; ) {
-        if (TC_OP(ops[i]) == RISCV_OP_AUIPC_ABS) {
-            uint32_t target = ops[i + 1];
-            if (target >= code_len && target < code_len + rodata_len)
-                ops[i + 1] = (uint32_t)((int64_t)target - delta);
-            i += 2;
-        } else {
-            i += 1;
-        }
+            patch_rela(eh, i, rwdata_base, rwdata, rwdata_len, map, code_len);
     }
 }
 
@@ -263,16 +240,35 @@ int main(int argc, char **argv) {
 
     /* Each category's real base relative to a fixed boundary; a gap before it (e.g.
      * alignment padding between .text and .rodata) is zero-filled, not closed, so
-     * every pc-relative / absolute reference baked by the linker still lands right. */
+     * every pc-relative / absolute reference baked by the linker still lands right.
+     * code (base 0) and rwdata (base RISCV_HALF) are fixed architectural boundaries
+     * every purva linker script agrees on. rodata's is too -- RISCV_HALF minus its
+     * own length, purv.h's documented formula for a region that grows down from a
+     * half's top (purva.ld places .rodata there for exactly this reason: a
+     * genuinely separate region from code, not a fixed distance from it, so the
+     * engine can compute its base the same way at run time with no extra state --
+     * see purva.c's mem_xlate). That base isn't known until rodata_len is (its
+     * length is exactly what merge_progbits computes), so MERGE_AUTO_BASE reads
+     * the real address back from the ELF instead of assuming it, then this
+     * asserts the linker actually produced purv.h's layout rather than silently
+     * trusting an arbitrary address (which mem_xlate's fixed formula would then
+     * get wrong at run time). */
     uint32_t code_len;
-    uint8_t *code_bytes = merge_progbits(eh, 1, 0, 0, &code_len);          /* exec, base 0 */
+    uint8_t *code_bytes = merge_progbits(eh, 1, 0, 0, &code_len, NULL);          /* exec, base 0 */
     if (!code_bytes) { fprintf(stderr, "transcode: no executable section\n"); return 2; }
 
-    uint32_t rodata_len;
-    uint8_t *rodata_bytes = merge_progbits(eh, 0, 0, code_len, &rodata_len);   /* base = right after code */
+    uint32_t rodata_len, rodata_base;
+    uint8_t *rodata_bytes = merge_progbits(eh, 0, 0, MERGE_AUTO_BASE, &rodata_len, &rodata_base);
+    if (rodata_len && rodata_base != RISCV_HALF - rodata_len) {
+        fprintf(stderr, "transcode: rodata at 0x%x, expected 0x%x (RISCV_HALF - rodata_len) --\n"
+                "  the linker script must place rodata to grow down from RISCV_HALF,\n"
+                "  like purva.ld; the engine derives its base from length alone.\n",
+                rodata_base, RISCV_HALF - rodata_len);
+        return 2;
+    }
 
     uint32_t rwdata_len;
-    uint8_t *rwdata_bytes = merge_progbits(eh, 0, 1, RISCV_HALF, &rwdata_len); /* base = RISCV_HALF */
+    uint8_t *rwdata_bytes = merge_progbits(eh, 0, 1, RISCV_HALF, &rwdata_len, NULL); /* base = RISCV_HALF */
 
     uint32_t bss_len = nobits_top(eh, RISCV_HALF + rwdata_len) - (RISCV_HALF + rwdata_len);
 
@@ -281,7 +277,7 @@ int main(int argc, char **argv) {
      * no way to know these (it never reads the ELF), only this tool does. */
     uint32_t n_ext;
     uint32_t *ext_addrs = collect_code_address_relocs(eh, code_len, &n_ext);
-    TcExternalTargets ext = { ext_addrs, n_ext, code_len + rodata_len };
+    TcExternalTargets ext = { ext_addrs, n_ext };
 
     /* 1. transcode code -- the only decoding in this pipeline. */
     Transcoded prog;
@@ -311,18 +307,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* The whole-program byte-length delta fusion/expansion introduced -- shared by
-     * patch_rela (relocation-held rodata pointers) and fixup_rodata_auipc (baked
-     * auipc rodata pointers); both correct the same real-ELF-vs-image mismatch. */
-    int64_t delta = (int64_t)code_len - (int64_t)(prog.n_ops * 4);
-
-    /* 2. patch every code- and rodata-pointer relocation found anywhere into
-     * rodata/rwdata. */
-    patch_all_relas(eh, code_len, rodata_bytes, rodata_len,
-                     RISCV_HALF, rwdata_bytes, rwdata_len, map, code_len, delta);
-
-    /* 3. correct every baked rodata-pointing auipc for the same delta. */
-    fixup_rodata_auipc(prog.ops, prog.n_ops, code_len, rodata_len, delta);
+    /* 2. patch every code-pointer relocation found anywhere into rodata/rwdata.
+     * Nothing else needs correcting: rodata and rwdata both keep their real ELF
+     * address unmodified in the image (see merge_progbits), so no relocation or
+     * baked auipc value pointing at either one is ever wrong to begin with. */
+    patch_all_relas(eh, rodata_base, rodata_bytes, rodata_len,
+                     RISCV_HALF, rwdata_bytes, rwdata_len, map, code_len);
 
     Image img = {0};
     img.code_size   = prog.n_ops * 4;

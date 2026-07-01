@@ -46,14 +46,35 @@ static inline __attribute__((always_inline)) void st32(uint8_t *q, uint32_t v) {
     q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24);
 }
 
+/* Instructions fetch ONLY from region[RISCV_CODE] (via g_prog/the op cursor below,
+ * never through here). A data access -- load OR store -- must NEVER reach it:
+ * purva's "code" is packed op words, not real RISC-V bytes (unlike purv, whose
+ * code stays real bytes forever, so reading it as data is meaningless but
+ * harmless there); there is nothing sane to read, and self-modifying code isn't
+ * a thing this engine supports. So the lower half only ever resolves into
+ * region[RISCV_RODATA] -- read-only, based at RISCV_HALF - its own length,
+ * EXACTLY purv.h's documented formula for a region that grows down from a
+ * half's top, unchanged from the original. No extra state or setter needed:
+ * purva.ld places rodata to grow down from RISCV_HALF for exactly this reason
+ * (a genuinely separate region from code, anchored the same way the engine
+ * already computes it, not derived from region[RISCV_CODE].len or anything
+ * about how code transcoded). The upper half is unchanged from purv.h's
+ * documented model: region[RISCV_HEAP] grows up from RISCV_HALF,
+ * region[RISCV_STACK] grows down from 2^32. */
 static inline __attribute__((always_inline))
 uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
-    if (write && addr < RISCV_HALF) return (uint8_t *)0;
-    const RiscvEmulatorRegion_t *r = &s->region[(addr >> 31) << 1];
+    if (addr < RISCV_HALF) {
+        if (write) return (uint8_t *)0;
+        const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
+        uint32_t down = RISCV_HALF - rodata->len;
+        return (addr >= down && addr + n <= RISCV_HALF) ? rodata->ptr + (addr - down) : (uint8_t *)0;
+    }
+    const RiscvEmulatorRegion_t *heap = &s->region[RISCV_HEAP];
     uint32_t lo = addr & (RISCV_HALF - 1);
-    if (lo + n <= r[0].len) return r[0].ptr + lo;
-    uint32_t down = RISCV_HALF - r[1].len;
-    if (lo >= down && lo + n <= RISCV_HALF) return r[1].ptr + (lo - down);
+    if (lo + n <= heap->len) return heap->ptr + lo;
+    const RiscvEmulatorRegion_t *stack = &s->region[RISCV_STACK];
+    uint32_t down = RISCV_HALF - stack->len;
+    if (lo >= down && lo + n <= RISCV_HALF) return stack->ptr + (lo - down);
     return (uint8_t *)0;
 }
 

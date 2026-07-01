@@ -190,16 +190,15 @@ int main(int argc, char **argv) {
         g_have_symbols = 1;
     }
 
-    /* region[CODE] backs lower-half DATA access (rodata reads); fetch never goes
-     * through it -- the evaluator runs straight off img.code via SetProgram. The
-     * [0, code_size) portion is left zero: RISC-V never embeds data inline in code
-     * (no literal pools), so nothing should ever read there; rodata is placed
-     * right after, at guest address code_size, matching what every pc-relative
-     * reference to it was baked against (transcode.c's tctool preserves the real
-     * gap, so this holds even with alignment padding). */
-    uint32_t codereg_len = img.code_size + img.rodata_size;
-    uint8_t *codereg = calloc(1, codereg_len ? codereg_len : 1);
-    if (img.rodata_size) memcpy(codereg + img.code_size, img.rodata, img.rodata_size);
+    /* region[CODE] and region[RODATA] are genuinely separate regions -- purva.c's
+     * mem_xlate never resolves a data access into region[CODE] at all (purva's
+     * "code" is packed op words, not real RISC-V bytes; there is nothing sane
+     * for a data load to read there); img.code (already exactly code_size bytes,
+     * from image_read) IS region[CODE], no copy needed. img.rodata is placed at
+     * RISCV_HALF - img.rodata_size, purv.h's formula for a region that grows
+     * down from a half's top (mem_xlate derives it the same way, no separate
+     * base needed) -- not derived from code_size, so a fusion pass shrinking or
+     * growing the op array never moves it. */
 
     /* region[HEAP]: rwdata, then bss (the compiled code's global/static variables --
      * their addresses are baked in at the linker's real offset, right after rwdata,
@@ -216,8 +215,8 @@ int main(int argc, char **argv) {
 
     RiscvEmulatorState_t state;
     RiscvEmulatorInit(&state,
-        (RiscvEmulatorRegion_t){ codereg, codereg_len },
-        (RiscvEmulatorRegion_t){ 0, 0 },
+        (RiscvEmulatorRegion_t){ img.code, img.code_size },
+        (RiscvEmulatorRegion_t){ img.rodata, img.rodata_size },
         (RiscvEmulatorRegion_t){ g_heap, g_heap_region_len },
         (RiscvEmulatorRegion_t){ g_stack, g_stack_size });
     RiscvEmulatorState_t *st = &state;

@@ -7,11 +7,23 @@
  *
  * Layout (five little-endian uint32 header fields, then three byte blobs):
  *   code_size      bytes of code (the packed op array; code_size/4 == op count)
- *   rodata_size    bytes of read-only data, placed right after code
+ *   rodata_size    bytes of read-only data
  *   rwdata_size    bytes of initial writable data (the .data contents)
  *   bss_size       zero bytes after rwdata -- bss plus a minimum initial heap
  *   stack_size     a minimum initial stack size
  *   code[code_size] | rodata[rodata_size] | rwdata[rwdata_size]
+ *
+ * That's the FILE layout; it is NOT the guest ADDRESS layout. code and rodata are
+ * two separate regions in guest address space (purv.h's region[RISCV_CODE] and
+ * region[RISCV_RODATA]): code at [0, code_size), rodata at
+ * [RISCV_HALF - rodata_size, RISCV_HALF) -- rodata's base is never stored, only
+ * derived from rodata_size, exactly as purv.h documents for a region that grows
+ * down from a half's top (see purva.c's mem_xlate and purva.ld, which places
+ * .rodata there for exactly this reason). purva's "code" is transcoded, packed
+ * op words, not real RISC-V bytes, so it is fetch-only -- never data-addressable
+ * at all, unlike purv's, which stays real bytes forever and can safely host
+ * rodata inline; this is why the image needs rodata to be a genuinely separate
+ * region rather than appended after code the way purv's driver does it.
  *
  * bss_size and stack_size are MINIMUMS: the host may map a larger heap/stack than
  * the image asks for (e.g. via --ram=), but never smaller. */
