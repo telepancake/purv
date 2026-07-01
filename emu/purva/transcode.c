@@ -146,7 +146,6 @@ static Targets collect_targets(const uint8_t *code, uint32_t len, const TcExtern
 /* Callee-saved integer registers (RV32 ilp32): ra, s0, s1, s2..s11. Their canonical
  * save/restore rank (highest frame slot first) is ra, s0, s1, s2..s11 -- rank_of
  * returns that 0..12 index, or -1 for any non-callee-saved register. */
-static int is_callee_reg(uint32_t r) { return r == 1 || r == 8 || r == 9 || (r >= 18 && r <= 27); }
 static int rank_of(uint32_t r) {
     if (r == 1) return 0;
     if (r == 8) return 1;
@@ -155,36 +154,87 @@ static int rank_of(uint32_t r) {
     return -1;
 }
 
-/* Try to fuse the store-pair at `off` into one SPILL2 record (transcode.h has the
- * full safety argument). Two adjacent `sw` to the same base at offsets exactly 4
- * apart, where the second instruction is not in `targets` and the lower offset
- * fits the op word's signed 11-bit field. On success fills *out (op=SPILL2,
- * rs1=base, rd=low-address value, rs2=high-address value, imm=low offset) and
- * returns 8 (bytes consumed); on failure returns 0 and *out is untouched. */
-static uint32_t try_fuse_spill2(const uint8_t *code, uint32_t len, uint32_t off,
-                                 const Targets *targets, Dec *out) {
-    if (off + 8 > len) return 0;
-    Dec d1, d2;
-    decode(code, off, &d1);
-    if (d1.op != RISCV_OP_SW) return 0;
-    decode(code, off + 4, &d2);
-    if (d2.op != RISCV_OP_SW || d2.rs1 != d1.rs1) return 0;
-    /* Step aside for a callee-saved store to sp: that is a prologue save, and
-     * fuse_frames collapses the whole prologue into ONE op. If SPILL2 grabbed the
-     * pair (or straddled the prologue/body boundary) first, the frame op could not
-     * consume a clean uniform run of individual sw's -- so SPILL2 leaves any sp-store
-     * pair touching a callee-saved register alone. */
-    if (d1.rs1 == 2 && (is_callee_reg(d1.rs2) || is_callee_reg(d2.rs2))) return 0;
-    if (targets_has(targets, off + 4)) return 0;            /* provably never a target -- required */
-    int32_t off1 = (int32_t)d1.imm, off2 = (int32_t)d2.imm;
-    if (off2 - off1 != 4 && off1 - off2 != 4) return 0;
-    int32_t lo_off = off1 < off2 ? off1 : off2;
-    uint8_t lo_val = (uint8_t)(off1 < off2 ? d1.rs2 : d2.rs2);
-    uint8_t hi_val = (uint8_t)(off1 < off2 ? d2.rs2 : d1.rs2);
-    if (lo_off < -1024 || lo_off > 1023) return 0;           /* must fit the 11-bit field */
-    out->op = RISCV_OP_SPILL2;
-    out->rs1 = d1.rs1; out->rd = lo_val; out->rs2 = hi_val; out->imm = (uint32_t)lo_off;
-    return 8;
+/* A prologue/epilogue's saved set is canonical iff its offsets are exactly
+ * {N-4, N-8, .., N-4-4(cnt-1)} and, as the offset descends, the register rank
+ * strictly increases (ra above s0 above s1 ..). Fills *rmask on success. This is
+ * what lets the op word store only (frame, mask): each register's slot is derived
+ * from its position among the set bits. See transcode.h. */
+static int frame_canonical(const uint32_t *regs, const int32_t *offs, uint32_t cnt,
+                           uint32_t N, uint32_t *rmask) {
+    int prev = -1; uint32_t m = 0;
+    for (uint32_t p = 0; p < cnt; p++) {
+        int32_t want = (int32_t)N - 4 - 4 * (int32_t)p;
+        int found = -1;
+        for (uint32_t c = 0; c < cnt; c++) if (offs[c] == want) { found = (int)c; break; }
+        if (found < 0) return 0;
+        int rk = rank_of(regs[found]);
+        if (rk <= prev) return 0;                 /* strictly increasing rank as offset drops */
+        prev = rk; m |= 1u << rk;
+    }
+    *rmask = m;
+    return 1;
+}
+
+static uint32_t frame_enc(uint32_t rmask, uint32_t N) { return (rmask << 13) | (N & 0x1fffu); }
+
+/* Fusion always replays the exact instruction effects, so a match is never wrong on
+ * semantics -- the constraints are only what the compact (frame,mask) encoding needs:
+ * a canonical top-of-frame layout, a frame that fits, and no jump landing in the
+ * middle of the run being collapsed (its head slot, where returns/entries converge,
+ * is kept and still maps to the fused op). */
+
+/* Prologue at `off`: `addi sp,sp,-N` then a contiguous canonical run of callee-saved
+ * `sw`s, none of them a jump target. On success fills *out (op=PROLOGUE) and returns
+ * the byte width consumed (the addi plus every save, all collapsed to ONE op word);
+ * else 0. */
+static uint32_t try_fuse_prologue(const uint8_t *code, uint32_t len, uint32_t off,
+                                  const Targets *targets, Dec *out) {
+    Dec a;
+    decode(code, off, &a);
+    if (a.op != RISCV_OP_ADDI || a.rd != 2 || a.rs1 != 2 || (int32_t)a.imm >= 0) return 0;
+    uint32_t N = (uint32_t)(-(int32_t)a.imm);
+    if (N == 0 || N > 0x1fff) return 0;
+    uint32_t regs[13]; int32_t offs[13]; uint32_t cnt = 0, o = off + 4;
+    while (o + 4 <= len && cnt < 13) {
+        if (targets_has(targets, o)) break;               /* a save that is a target keeps its slot */
+        Dec s;
+        decode(code, o, &s);
+        if (s.op != RISCV_OP_SW || s.rs1 != 2 || rank_of(s.rs2) < 0) break;
+        regs[cnt] = s.rs2; offs[cnt] = (int32_t)s.imm; cnt++; o += 4;
+    }
+    uint32_t rmask;
+    if (cnt == 0 || !frame_canonical(regs, offs, cnt, N, &rmask)) return 0;
+    out->op = RISCV_OP_PROLOGUE; out->imm = frame_enc(rmask, N);
+    return 4 * (1 + cnt);
+}
+
+/* Epilogue at `off`: a contiguous canonical run of callee-saved `lw`s, then
+ * `addi sp,sp,+N`, then `jalr zero,0(ra)`, with the dealloc and ret (and any interior
+ * load) not jump targets. On success fills *out (op=EPILOGUE) and returns the byte
+ * width consumed (loads + dealloc + ret, collapsed to ONE op word); else 0. */
+static uint32_t try_fuse_epilogue(const uint8_t *code, uint32_t len, uint32_t off,
+                                  const Targets *targets, Dec *out) {
+    uint32_t regs[13]; int32_t offs[13]; uint32_t cnt = 0, o = off;
+    while (o + 4 <= len && cnt < 13) {
+        if (o != off && targets_has(targets, o)) break;   /* interior load target keeps its slot */
+        Dec l;
+        decode(code, o, &l);
+        if (l.op != RISCV_OP_LW || l.rs1 != 2 || rank_of(l.rd) < 0) break;
+        regs[cnt] = l.rd; offs[cnt] = (int32_t)l.imm; cnt++; o += 4;
+    }
+    if (cnt == 0 || o + 8 > len) return 0;
+    if (targets_has(targets, o) || targets_has(targets, o + 4)) return 0;   /* dealloc/ret not targets */
+    Dec ad, rt;
+    decode(code, o, &ad);
+    if (ad.op != RISCV_OP_ADDI || ad.rd != 2 || ad.rs1 != 2 || (int32_t)ad.imm <= 0) return 0;
+    uint32_t N = ad.imm;
+    if (N > 0x1fff) return 0;
+    decode(code, o + 4, &rt);
+    if (rt.op != RISCV_OP_JALR || rt.rd != 0 || rt.rs1 != 1 || (int32_t)rt.imm != 0) return 0;
+    uint32_t rmask;
+    if (!frame_canonical(regs, offs, cnt, N, &rmask)) return 0;
+    out->op = RISCV_OP_EPILOGUE; out->imm = frame_enc(rmask, N);
+    return (o + 8) - off;
 }
 
 /* Decode (or fuse) the unit starting at `off`; returns the byte width consumed and
@@ -195,17 +245,19 @@ static uint32_t try_fuse_spill2(const uint8_t *code, uint32_t len, uint32_t off,
  * still equals off/4, no fusion has happened anywhere earlier in the stream, so
  * op-index == pc/4 holds and an auipc here is exactly as safe as it always was
  * (decode() already produced the ordinary 1-word RISCV_OP_AUIPC). Once at has
- * fallen behind off/4 (some earlier SPILL2 fired), that identity is gone for
- * everything downstream, including this auipc -- so its cursor-based runtime value
- * would be wrong, and step() upgrades it to RISCV_OP_AUIPC_ABS, baking the real
- * absolute value (off + uimm20<<12, using the TRUE pc this function already has,
- * not the drifted cursor the evaluator would have at run time) into a second word
- * (transcode.h has the full argument for why this is safe: rodata is a
- * separate region at its own fixed real address regardless of how code
- * transcoded, so the baked real address needs no further correction). */
+ * fallen behind off/4 (an earlier prologue/epilogue collapsed several instructions
+ * into one op word), that identity is gone for everything downstream, including this
+ * auipc -- so its cursor-based runtime value would be wrong, and step() upgrades it
+ * to RISCV_OP_AUIPC_ABS, baking the real absolute value (off + uimm20<<12, using the
+ * TRUE pc this function already has, not the drifted cursor the evaluator would have
+ * at run time) into a second word (transcode.h has the full argument for why this is
+ * safe: rodata is a separate region at its own fixed real address regardless of how
+ * code transcoded, so the baked real address needs no further correction). */
 static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off, uint32_t at,
                       const Targets *targets, Dec *d) {
-    uint32_t fused = try_fuse_spill2(code, len, off, targets, d);
+    uint32_t fused = try_fuse_prologue(code, len, off, targets, d);
+    if (fused) return fused;
+    fused = try_fuse_epilogue(code, len, off, targets, d);
     if (fused) return fused;
     decode(code, off, d);
     if (d->op == RISCV_OP_AUIPC && at != off / 4) {
@@ -238,8 +290,8 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffff);  /* load          */
     else if (op >= RISCV_OP_SB && op <= RISCV_OP_SW)
         ops[at++] = w0 | rs2 << 21 | rs1 << 16 | (d->imm & 0xffff); /* store         */
-    else if (op == RISCV_OP_SPILL2)                                 /* base | v1 | v2 | off11 */
-        ops[at++] = w0 | rs1 << 21 | rd << 16 | rs2 << 11 | (d->imm & 0x7ffu);
+    else if (op == RISCV_OP_PROLOGUE || op == RISCV_OP_EPILOGUE)    /* regmask<<13 | frame */
+        ops[at++] = w0 | (d->imm & 0x3ffffffu);
     else if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
         int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;
         ops[at++] = w0 | rs1 << 21 | rs2 << 16 | ((uint32_t)(delta * 4) & 0xffff);
@@ -290,106 +342,6 @@ uint32_t *transcode_map(const uint8_t *code, uint32_t len, uint32_t *n_ops_out) 
     return transcode_map_ex(code, len, NULL, n_ops_out);
 }
 
-/* ---- post-pass: fuse prologues and epilogues (see transcode.h) ----
- *
- * Runs on the EMITTED op array. A prologue is `addi sp,sp,-N` followed by a
- * contiguous run of callee-saved `sw`s at the top of the frame (SPILL2 has stepped
- * aside, so they are individual and uniform); it becomes a PROLOGUE op in the
- * frame-alloc slot, the store slots left dead (the op steps the cursor past them).
- * An epilogue is a contiguous run of callee-saved `lw`s, then `addi sp,sp,+N`, then
- * `jalr zero,0(ra)`; the first load slot becomes an EPILOGUE op that loads, deallocs
- * and returns, the trailing slots left dead. Neither removes a slot, so
- * op-index == pc/4 is preserved. Fusion is refused if any branch/jal target lands in
- * the interior that would be skipped (the head slot -- where returns converge -- is
- * always kept). */
-
-/* The set of (reg,off) saves/restores is canonical iff its offsets are exactly
- * {N-4, N-8, .., N-4-4(cnt-1)} and, as the offset descends, the register rank
- * strictly increases (ra above s0 above s1 ..). Builds *rmask on success. */
-static int frame_canonical(const uint32_t *regs, const int32_t *offs, uint32_t cnt,
-                           uint32_t N, uint32_t *rmask) {
-    int prev = -1; uint32_t m = 0;
-    for (uint32_t p = 0; p < cnt; p++) {
-        int32_t want = (int32_t)N - 4 - 4 * (int32_t)p;
-        int found = -1;
-        for (uint32_t c = 0; c < cnt; c++) if (offs[c] == want) { found = (int)c; break; }
-        if (found < 0) return 0;
-        int rk = rank_of(regs[found]);
-        if (rk <= prev) return 0;                 /* strictly increasing rank as offset drops */
-        prev = rk; m |= 1u << rk;
-    }
-    *rmask = m;
-    return 1;
-}
-
-static void fuse_frames(uint32_t *ops, uint32_t n) {
-    uint8_t *is_target = calloc((size_t)n, 1);
-    if (!is_target) return;
-    for (uint32_t i = 0; i < n; ) {
-        uint8_t op = TC_OP(ops[i]);
-        if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
-            int32_t t = (int32_t)i + (TC_IMM(ops[i]) >> 2);
-            if (t >= 0 && (uint32_t)t < n) is_target[t] = 1;
-        } else if (op == RISCV_OP_JAL) {
-            int32_t t = (int32_t)i + (TC_JOFF(ops[i]) >> 2);
-            if (t >= 0 && (uint32_t)t < n) is_target[t] = 1;
-        }
-        i += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
-    }
-
-    /* prologues */
-    for (uint32_t i = 0; i < n; ) {
-        uint8_t op = TC_OP(ops[i]);
-        if (op == RISCV_OP_ADDI && TC_A(ops[i]) == 2 && TC_B(ops[i]) == 2 && TC_IMM(ops[i]) < 0) {
-            uint32_t N = (uint32_t)(-TC_IMM(ops[i]));
-            uint32_t regs[13]; int32_t offs[13]; uint32_t cnt = 0, j = i + 1;
-            while (j < n && cnt < 13) {
-                uint32_t w = ops[j];
-                if (TC_OP(w) == RISCV_OP_SW && TC_B(w) == 2 && rank_of(TC_A(w)) >= 0) {
-                    regs[cnt] = TC_A(w); offs[cnt] = TC_IMM(w); cnt++; j++;
-                } else break;
-            }
-            uint32_t rmask;
-            if (cnt > 0 && N <= 0x1fff && frame_canonical(regs, offs, cnt, N, &rmask)) {
-                int interior = 0;
-                for (uint32_t t = i + 1; t < j; t++) if (is_target[t]) { interior = 1; break; }
-                if (!interior) {
-                    ops[i] = ((uint32_t)RISCV_OP_PROLOGUE << 26) | (rmask << 13) | (N & 0x1fff);
-                    i = j; continue;
-                }
-            }
-        }
-        i += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
-    }
-
-    /* epilogues (anchored at the ret) */
-    for (uint32_t k = 0; k < n; ) {
-        uint8_t op = TC_OP(ops[k]);
-        if (op == RISCV_OP_JALR && TC_A(ops[k]) == 0 && TC_B(ops[k]) == 1 && TC_IMM(ops[k]) == 0
-            && k >= 1 && TC_OP(ops[k-1]) == RISCV_OP_ADDI && TC_A(ops[k-1]) == 2
-            && TC_B(ops[k-1]) == 2 && TC_IMM(ops[k-1]) > 0) {
-            uint32_t N = (uint32_t)TC_IMM(ops[k-1]);
-            uint32_t regs[13]; int32_t offs[13]; uint32_t cnt = 0; int32_t f = (int32_t)k - 2;
-            while (f >= 0 && cnt < 13) {
-                uint32_t w = ops[f];
-                if (TC_OP(w) == RISCV_OP_LW && TC_B(w) == 2 && rank_of(TC_A(w)) >= 0) {
-                    regs[cnt] = TC_A(w); offs[cnt] = TC_IMM(w); cnt++; f--;
-                } else break;
-            }
-            uint32_t rmask;
-            if (cnt > 0 && N <= 0x1fff && frame_canonical(regs, offs, cnt, N, &rmask)) {
-                uint32_t start = (uint32_t)(f + 1);
-                int interior = 0;
-                for (uint32_t t = start + 1; t <= k; t++) if (is_target[t]) { interior = 1; break; }
-                if (!interior)
-                    ops[start] = ((uint32_t)RISCV_OP_EPILOGUE << 26) | (rmask << 13) | (N & 0x1fff);
-            }
-        }
-        k += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
-    }
-    free(is_target);
-}
-
 void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ext, Transcoded *out) {
     Targets targets = collect_targets(code, len, ext);
     uint32_t n_ops;
@@ -411,7 +363,6 @@ void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ex
     }
     free(map);
     targets_free(&targets);
-    fuse_frames(out->ops, out->n_ops);
 }
 
 void transcode(const uint8_t *code, uint32_t len, Transcoded *out) {

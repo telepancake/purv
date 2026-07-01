@@ -166,7 +166,6 @@ static int on_ecall(RiscvEmulatorState_t *st) {
 
 /* ------------------------------------------------------------------- main */
 
-extern int g_s2trace;   /* TEMP debug */
 extern int g_itrace;    /* TEMP debug */
 extern uint32_t g_watch; /* TEMP debug */
 
@@ -174,7 +173,6 @@ int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <guest.img> [--max-insns=N] [--stats]\n", argv[0]); return 2; }
     uint64_t max_insns = 20000ull * 1000 * 1000;
     int stats = 0;
-    g_s2trace = getenv("S2TRACE") != NULL;
     g_itrace = getenv("ITRACE") != NULL;
     if (getenv("WATCH")) g_watch = (uint32_t)strtoul(getenv("WATCH"), 0, 0);
     for (int i = 2; i < argc; i++) {

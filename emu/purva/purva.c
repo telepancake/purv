@@ -19,8 +19,6 @@
 
 #include "purva.h"   /* purv.h + transcode.h (the op vocabulary and field macros) */
 
-unsigned long g_s2count;   /* TEMP debug */
-int g_s2trace;             /* TEMP debug */
 int g_itrace;              /* TEMP debug: per-instruction register trace */
 unsigned long g_icount;    /* TEMP debug: running instruction counter for trace labels */
 uint32_t g_watch;          /* TEMP debug: store-address watchpoint, 0 = off */
@@ -35,13 +33,8 @@ static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
 static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i] = v; }
 
 /* A single 4-byte store, written the same way h_sw's does (GCC reliably folds this
- * exact shape into one unaligned mov). SPILL2's fast path needs TWO of these back
- * to back; writing both as one flat 8-byte byte-store block instead made GCC try to
- * fuse them into a single 64-bit store, and since the two halves come from
- * DIFFERENT source registers (v1, v2, not one combined value), it could only do
- * that by manually reconstructing the 64-bit pattern via ~15 shift/or/movzbl
- * instructions before the store -- measured ~30 Ir per call versus ~4 for two calls
- * to this. Calling it twice keeps each store the simple, already-efficient shape. */
+ * exact shape into one unaligned mov). The fused prologue handler calls it once per
+ * saved register into the contiguous save block. */
 static inline __attribute__((always_inline)) void st32(uint8_t *q, uint32_t v) {
     q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24);
 }
@@ -117,7 +110,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_JAL] = &&h_jal, [RISCV_OP_JALR] = &&h_jalr,
         [RISCV_OP_LUI] = &&h_lui, [RISCV_OP_AUIPC] = &&h_auipc, [RISCV_OP_NOP] = &&h_nop,
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
-        [RISCV_OP_SPILL2] = &&h_spill2, [RISCV_OP_AUIPC_ABS] = &&h_auipc_abs,
+        [RISCV_OP_AUIPC_ABS] = &&h_auipc_abs,
         [RISCV_OP_PROLOGUE] = &&h_prologue, [RISCV_OP_EPILOGUE] = &&h_epilogue,
     };
     uint32_t *p = base + (pc >> 2);
@@ -205,32 +198,6 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
           NEXT();
 
-    /* SPILL2 (fused store-pair, transcode.h): val1 at base+off, val2 at base+off+4 --
-     * two independent stores (no register write, no hazard between them), so the
-     * only thing to get right is matching the unfused pair's behaviour exactly,
-     * including a miss on EITHER word going through the callback the same way a
-     * real sw would. Deliberately NOT a single combined 8-byte mem_xlate: q and q+4
-     * are then provably-adjacent pointers, and GCC's store-merge pass tries to fuse
-     * the two 4-byte writes into one 64-bit store -- since the two halves come from
-     * DIFFERENT source registers (v1, v2), the only way to do that is manually
-     * reconstructing the 64-bit pattern via ~15 shift/or/movzbl instructions before
-     * the store (measured ~30 Ir per call versus ~4 for the form below, used twice
-     * -- the conditional callback branch between the two stores keeps the merge
-     * pass from treating them as one mergeable group). */
-    h_spill2: {
-        uint32_t base = s->x[TC_A(w)], v1 = s->x[TC_B(w)], v2 = s->x[TC_C(w)];
-        uint32_t ad = base + (uint32_t)TC_OFF11(w);
-        extern unsigned long g_s2count; extern int g_s2trace;
-        g_s2count++;
-        if (g_s2trace) fprintf(stderr, "SPILL2#%lu baseR=%u base=0x%x off=%d v1R=%u v1=0x%x v2R=%u v2=0x%x ad=0x%x\n",
-            g_s2count, TC_A(w), base, TC_OFF11(w), TC_B(w), v1, TC_C(w), v2, ad);
-        uint8_t *q1 = mem_xlate(s, ad, 4, 1);
-        if (q1) st32(q1, v1); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, v1);
-        uint8_t *q2 = mem_xlate(s, ad + 4, 4, 1);
-        if (q2) st32(q2, v2); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad + 4, v2);
-    }
-    k += 2; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];     /* one op word, but two real instructions */
-
     h_beq:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a == b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
     h_bne:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a != b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
     h_blt:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if ((int32_t)a <  (int32_t)b) RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
@@ -256,8 +223,8 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
 
     /* Fused prologue (transcode.h): allocate the frame and save the callee-saved set
      * at the top of it. The p-th set register (rank order: ra,s0,s1,s2..) sits at
-     * sp-4-4p, independent of frame size. Then step the cursor past the dead store
-     * slots -- 1 (this op) + one per saved register -- into the body. */
+     * sp-4-4p, independent of frame size. The whole run is one op word, so advance
+     * one word into the body (k counts the addi + every save it stood in for). */
     h_prologue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
         uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];
@@ -276,12 +243,12 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
                 if (qq) st32(qq, v); else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, v); }
         }
         s->x[2] = sp0 - frame;
-        k += cnt + 1; p += cnt + 1; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+        k += cnt + 1; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     }
     /* Fused epilogue (transcode.h): restore the callee-saved set from the top of the
      * frame (p-th set register at sp+frame-4-4p), deallocate, and return to ra. The
-     * trailing load/dealloc/ret slots are dead -- this op jumps away. Only the ret
-     * checks the budget, exactly as the unfused sequence did. */
+     * whole run is one op word and this op never falls through -- it jumps to ra.
+     * Only the ret checks the budget, exactly as the unfused sequence did. */
     h_epilogue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
         uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];

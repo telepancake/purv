@@ -3,12 +3,12 @@
  *
  * Lowers each instruction into a packed 32-bit op word. For plain RV32IM that is
  * 1:1 with the instruction stream (op-index == pc/4 everywhere), but it is NOT a
- * general guarantee: SPILL2 (below) fuses a safe pair of adjacent stores into ONE
- * op word covering 8 bytes of original code, so op-index can run ahead of pc/4 once
- * a fusion has happened earlier in the stream. Every jump target is still resolved
- * correctly because of how it's computed -- see SPILL2's contract -- but "ops[pc>>2]
- * is always right" is no longer literally true; only the transcode-time map and
- * baked op-relative displacements are.
+ * general guarantee: PROLOGUE/EPILOGUE fusion (below) collapses a whole run of
+ * instructions -- a frame setup or teardown -- into ONE op word, so op-index falls
+ * behind pc/4 once a fusion has happened earlier in the stream. Every jump target is
+ * still resolved correctly because of how it's computed -- see the fusion contract --
+ * but "ops[pc>>2] is always right" is no longer literally true; only the
+ * transcode-time map and baked op-relative displacements are.
  *
  * Packed op word: our leaf op in the top 6 bits (dispatch is w>>26, no mask), then
  * the operands. The immediate is a displacement/value, NOT an absolute address --
@@ -22,35 +22,30 @@
  *   jalr             op[31:26] rd[25:21] rs1[20:16] imm[15:0]
  *   lui / auipc      op[31:26] rd[25:21]  uimm20[19:0]
  *   nop / ecall / ebreak / illegal   op[31:26]
- *   spill2 (fused)   op[31:26] base[25:21] v1[20:16] v2[15:11] off[10:0]
+ *   prologue / epilogue (fused)      op[31:26] regmask[25:13] frame[12:0]
  *
  * (auipc is its own op -- it needs the live pc, which the evaluator has -- so unlike
  * a baked absolute it fits one word. lui keeps only the 20-bit upper immediate.)
  *
- * SPILL2: a peephole fusion over two adjacent `sw` to the same base register at
- * consecutive word offsets (off, off+4) -- the spill/restore and struct-copy idiom,
- * ~8.6% of static instructions in a real corpus (see the conversation this came
- * from). One op does both stores; the evaluator counts it as 2 instructions and
- * advances its cursor by 1 op word instead of 2, so it is strictly fewer dispatches
- * and one merged 8-byte memory access instead of two 4-byte ones.
+ * PROLOGUE/EPILOGUE fusion (see the encoding note below) collapses a function's frame
+ * setup (`addi sp` + callee-saved stores) or teardown (callee-saved loads + `addi sp`
+ * + `ret`) into ONE op word. It happens INSIDE the two passes (step(), shared by
+ * build_map and emit), so the collapsed instructions are genuinely removed: the map
+ * assigns the run a single op-word and the evaluator advances one op word for the
+ * whole thing. Each fused op replays the exact instruction effects, so a match is
+ * never wrong on semantics.
  *
- * Stores write no register, so there is no data hazard between the pair -- the only
- * thing fusion can break is CONTROL FLOW: hiding the SECOND instruction's op slot
- * is only safe if nothing can ever land there. Sequential scanning makes this
- * provable, not assumed: a candidate pair's FIRST instruction always keeps its own
- * op slot (fusion only ever hides the second), and an `sw` can never itself be a
- * jal/jalr/branch, so the instruction immediately after any jal/jalr/branch is
- * always visited fresh by the scan and can only ever be a kept first-half or a
- * standalone -- meaning every RETURN ADDRESS (computed purely from the call site's
- * own op-index, not from pc) is automatically safe with no bookkeeping. The
- * remaining risk is a position becoming unreachable as a DIRECT branch/jal target,
- * or as an INDIRECT (jalr) target reached via a code address taken somewhere in the
- * program (a function pointer, a vtable slot -- exactly the addresses --emit-relocs
- * surfaces in tctool.c, the same mechanism that patches them). transcode_ex's
- * `ext` parameter lets a caller that has that information (tctool.c does; a bare
- * transcode() call does not, and so fuses nothing across an unknown external
- * target) supply it; the transcoder unions it with its own direct-target scan and
- * refuses to fuse across anything in the result.
+ * The only thing fusion can break is CONTROL FLOW: collapsing a run is safe only if
+ * nothing jumps into its interior. The run's HEAD keeps an op-word (the map points
+ * the frame entry / the epilogue's shared return there), so branches and return
+ * addresses that target the head still resolve. The interior is the risk -- a
+ * position becoming a DIRECT branch/jal target, or an INDIRECT (jalr) target reached
+ * via a code address taken somewhere in the program (a function pointer, a vtable
+ * slot -- exactly the addresses --emit-relocs surfaces in tctool.c, the same
+ * mechanism that patches them). transcode_ex's `ext` parameter lets a caller that has
+ * that information (tctool.c does; a bare transcode() call does not, and so fuses
+ * nothing across an unknown external target) supply it; the transcoder unions it with
+ * its own direct-target scan and refuses to collapse across anything in the result.
  */
 #ifndef TRANSCODE_H_
 #define TRANSCODE_H_
@@ -73,8 +68,7 @@ enum {
     RISCV_OP_JAL, RISCV_OP_JALR,
     RISCV_OP_LUI, RISCV_OP_AUIPC, RISCV_OP_NOP,
     RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,
-    RISCV_OP_SPILL2,        /* fused store-pair (peephole-only; decode() never emits it directly) */
-    RISCV_OP_AUIPC_ABS,     /* auipc with a baked absolute value (see below; also peephole-only) */
+    RISCV_OP_AUIPC_ABS,     /* auipc with a baked absolute value (see below; peephole-only) */
     RISCV_OP_PROLOGUE,      /* fused frame-alloc + callee-saved register saves (peephole-only) */
     RISCV_OP_EPILOGUE,      /* fused callee-saved restores + frame-dealloc + ret (peephole-only) */
     RISCV_OP_COUNT
@@ -98,16 +92,16 @@ enum {
  *          at frame-4-4p; PROLOGUE stores it, EPILOGUE loads it.
  * frame:   frame size in bytes (the addi sp amount; <= 2047 in practice, 13 bits here).
  *
- * PROLOGUE sits at the frame-alloc slot: sp -= frame, do the stores, then step the
- *          cursor past the (now dead) store slots -- 1 + popcount(regmask) words.
- * EPILOGUE sits at the first restore-load slot: do the loads, sp += frame, then
- *          return to ra; the trailing load/dealloc/ret slots are left dead (the op
- *          jumps away). Both keep op-index == pc/4 -- no slot is removed. */
+ * The whole run is ONE op word -- the collapsed instructions are removed during the
+ * two passes, not left behind, so op-index falls behind pc/4 downstream (handled by
+ * the auipc/auipc_abs upgrade below).
+ * PROLOGUE: sp -= frame, do the stores, advance one op word into the body.
+ * EPILOGUE: do the loads, sp += frame, return to ra (it never falls through). */
 
 /* RISCV_OP_AUIPC's runtime value (cursor*4 + uimm20<<12) is only correct as long as
- * op-index == pc/4 EVERYWHERE BEFORE this instruction -- the same invariant SPILL2
- * fusion deliberately breaks once it's fired earlier in the stream (fusion runs the
- * op-index 1 behind pc/4 for everything downstream of it). transcode_ex tracks
+ * op-index == pc/4 EVERYWHERE BEFORE this instruction -- the same invariant
+ * prologue/epilogue fusion deliberately breaks once it's fired earlier in the stream
+ * (fusion runs the op-index behind pc/4 for everything downstream of it). transcode_ex tracks
  * whether that drift has actually started by the time it reaches an auipc; if so,
  * it bakes the absolute value (computed from `off`, which the transcoder has and
  * the evaluator's cursor no longer reliably tracks) into a second word as
@@ -134,15 +128,14 @@ enum {
 
 /* Packed-op field accessors. A/B/C are the three register slots; which register each
  * holds depends on the class (see the layout above), so handlers pick by name.
- * SPILL2 reuses A/B/C as base/v1/v2 and adds its own 11-bit signed offset field. */
+ * PROLOGUE/EPILOGUE instead pack (regmask, frame) into the low 26 bits. */
 #define TC_OP(w)    ((uint32_t)(w) >> 26)
-#define TC_A(w)     (((w) >> 21) & 31)   /* rd, or rs1 (branch), or rs2 (store), or SPILL2 base */
-#define TC_B(w)     (((w) >> 16) & 31)   /* rs1, or rs2 (branch), or SPILL2 v1                  */
-#define TC_C(w)     (((w) >> 11) & 31)   /* rs2 (reg-reg), or SPILL2 v2                         */
+#define TC_A(w)     (((w) >> 21) & 31)   /* rd, or rs1 (branch), or rs2 (store) */
+#define TC_B(w)     (((w) >> 16) & 31)   /* rs1, or rs2 (branch)                */
+#define TC_C(w)     (((w) >> 11) & 31)   /* rs2 (reg-reg)                       */
 #define TC_IMM(w)   ((int32_t)(int16_t)(w))                       /* 16-bit signed */
 #define TC_JOFF(w)  ((int32_t)(((w) & 0x1fffffu) << 11) >> 11)    /* 21-bit signed */
 #define TC_UIMM(w)  ((w) & 0xfffffu)                              /* 20-bit upper  */
-#define TC_OFF11(w) ((int32_t)(((w) & 0x7ffu) << 21) >> 21)       /* 11-bit signed (SPILL2) */
 
 /* A transcoded program: just the op array and how far the code runs. ops[pc>>2] is
  * a SHORTCUT that only holds when nothing has fused -- see the header note above.
