@@ -21,7 +21,7 @@ AMALG   := $(SQLDIR)/sqlite3.c
 RES     := $(shell clang -print-resource-dir)/include
 # benchmark size, percent of default. (No inline comment: make would fold the
 # trailing spaces into the value, breaking the .scale comparison below.)
-SCALE   ?= 100
+SCALE   ?= 10
 
 # Shared SQLite options: the freestanding minimum from sqlite.org. The native
 # build (for the benchmark) drops only SQLITE_OS_OTHER, so it uses this box's
