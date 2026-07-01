@@ -10,7 +10,7 @@
  *                    by an instruction anywhere in the program, including after the
  *                    candidate pair being considered.
  *   build_map        place every instruction's (or fused pair's) op-word offset in
- *                    map[orig_pc>>1], using the SAME fusion decision pass 2 will
+ *                    map[pc>>1], using the SAME fusion decision pass 2 will
  *                    make (see try_fuse_spill2) so the map and the emitted array
  *                    agree on layout.
  *   emit (in         lower each instruction/pair into its packed op word(s),
@@ -52,9 +52,9 @@ static uint8_t branch_op(uint32_t f3) {
 
 /* One decoded instruction. `imm` is the immediate for the ops that keep one inline
  * (for STORE specifically, the signed S-immediate -- try_fuse_spill2 reads it
- * directly); `target` is an ABSOLUTE original pc for branch/jal. `width` is the
- * original instruction width (2 or 4; transcode is RV32IM-only, so always 4 here,
- * kept for symmetry with purvs's decoder shape). */
+ * directly); `target` is an absolute pc for branch/jal. `width` is the
+ * instruction width (2 or 4; transcode is RV32IM-only, so always 4 here, kept
+ * for symmetry with purvs's decoder shape). */
 typedef struct { uint8_t op, rd, rs1, rs2; uint32_t imm, target; uint8_t width; } Dec;
 
 static void decode(const uint8_t *code, uint32_t off, Dec *d) {
@@ -197,10 +197,9 @@ static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off, uint32_t a
     return d->width;
 }
 
-/* Resolve a branch/jal target's original pc to its op-word offset. A target outside
- * the code window or not at an instruction start (only possible while sweeping the
- * rodata that rides in the code image -- those ops never execute) yields `at`, i.e.
- * a zero displacement. */
+/* Resolve a branch/jal target pc to its op-word offset. A target outside the code
+ * window or not at an instruction start (shouldn't happen for real code; a
+ * defensive fallback) yields `at`, i.e. a zero displacement. */
 static uint32_t target_word(const uint32_t *map, uint32_t len, uint32_t target, uint32_t at) {
     if (target >= len) return at;
     uint32_t tw = map[target >> 1];
@@ -208,7 +207,7 @@ static uint32_t target_word(const uint32_t *map, uint32_t len, uint32_t target, 
 }
 
 /* Emit one op at op-word offset `at`; resolve branch/jal targets through `map`
- * (orig_pc>>1 -> op-word offset) to a baked op-relative displacement (scaled x4, so
+ * (pc>>1 -> op-word offset) to a baked op-relative displacement (scaled x4, so
  * the evaluator's >>2 recovers the op delta). Returns the next op-word offset. */
 static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *map, uint32_t len) {
     uint8_t op = d->op;
@@ -242,7 +241,7 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
 }
 
 /* Pass 1: place every instruction's (or fused pair's) op-word offset in
- * map[orig_pc>>1], using the SAME step() decision pass 2 will make, and report the
+ * map[pc>>1], using the SAME step() decision pass 2 will make, and report the
  * total op count. */
 static void build_map(const uint8_t *code, uint32_t len, const Targets *targets, uint32_t *map, uint32_t *n_ops) {
     size_t mapn = (size_t)(len >> 1) + 2;

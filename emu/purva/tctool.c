@@ -36,7 +36,7 @@
  *      word (the standard "vtable slot" / function-pointer-global pattern -- e.g.
  *      SQLite alone has ~1300 such call sites). Resolve it through the op-index
  *      map and overwrite the word in our rodata/rwdata buffer with that op index
- *      (the same "fake pc" units jal already produces), so a jalr that later loads
+ *      (op_index*4 -- the pc, the same units jal already produces), so a jalr that later loads
  *      and jumps through it needs no runtime translation at all;
  *   4. write the image (image.h): header + code + rodata + rwdata. No ELF, no
  *      symbols, no entry field (entry is implicit 0 -- see image.h).
@@ -70,7 +70,10 @@ typedef struct { uint32_t r_offset, r_info, r_addend; } Rela;
 #define SHF_WRITE     0x1
 #define SHF_ALLOC     0x2
 #define SHF_EXECINSTR 0x4
-#define R_RISCV_32    1
+#define R_RISCV_32            1
+#define R_RISCV_PCREL_HI20    23  /* auipc's own contribution to a symbol+addend target */
+#define R_RISCV_PCREL_LO12_I  24  /* addi/jalr/load completing it -- symbol is the HI20's own address */
+#define R_RISCV_PCREL_LO12_S  25  /* store completing it, same symbol convention as LO12_I */
 
 static uint8_t *g_elf;
 
@@ -147,12 +150,14 @@ static uint32_t nobits_top(const Ehdr *eh, uint32_t base) {
     return top;
 }
 
-/* Every R_RISCV_32 relocation anywhere in the file whose target value lands inside
- * the code window: every code address taken as a value ANYWHERE in the program --
- * a vtable slot, a stored function pointer -- and therefore a possible jalr target.
- * This is the set transcode_ex's fusion pass must never hide a second half inside
- * (see transcode.h's SPILL2 contract); unlike patch_all_relas, it does not matter
- * which section the relocation lives in, only what it points AT. Caller frees. */
+/* Every R_RISCV_32 or R_RISCV_PCREL_HI20 relocation anywhere in the file whose
+ * target value lands inside the code window: every code address taken as a
+ * value ANYWHERE in the program -- a vtable slot, a stored function pointer, an
+ * auipc materializing a function pointer to store as data -- and therefore a
+ * possible jalr target. This is the set transcode_ex's fusion pass must never
+ * hide a second half inside (see transcode.h's SPILL2 contract); unlike
+ * patch_all_relas, it does not matter which section the relocation lives in,
+ * only what it points AT. Caller frees. */
 static uint32_t *collect_code_address_relocs(const Ehdr *eh, uint32_t code_len, uint32_t *n_out) {
     uint32_t *out = NULL, n = 0, cap = 0;
     for (int i = 0; i < eh->e_shnum; i++) {
@@ -163,7 +168,8 @@ static uint32_t *collect_code_address_relocs(const Ehdr *eh, uint32_t code_len, 
         const Rela *relas = (const Rela *)(g_elf + sh->sh_offset);
         uint32_t cnt = sh->sh_size / sizeof(Rela);
         for (uint32_t j = 0; j < cnt; j++) {
-            if ((relas[j].r_info & 0xff) != R_RISCV_32) continue;
+            uint32_t type = relas[j].r_info & 0xff;
+            if (type != R_RISCV_32 && type != R_RISCV_PCREL_HI20) continue;
             uint32_t target = syms[relas[j].r_info >> 8].st_value + relas[j].r_addend;
             if (target >= code_len) continue;
             if (n == cap) { cap = cap ? cap * 2 : 64; out = realloc(out, cap * sizeof *out); }
@@ -174,10 +180,124 @@ static uint32_t *collect_code_address_relocs(const Ehdr *eh, uint32_t code_len, 
     return out;
 }
 
+/* auipc+addi (or +load/store) materializing a CODE address into a register, to
+ * be used as data rather than jumped to immediately (a function pointer stored
+ * into a struct field, not a link-time relocation -- collect_code_address_
+ * relocs/patch_rela already cover that case). --emit-relocs keeps the pair this
+ * was resolved from: R_RISCV_PCREL_HI20 on the auipc, and a paired
+ * R_RISCV_PCREL_LO12_I (addi/jalr/load) or _S (store) on the completing
+ * instruction, whose symbol points back at the auipc's own address rather than
+ * at the target (the standard local-label convention).
+ *
+ * What needs re-encoding is the pc-to-pc displacement between the auipc and the
+ * target -- both are op-index*4 (transcode.h has the argument for treating that
+ * as simply "the pc"), and neither is known until the map exists, so this just
+ * collects the pairs; apply_pcrel_code_fixups does the actual re-encoding.
+ *
+ * `sym_value` and `addend` are kept separate rather than pre-summed: an addend
+ * can be a small negative offset (`.Ltmp7 - 1`, seen in ACT's I-jalr-01, to test
+ * jalr masking the low bit of a computed target), landing the sum off an
+ * instruction boundary. The symbol alone is always aligned; the addend is added
+ * back after resolving it, since a byte offset means the same thing before and
+ * after transcoding. Caller frees. */
+typedef struct { uint32_t hi_off, lo_off, sym_value; int32_t addend; int lo_is_store; } PcrelFixup;
+
+static PcrelFixup *collect_pcrel_code_fixups(const Ehdr *eh, uint32_t code_len, uint32_t *n_out) {
+    PcrelFixup *out = NULL; uint32_t n = 0, cap = 0;
+    for (int i = 0; i < eh->e_shnum; i++) {
+        const Shdr *sh = shdr(eh, i);
+        if (sh->sh_type != SHT_RELA) continue;
+        const Shdr *symsh = shdr(eh, sh->sh_link);
+        const Sym  *syms = (const Sym *)(g_elf + symsh->sh_offset);
+        const Rela *relas = (const Rela *)(g_elf + sh->sh_offset);
+        uint32_t cnt = sh->sh_size / sizeof(Rela);
+        for (uint32_t j = 0; j < cnt; j++) {
+            if ((relas[j].r_info & 0xff) != R_RISCV_PCREL_HI20) continue;
+            uint32_t sym_value = syms[relas[j].r_info >> 8].st_value;
+            int32_t addend = relas[j].r_addend;
+            if (sym_value >= code_len) continue;                /* not a code address; the
+                                                                    * existing unmodified-real-
+                                                                    * address bake is already
+                                                                    * correct for these */
+            uint32_t hi_off = relas[j].r_offset;
+            /* One auipc's result can feed more than one lo12-completing
+             * instruction (e.g. auipc t0,..; lw a,..(t0); sw b,..(t0)) -- every
+             * LO12 relocation whose symbol points back at this hi_off needs its
+             * own fixup entry, not just the first one found. */
+            int found = 0;
+            for (int k = 0; k < eh->e_shnum; k++) {
+                const Shdr *sh2 = shdr(eh, k);
+                if (sh2->sh_type != SHT_RELA) continue;
+                const Shdr *symsh2 = shdr(eh, sh2->sh_link);
+                const Sym  *syms2 = (const Sym *)(g_elf + symsh2->sh_offset);
+                const Rela *relas2 = (const Rela *)(g_elf + sh2->sh_offset);
+                uint32_t cnt2 = sh2->sh_size / sizeof(Rela);
+                for (uint32_t l = 0; l < cnt2; l++) {
+                    uint32_t type2 = relas2[l].r_info & 0xff;
+                    if (type2 != R_RISCV_PCREL_LO12_I && type2 != R_RISCV_PCREL_LO12_S) continue;
+                    if (syms2[relas2[l].r_info >> 8].st_value != hi_off) continue;
+                    found = 1;
+                    if (n == cap) { cap = cap ? cap * 2 : 64; out = realloc(out, cap * sizeof *out); }
+                    out[n++] = (PcrelFixup){ hi_off, relas2[l].r_offset, sym_value, addend,
+                                              type2 == R_RISCV_PCREL_LO12_S };
+                }
+            }
+            if (!found) {
+                fprintf(stderr, "transcode: auipc at 0x%x (code target 0x%x+%d) has no paired "
+                        "PCREL_LO12 relocation -- cannot fix up\n", hi_off, sym_value, addend);
+                exit(2);
+            }
+        }
+    }
+    *n_out = n;
+    return out;
+}
+
+/* Re-encode each pair for the pc-to-pc displacement between the auipc (its op-
+ * index, always correct as-is) and the target (resolved through the same map
+ * patch_rela uses). Standard hi20/lo12 split when the auipc is still the cheap
+ * 1-word form; if drift already forced it to the 2-word baked AUIPC_ABS, the
+ * full target fits in that second word directly and the paired instruction
+ * contributes nothing. */
+static void apply_pcrel_code_fixups(const PcrelFixup *fx, uint32_t n, const uint32_t *map, uint32_t *ops) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t at_hi = map[fx[i].hi_off >> 1], at_lo = map[fx[i].lo_off >> 1],
+                 at_sym = map[fx[i].sym_value >> 1];
+        if (at_hi == TC_SENTINEL || at_lo == TC_SENTINEL || at_sym == TC_SENTINEL) {
+            fprintf(stderr, "transcode: pcrel fixup at 0x%x/0x%x -> 0x%x+%d: unresolved instruction start\n",
+                    fx[i].hi_off, fx[i].lo_off, fx[i].sym_value, fx[i].addend);
+            exit(2);
+        }
+        /* try_fuse_spill2 only ever fuses a pair of sw -- an addi/load/jalr lo12
+         * can't become one, so only check when it's a store. ext_addrs already
+         * stops it being hidden as a fusion's second half; nothing stops it
+         * becoming a fusion's first half (try_fuse_spill2 never checks that), so
+         * this catches that case before writing into the wrong field. */
+        if (fx[i].lo_is_store && TC_OP(ops[at_lo]) != RISCV_OP_SW) {
+            fprintf(stderr, "transcode: pcrel fixup at 0x%x: lo12 store at 0x%x got fused\n", fx[i].hi_off, fx[i].lo_off);
+            exit(2);
+        }
+        int32_t target_pc = (int32_t)(at_sym * 4) + fx[i].addend;   /* an addend is just an offset, same in either pc space */
+        int32_t delta = target_pc - (int32_t)(at_hi * 4);
+        uint8_t hi_op = TC_OP(ops[at_hi]);
+        if (hi_op == RISCV_OP_AUIPC) {
+            int32_t hi20 = (delta + 0x800) >> 12, lo12 = delta - (hi20 << 12);
+            ops[at_hi] = (ops[at_hi] & ~0xfffffu) | ((uint32_t)hi20 & 0xfffffu);
+            ops[at_lo] = (ops[at_lo] & ~0xffffu) | ((uint32_t)lo12 & 0xffffu);
+        } else if (hi_op == RISCV_OP_AUIPC_ABS) {
+            ops[at_hi + 1] = (uint32_t)target_pc;      /* whole value in one word; lo12 adds nothing */
+            ops[at_lo] = ops[at_lo] & ~0xffffu;
+        } else {
+            fprintf(stderr, "transcode: pcrel fixup at 0x%x: op %u is not an auipc\n", fx[i].hi_off, hi_op);
+            exit(2);
+        }
+    }
+}
+
 /* Patch every R_RISCV_32 relocation in section `ri` whose target value lands inside
  * the code window [0, code_len): overwrite the word at its (absolute address -
  * buf_base) in `buf` with its resolved op index * 4. A relocation targeting rodata
- * or rwdata needs no patching at all: both regions keep their real ELF address
+ * or rwdata needs no patching at all: both regions keep their linked address
  * unmodified in the image (rwdata is always at the fixed RISCV_HALF boundary;
  * rodata is wherever the linker put it -- see merge_progbits's MERGE_AUTO_BASE
  * comment -- and the image preserves that address exactly), so a relocation's raw
@@ -198,7 +318,7 @@ static void patch_rela(const Ehdr *eh, int ri, uint32_t buf_base, uint8_t *buf, 
         if (op_index == TC_SENTINEL) continue;              /* not an instruction start */
         if (relas[i].r_offset < buf_base || relas[i].r_offset - buf_base + 4 > buf_len) continue;
         uint32_t at = relas[i].r_offset - buf_base;
-        uint32_t new_value = op_index * 4;                  /* fake-pc units, like jal's link */
+        uint32_t new_value = op_index * 4;                  /* the pc, same as jal's link */
         buf[at] = (uint8_t)new_value; buf[at + 1] = (uint8_t)(new_value >> 8);
         buf[at + 2] = (uint8_t)(new_value >> 16); buf[at + 3] = (uint8_t)(new_value >> 24);
     }
@@ -277,6 +397,19 @@ int main(int argc, char **argv) {
      * no way to know these (it never reads the ELF), only this tool does. */
     uint32_t n_ext;
     uint32_t *ext_addrs = collect_code_address_relocs(eh, code_len, &n_ext);
+
+    /* auipc+addi/load/store pairs materializing a code address as data (see
+     * collect_pcrel_code_fixups) -- their lo12-completing instruction must also
+     * keep its own op slot (apply_pcrel_code_fixups patches its imm[15:0]
+     * directly, which a SPILL2 fusion would silently repurpose as a different
+     * field), so its address joins the SAME fusion-protected set. */
+    uint32_t n_fixups;
+    PcrelFixup *fixups = collect_pcrel_code_fixups(eh, code_len, &n_fixups);
+    if (n_fixups) {
+        ext_addrs = realloc(ext_addrs, (n_ext + n_fixups) * sizeof *ext_addrs);
+        for (uint32_t i = 0; i < n_fixups; i++) ext_addrs[n_ext + i] = fixups[i].lo_off;
+        n_ext += n_fixups;
+    }
     TcExternalTargets ext = { ext_addrs, n_ext };
 
     /* 1. transcode code -- the only decoding in this pipeline. */
@@ -308,11 +441,19 @@ int main(int argc, char **argv) {
     }
 
     /* 2. patch every code-pointer relocation found anywhere into rodata/rwdata.
-     * Nothing else needs correcting: rodata and rwdata both keep their real ELF
-     * address unmodified in the image (see merge_progbits), so no relocation or
-     * baked auipc value pointing at either one is ever wrong to begin with. */
+     * rwdata needs no correcting: it keeps its linked address unmodified in
+     * the image (see merge_progbits), so a relocation pointing at it is never
+     * wrong to begin with. rodata is the same UNLESS a relocation's target is
+     * actually a code address stored there (a vtable in rodata, still R_RISCV_32
+     * -- patch_rela already resolves those through the map like any other code-
+     * address relocation, regardless of which section holds the word). */
     patch_all_relas(eh, rodata_base, rodata_bytes, rodata_len,
                      RISCV_HALF, rwdata_bytes, rwdata_len, map, code_len);
+
+    /* 3. re-encode every auipc+addi/load/store pair that materializes a code
+     * address as data (see collect_pcrel_code_fixups) for the pc-to-pc
+     * displacement it actually needs, now that the map exists. */
+    apply_pcrel_code_fixups(fixups, n_fixups, map, prog.ops);
 
     Image img = {0};
     img.code_size   = prog.n_ops * 4;
@@ -330,5 +471,6 @@ int main(int argc, char **argv) {
             argv[1], argv[2], prog.n_ops, rodata_len, rwdata_len, bss_len);
     free(map);
     free(ext_addrs);
+    free(fixups);
     return 0;
 }

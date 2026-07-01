@@ -83,37 +83,28 @@ enum {
  * fusion deliberately breaks once it's fired earlier in the stream (fusion runs the
  * op-index 1 behind pc/4 for everything downstream of it). transcode_ex tracks
  * whether that drift has actually started by the time it reaches an auipc; if so,
- * it bakes the real absolute value (computed from the TRUE pc, which the
- * transcoder has and the evaluator's cursor no longer reliably tracks) into a
- * second word as RISCV_OP_AUIPC_ABS rather than emitting the ordinary 1-word
- * cursor-based RISCV_OP_AUIPC.
+ * it bakes the absolute value (computed from `off`, which the transcoder has and
+ * the evaluator's cursor no longer reliably tracks) into a second word as
+ * RISCV_OP_AUIPC_ABS rather than emitting the ordinary 1-word cursor-based
+ * RISCV_OP_AUIPC.
  *
- * Both forms compute a value in REAL-ELF coordinates (off + uimm20<<12, whether
- * from the transcode-time `off` or, when undrifted, the cursor standing in for
- * it) -- and that is only safe to use unmodified at run time because RODATA
- * NEVER MOVES: code and rodata are two genuinely separate regions (purv.h's
+ * That baked value is safe unmodified for a data (rodata/rwdata) target because
+ * neither region ever moves relative to code: they're separate regions (purv.h's
  * documented four-region layout -- code at [0, code.len), rodata growing down
- * from RISCV_HALF, see purva.ld and purva.c's mem_xlate), so a rodata pointer's
- * real ELF address IS its image address, with no transcoder-side correction
- * ever needed -- unlike an earlier version of this file, which instead
- * appended rodata right after code and let its image position drift with the
- * transcoded code's size, patching every baked pointer for the difference
- * after the fact. That was real complexity for a self-inflicted problem: once
- * rodata is anchored to its own fixed architectural boundary instead of
- * "wherever code happens to end", the problem it was solving doesn't exist.
+ * from RISCV_HALF; see purva.ld and purva.c's mem_xlate), anchored to their own
+ * fixed architectural boundaries rather than to "wherever code happens to end",
+ * so fusion changing code's size can't move them.
  *
- * A target INSIDE the code window (target < len) is the one case this doesn't
- * cover: computing a CODE address (the auipc+jr idiom, or auipc+store used to
- * materialize a function pointer as data) needs the op-index*4 a jalr can
- * actually use, not a real-ELF byte offset -- and neither AUIPC form produces
- * that. This is a known, accepted gap (transcode.h's SPILL2 note references the
- * same idiom for jalr) -- CONFIRMED as the sole remaining one: with SPILL2
- * disabled (so op-index == pc/4 always, meaning even an unresolved real-ELF
- * code address happens to equal the op-index*4 it needs), a real SQLite
- * workload runs to completion byte-identical to purv for its full ~2.2 billion
- * instructions; with SPILL2 enabled it still hits this gap partway through, via
- * auipc+addi materializing a function pointer that gets stored to memory (not
- * jumped to immediately) and later loaded back and called indirectly. */
+ * A CODE target is different: two positions in code can shift relative to each
+ * other as fusion changes what's between them, so a value computed against one
+ * position (the auipc's) isn't valid at another (the target's) -- an auipc
+ * materializing a function pointer to store as data (`obj->method = someFunc;`,
+ * as opposed to a static initializer, which is a link-time relocation and
+ * already handled by patch_rela) needs the actual pc-to-pc displacement between
+ * the two, not its own local value. tctool.c's collect_pcrel_code_fixups /
+ * apply_pcrel_code_fixups do that: find the auipc+addi (or +load/store) pair via
+ * the PCREL_HI20/LO12 relocations --emit-relocs keeps, and once the map exists,
+ * re-encode both instructions for the real displacement. */
 
 /* Packed-op field accessors. A/B/C are the three register slots; which register each
  * holds depends on the class (see the layout above), so handlers pick by name.
@@ -151,7 +142,7 @@ void transcode(const uint8_t *code, uint32_t len, Transcoded *out);   /* = trans
 
 #define TC_SENTINEL 0xffffffffu     /* map entry for a non-instruction offset */
 
-/* Build ONLY the orig_pc>>1 -> op-word-offset map (pass 1; no op emission), and
+/* Build ONLY the pc>>1 -> op-word-offset map (pass 1; no op emission), and
  * report the resulting op count -- using the SAME fusion decisions a transcode_ex
  * call with the same (code, len, ext) would make, so the two stay consistent. For a
  * tool that needs to resolve a CODE ADDRESS to its op index outside the normal
