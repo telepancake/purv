@@ -75,8 +75,34 @@ enum {
     RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,
     RISCV_OP_SPILL2,        /* fused store-pair (peephole-only; decode() never emits it directly) */
     RISCV_OP_AUIPC_ABS,     /* auipc with a baked absolute value (see below; also peephole-only) */
+    RISCV_OP_PROLOGUE,      /* fused frame-alloc + callee-saved register saves (peephole-only) */
+    RISCV_OP_EPILOGUE,      /* fused callee-saved restores + frame-dealloc + ret (peephole-only) */
     RISCV_OP_COUNT
 };
+
+/* PROLOGUE / EPILOGUE encoding:  op[31:26] | regmask[25:13] | frame[12:0]
+ *
+ * A compiler prologue is a frame allocation followed by the callee-saved registers
+ * stored at the TOP of the new frame, and the epilogue is its mirror:
+ *     addi sp,sp,-N   |   lw   ra,N-4(sp)          (ra highest, then s0,s1,s2..)
+ *     sw   ra,N-4(sp) |   lw   s0,N-8(sp)
+ *     sw   s0,N-8(sp) |   ...
+ *     ...             |   addi sp,sp,N
+ *                     |   jalr zero,0(ra)          (ret)
+ * The saves/restores always occupy contiguous 4-byte slots from N-4 downward in the
+ * canonical order ra, s0, s1, s2..s11, so each register's offset is fully determined
+ * by (frame, its position among the set registers) -- no offset list is stored.
+ *
+ * regmask: 13 bits, one per callee-saved register in rank order
+ *          rank 0=ra, 1=s0, 2=s1, 3..12=s2..s11. The p-th SET bit (rank order) lives
+ *          at frame-4-4p; PROLOGUE stores it, EPILOGUE loads it.
+ * frame:   frame size in bytes (the addi sp amount; <= 2047 in practice, 13 bits here).
+ *
+ * PROLOGUE sits at the frame-alloc slot: sp -= frame, do the stores, then step the
+ *          cursor past the (now dead) store slots -- 1 + popcount(regmask) words.
+ * EPILOGUE sits at the first restore-load slot: do the loads, sp += frame, then
+ *          return to ra; the trailing load/dealloc/ret slots are left dead (the op
+ *          jumps away). Both keep op-index == pc/4 -- no slot is removed. */
 
 /* RISCV_OP_AUIPC's runtime value (cursor*4 + uimm20<<12) is only correct as long as
  * op-index == pc/4 EVERYWHERE BEFORE this instruction -- the same invariant SPILL2

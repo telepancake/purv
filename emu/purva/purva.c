@@ -80,6 +80,10 @@ uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int
 
 static int32_t sext(uint32_t v, int bits) { int sh = 32 - bits; return (int32_t)(v << sh) >> sh; }
 
+/* PROLOGUE/EPILOGUE regmask bit -> register number, in canonical save rank order
+ * (see transcode.h): rank 0=ra, 1=s0, 2=s1, 3..12=s2..s11. */
+static const uint8_t rank2reg[13] = { 1, 8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 };
+
 static const Transcoded *g_prog;
 
 void RiscvEmulatorSetProgram(const Transcoded *prog) { g_prog = prog; }
@@ -111,6 +115,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_LUI] = &&h_lui, [RISCV_OP_AUIPC] = &&h_auipc, [RISCV_OP_NOP] = &&h_nop,
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
         [RISCV_OP_SPILL2] = &&h_spill2, [RISCV_OP_AUIPC_ABS] = &&h_auipc_abs,
+        [RISCV_OP_PROLOGUE] = &&h_prologue, [RISCV_OP_EPILOGUE] = &&h_epilogue,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -245,6 +250,43 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * (computed from the TRUE pc, not a drifted cursor) into the next word. */
     h_auipc_abs: wr(s, TC_A(w), p[1]); k++; p += 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     h_nop:   NEXT();
+
+    /* Fused prologue (transcode.h): allocate the frame and save the callee-saved set
+     * at the top of it. The p-th set register (rank order: ra,s0,s1,s2..) sits at
+     * sp-4-4p, independent of frame size. Then step the cursor past the dead store
+     * slots -- 1 (this op) + one per saved register -- into the body. */
+    h_prologue: {
+        uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
+        uint32_t sp0 = s->x[2], addr = sp0, cnt = 0;
+        for (uint32_t r = 0; r < 13; r++) if (rmask & (1u << r)) {
+            addr -= 4;
+            uint32_t v = s->x[rank2reg[r]];
+            uint8_t *q = mem_xlate(s, addr, 4, 1);
+            if (q) st32(q, v); else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, v);
+            cnt++;
+        }
+        s->x[2] = sp0 - frame;
+        k += cnt + 1; p += cnt + 1; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+    }
+    /* Fused epilogue (transcode.h): restore the callee-saved set from the top of the
+     * frame (p-th set register at sp+frame-4-4p), deallocate, and return to ra. The
+     * trailing load/dealloc/ret slots are dead -- this op jumps away. Only the ret
+     * checks the budget, exactly as the unfused sequence did. */
+    h_epilogue: {
+        uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
+        uint32_t sp0 = s->x[2], addr = sp0 + frame, cnt = 0;
+        for (uint32_t r = 0; r < 13; r++) if (rmask & (1u << r)) {
+            addr -= 4;
+            uint8_t *q = mem_xlate(s, addr, 4, 0);
+            s->x[rank2reg[r]] = q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24)
+                                  : (s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0);
+            cnt++;
+        }
+        s->x[2] = sp0 + frame;
+        uint32_t t = s->x[1] & ~1u; k += cnt + 2;
+        if (t >= clen || k >= max) { s->pc = t; return k; }
+        p = base + (t >> 2); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+    }
 
     h_trap: {
         uint32_t pc_ = (uint32_t)(p - base) << 2;

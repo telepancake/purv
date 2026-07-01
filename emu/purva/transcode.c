@@ -143,6 +143,18 @@ static Targets collect_targets(const uint8_t *code, uint32_t len, const TcExtern
     return t;
 }
 
+/* Callee-saved integer registers (RV32 ilp32): ra, s0, s1, s2..s11. Their canonical
+ * save/restore rank (highest frame slot first) is ra, s0, s1, s2..s11 -- rank_of
+ * returns that 0..12 index, or -1 for any non-callee-saved register. */
+static int is_callee_reg(uint32_t r) { return r == 1 || r == 8 || r == 9 || (r >= 18 && r <= 27); }
+static int rank_of(uint32_t r) {
+    if (r == 1) return 0;
+    if (r == 8) return 1;
+    if (r == 9) return 2;
+    if (r >= 18 && r <= 27) return 3 + (int)(r - 18);
+    return -1;
+}
+
 /* Try to fuse the store-pair at `off` into one SPILL2 record (transcode.h has the
  * full safety argument). Two adjacent `sw` to the same base at offsets exactly 4
  * apart, where the second instruction is not in `targets` and the lower offset
@@ -157,6 +169,12 @@ static uint32_t try_fuse_spill2(const uint8_t *code, uint32_t len, uint32_t off,
     if (d1.op != RISCV_OP_SW) return 0;
     decode(code, off + 4, &d2);
     if (d2.op != RISCV_OP_SW || d2.rs1 != d1.rs1) return 0;
+    /* Step aside for a callee-saved store to sp: that is a prologue save, and
+     * fuse_frames collapses the whole prologue into ONE op. If SPILL2 grabbed the
+     * pair (or straddled the prologue/body boundary) first, the frame op could not
+     * consume a clean uniform run of individual sw's -- so SPILL2 leaves any sp-store
+     * pair touching a callee-saved register alone. */
+    if (d1.rs1 == 2 && (is_callee_reg(d1.rs2) || is_callee_reg(d2.rs2))) return 0;
     if (targets_has(targets, off + 4)) return 0;            /* provably never a target -- required */
     int32_t off1 = (int32_t)d1.imm, off2 = (int32_t)d2.imm;
     if (off2 - off1 != 4 && off1 - off2 != 4) return 0;
@@ -272,6 +290,106 @@ uint32_t *transcode_map(const uint8_t *code, uint32_t len, uint32_t *n_ops_out) 
     return transcode_map_ex(code, len, NULL, n_ops_out);
 }
 
+/* ---- post-pass: fuse prologues and epilogues (see transcode.h) ----
+ *
+ * Runs on the EMITTED op array. A prologue is `addi sp,sp,-N` followed by a
+ * contiguous run of callee-saved `sw`s at the top of the frame (SPILL2 has stepped
+ * aside, so they are individual and uniform); it becomes a PROLOGUE op in the
+ * frame-alloc slot, the store slots left dead (the op steps the cursor past them).
+ * An epilogue is a contiguous run of callee-saved `lw`s, then `addi sp,sp,+N`, then
+ * `jalr zero,0(ra)`; the first load slot becomes an EPILOGUE op that loads, deallocs
+ * and returns, the trailing slots left dead. Neither removes a slot, so
+ * op-index == pc/4 is preserved. Fusion is refused if any branch/jal target lands in
+ * the interior that would be skipped (the head slot -- where returns converge -- is
+ * always kept). */
+
+/* The set of (reg,off) saves/restores is canonical iff its offsets are exactly
+ * {N-4, N-8, .., N-4-4(cnt-1)} and, as the offset descends, the register rank
+ * strictly increases (ra above s0 above s1 ..). Builds *rmask on success. */
+static int frame_canonical(const uint32_t *regs, const int32_t *offs, uint32_t cnt,
+                           uint32_t N, uint32_t *rmask) {
+    int prev = -1; uint32_t m = 0;
+    for (uint32_t p = 0; p < cnt; p++) {
+        int32_t want = (int32_t)N - 4 - 4 * (int32_t)p;
+        int found = -1;
+        for (uint32_t c = 0; c < cnt; c++) if (offs[c] == want) { found = (int)c; break; }
+        if (found < 0) return 0;
+        int rk = rank_of(regs[found]);
+        if (rk <= prev) return 0;                 /* strictly increasing rank as offset drops */
+        prev = rk; m |= 1u << rk;
+    }
+    *rmask = m;
+    return 1;
+}
+
+static void fuse_frames(uint32_t *ops, uint32_t n) {
+    uint8_t *is_target = calloc((size_t)n, 1);
+    if (!is_target) return;
+    for (uint32_t i = 0; i < n; ) {
+        uint8_t op = TC_OP(ops[i]);
+        if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
+            int32_t t = (int32_t)i + (TC_IMM(ops[i]) >> 2);
+            if (t >= 0 && (uint32_t)t < n) is_target[t] = 1;
+        } else if (op == RISCV_OP_JAL) {
+            int32_t t = (int32_t)i + (TC_JOFF(ops[i]) >> 2);
+            if (t >= 0 && (uint32_t)t < n) is_target[t] = 1;
+        }
+        i += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+    }
+
+    /* prologues */
+    for (uint32_t i = 0; i < n; ) {
+        uint8_t op = TC_OP(ops[i]);
+        if (op == RISCV_OP_ADDI && TC_A(ops[i]) == 2 && TC_B(ops[i]) == 2 && TC_IMM(ops[i]) < 0) {
+            uint32_t N = (uint32_t)(-TC_IMM(ops[i]));
+            uint32_t regs[13]; int32_t offs[13]; uint32_t cnt = 0, j = i + 1;
+            while (j < n && cnt < 13) {
+                uint32_t w = ops[j];
+                if (TC_OP(w) == RISCV_OP_SW && TC_B(w) == 2 && rank_of(TC_A(w)) >= 0) {
+                    regs[cnt] = TC_A(w); offs[cnt] = TC_IMM(w); cnt++; j++;
+                } else break;
+            }
+            uint32_t rmask;
+            if (cnt > 0 && N <= 0x1fff && frame_canonical(regs, offs, cnt, N, &rmask)) {
+                int interior = 0;
+                for (uint32_t t = i + 1; t < j; t++) if (is_target[t]) { interior = 1; break; }
+                if (!interior) {
+                    ops[i] = ((uint32_t)RISCV_OP_PROLOGUE << 26) | (rmask << 13) | (N & 0x1fff);
+                    i = j; continue;
+                }
+            }
+        }
+        i += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+    }
+
+    /* epilogues (anchored at the ret) */
+    for (uint32_t k = 0; k < n; ) {
+        uint8_t op = TC_OP(ops[k]);
+        if (op == RISCV_OP_JALR && TC_A(ops[k]) == 0 && TC_B(ops[k]) == 1 && TC_IMM(ops[k]) == 0
+            && k >= 1 && TC_OP(ops[k-1]) == RISCV_OP_ADDI && TC_A(ops[k-1]) == 2
+            && TC_B(ops[k-1]) == 2 && TC_IMM(ops[k-1]) > 0) {
+            uint32_t N = (uint32_t)TC_IMM(ops[k-1]);
+            uint32_t regs[13]; int32_t offs[13]; uint32_t cnt = 0; int32_t f = (int32_t)k - 2;
+            while (f >= 0 && cnt < 13) {
+                uint32_t w = ops[f];
+                if (TC_OP(w) == RISCV_OP_LW && TC_B(w) == 2 && rank_of(TC_A(w)) >= 0) {
+                    regs[cnt] = TC_A(w); offs[cnt] = TC_IMM(w); cnt++; f--;
+                } else break;
+            }
+            uint32_t rmask;
+            if (cnt > 0 && N <= 0x1fff && frame_canonical(regs, offs, cnt, N, &rmask)) {
+                uint32_t start = (uint32_t)(f + 1);
+                int interior = 0;
+                for (uint32_t t = start + 1; t <= k; t++) if (is_target[t]) { interior = 1; break; }
+                if (!interior)
+                    ops[start] = ((uint32_t)RISCV_OP_EPILOGUE << 26) | (rmask << 13) | (N & 0x1fff);
+            }
+        }
+        k += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+    }
+    free(is_target);
+}
+
 void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ext, Transcoded *out) {
     Targets targets = collect_targets(code, len, ext);
     uint32_t n_ops;
@@ -293,6 +411,7 @@ void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ex
     }
     free(map);
     targets_free(&targets);
+    fuse_frames(out->ops, out->n_ops);
 }
 
 void transcode(const uint8_t *code, uint32_t len, Transcoded *out) {
