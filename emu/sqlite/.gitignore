@@ -14,3 +14,8 @@ purv.out
 purv.err
 purvs.out
 purvs.err
+purva.out
+purva.err
+host-purva
+guest-bench-purva.elf
+guest-bench-purva.img
