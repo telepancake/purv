@@ -5,7 +5,8 @@
 #   pvcc foo.c bar.c -o foo.img              link as a program (needs _start)
 #   pvcc foo.cpp -o foo.img                  C++ sources compile with clang++ and
 #                                              the freestanding C++ flags below
-#                                              (-fno-rtti -fno-exceptions)
+#                                              (-fno-rtti -fno-exceptions
+#                                               -fno-threadsafe-statics)
 #   pvcc fn.c --lib -o fn.img                link as a library (no _start; entry=0,
 #                                              call functions directly via --invoke)
 #
@@ -25,9 +26,11 @@ GUESTCC="${GUESTCC:-clang}"
 GUESTCXX="${GUESTCXX:-clang++}"
 GUEST_ARCH="--target=riscv32 -march=rv32im -mabi=ilp32"
 GUEST_CFLAGS="-ffreestanding -nostdlib -fno-builtin -fno-stack-protector -O2"
-# C++ adds the freestanding-C++ flavour: no RTTI and no exceptions (both pull in
-# runtime support this bare-metal target has no library for).
-GUEST_CXXFLAGS="$GUEST_CFLAGS -fno-rtti -fno-exceptions"
+# C++ adds the freestanding-C++ flavour: no RTTI, no exceptions, and no
+# thread-safe-statics -- each otherwise pulls in runtime support this bare-metal
+# target has no library for (exceptions/RTTI tables; __cxa_guard_* for a
+# function-local static's one-time init guard).
+GUEST_CXXFLAGS="$GUEST_CFLAGS -fno-rtti -fno-exceptions -fno-threadsafe-statics"
 RVLD="${RVLD:-ld.lld}"
 
 die() { echo "pvcc: $*" >&2; exit 2; }
