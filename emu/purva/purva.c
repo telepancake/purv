@@ -32,8 +32,10 @@ static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
 /* Little-endian assemble/scatter of n bytes. n is a compile-time constant at every
  * call site, so GCC folds these to a single (unaligned) load/store of that width. */
 static inline __attribute__((always_inline)) uint32_t ld_le(const uint8_t *q, uint32_t n) {
-    uint32_t v = q[0]; if (n > 1) v |= (uint32_t)q[1] << 8;
-    if (n > 2) v |= (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; return v;
+    uint32_t v = q[0];
+    if (n > 1) v |= (uint32_t)q[1] << 8;
+    if (n > 2) v |= (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24;
+    return v;
 }
 static inline __attribute__((always_inline)) void st_le(uint8_t *q, uint32_t n, uint32_t v) {
     q[0] = (uint8_t)v; if (n > 1) q[1] = (uint8_t)(v >> 8);
@@ -102,6 +104,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
         [RISCV_OP_AUIPC_ABS] = &&h_auipc_abs,
         [RISCV_OP_PROLOGUE] = &&h_prologue, [RISCV_OP_EPILOGUE] = &&h_epilogue,
+        [RISCV_OP_LI_LO] = &&h_li_lo, [RISCV_OP_LI_HI] = &&h_li_hi,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -199,6 +202,10 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     /* Drift has occurred upstream: the transcoder baked the real absolute value
      * (computed from the TRUE pc, not a drifted cursor) into the next word. */
     h_auipc_abs: s->x[TC_A(w)] = p[1]; k++; p += 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+    /* Fused `la` (transcode.h): materialise a data address in one op. LI_LO is the
+     * value straight (rodata just below 0, or code); LI_HI adds RISCV_HALF (globals). */
+    h_li_lo: s->x[TC_A(w)] = (uint32_t)TC_JOFF(w);              NEXT();
+    h_li_hi: s->x[TC_A(w)] = (uint32_t)TC_JOFF(w) + RISCV_HALF; NEXT();
     h_nop:   NEXT();
 
     /* Fused prologue (transcode.h): allocate the frame and save the callee-saved set

@@ -246,6 +246,34 @@ static uint32_t try_fuse_epilogue(const uint8_t *code, uint32_t len, uint32_t of
     return (o + 8) - off;
 }
 
+/* `la` at `off`: `auipc rd, hi` then `addi rd, rd, lo` -- the medany pcrel idiom that
+ * materialises a DATA address into rd. The code is non-relocatable, so that address is
+ * a compile-time constant: final = off + (hi<<12) + sext(lo), using the TRUE pc (off),
+ * exactly the value the two instructions would leave in rd. If final lands in a cluster
+ * -- small around 0 (rodata just below 0, code) or small around RISCV_HALF (globals) --
+ * it collapses to ONE load-immediate op (LI_LO / LI_HI), dropping the addi. A CODE
+ * target (final < code_len) is left alone: those are rewritten to op-indices by the
+ * pcrel-code fixups, so their register value is an op-index, not this address. Returns
+ * the byte width consumed (8) on a match, else 0. */
+static uint32_t try_fuse_la(const uint8_t *code, uint32_t len, uint32_t off,
+                            const Targets *targets, Dec *out) {
+    if (off + 8 > len) return 0;
+    if (targets_has(targets, off + 4)) return 0;          /* the addi keeps its slot if a jump lands on it */
+    Dec a, b;
+    decode(code, off, &a);
+    if (a.op != RISCV_OP_AUIPC) return 0;
+    decode(code, off + 4, &b);
+    if (b.op != RISCV_OP_ADDI || b.rd != a.rd || b.rs1 != a.rd) return 0;  /* addi rd,rd,lo consumes it in place */
+    uint32_t final = off + (a.imm << 12) + (uint32_t)(int32_t)b.imm;
+    if (final < len) return 0;                            /* code address: leave to the pcrel-code fixups */
+    int32_t lo = (int32_t)final, hi = (int32_t)(final - 0x80000000u);   /* RISCV_HALF */
+    if (lo >= -(1 << 20) && lo < (1 << 20))       { out->op = RISCV_OP_LI_LO; out->imm = final & 0x1fffffu; }
+    else if (hi >= -(1 << 20) && hi < (1 << 20))  { out->op = RISCV_OP_LI_HI; out->imm = (final - 0x80000000u) & 0x1fffffu; }
+    else return 0;                                        /* too far from either anchor */
+    out->rd = a.rd;
+    return 8;
+}
+
 /* Decode (or fuse) the unit starting at `off`; returns the byte width consumed and
  * fills *d. Shared by build_map and transcode_ex's emit pass so they make the
  * identical decision -- both are pure functions of (code, len, off, at, targets).
@@ -267,6 +295,8 @@ static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off, uint32_t a
     uint32_t fused = try_fuse_prologue(code, len, off, targets, d);
     if (fused) return fused;
     fused = try_fuse_epilogue(code, len, off, targets, d);
+    if (fused) return fused;
+    fused = try_fuse_la(code, len, off, targets, d);
     if (fused) return fused;
     decode(code, off, d);
     if (d->op == RISCV_OP_AUIPC && at != off / 4) {
@@ -301,6 +331,8 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | rs2 << 21 | rs1 << 16 | (d->imm & 0xffff); /* store         */
     else if (op == RISCV_OP_PROLOGUE || op == RISCV_OP_EPILOGUE)    /* regmask<<13 | frame */
         ops[at++] = w0 | (d->imm & 0x3ffffffu);
+    else if (op == RISCV_OP_LI_LO || op == RISCV_OP_LI_HI)          /* rd | 21-bit imm (JAL shape) */
+        ops[at++] = w0 | rd << 21 | (d->imm & 0x1fffffu);
     else if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
         int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;
         ops[at++] = w0 | rs1 << 21 | rs2 << 16 | ((uint32_t)(delta * 4) & 0xffff);

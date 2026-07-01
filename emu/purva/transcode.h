@@ -71,6 +71,8 @@ enum {
     RISCV_OP_AUIPC_ABS,     /* auipc with a baked absolute value (see below; peephole-only) */
     RISCV_OP_PROLOGUE,      /* fused frame-alloc + callee-saved register saves (peephole-only) */
     RISCV_OP_EPILOGUE,      /* fused callee-saved restores + frame-dealloc + ret (peephole-only) */
+    RISCV_OP_LI_LO,         /* rd = sext21(imm)              -- fused `la` near 0 (peephole-only) */
+    RISCV_OP_LI_HI,         /* rd = sext21(imm) + RISCV_HALF -- fused `la` near RISCV_HALF (peephole-only) */
     RISCV_OP_COUNT
 };
 
