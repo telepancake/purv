@@ -189,9 +189,9 @@ static inline int purvhost_sym(const PurvHost *h, const char *name, uint32_t *ou
  * signature dumps that touch guest memory. */
 static inline uint8_t purvhost_guest_byte(const RiscvEmulatorState_t *st, uint32_t a) {
     uint32_t rel = a - st->writable.base;
-    if ((uint64_t)rel + 1 <= st->writable.len) return st->writable.ptr[rel];
+    if (rel < st->writable.len) return st->writable.ptr[rel];
     rel = a - st->readonly.base;
-    if ((uint64_t)rel + 1 <= st->readonly.len) return st->readonly.ptr[rel];
+    if (rel < st->readonly.len) return st->readonly.ptr[rel];
     return 0;
 }
 

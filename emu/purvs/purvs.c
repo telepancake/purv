@@ -66,16 +66,17 @@ static inline int op_has_imm(uint8_t op) { return (int)((RISCV_IMM_MASK >> op) &
 /* mem_xlate maps [addr, addr+n) to host storage, or NULL on a miss (and on a write
  * to the read-only region). Two self-describing regions, one bounded check each: a
  * WRITE tests only the writable span; a READ falls through to the read-only span.
- * `(uint64_t)rel + n <= len` is correct for any n. The load/store sites read/write
- * the bytes explicitly per width (little-endian, so the byte-or / byte-store idioms
- * compile to a single unaligned sized access). */
+ * `rel < len && n <= len - rel` is correct for any n -- once rel < len, len - rel
+ * can't underflow. The load/store sites read/write the bytes explicitly per width
+ * (little-endian, so the byte-or / byte-store idioms compile to a single unaligned
+ * sized access). */
 static inline __attribute__((always_inline))
 uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
     uint32_t rel = addr - s->writable.base;
-    if ((uint64_t)rel + n <= s->writable.len) return s->writable.ptr + rel;
+    if (rel < s->writable.len && n <= s->writable.len - rel) return s->writable.ptr + rel;
     if (write) return (uint8_t *)0;
     rel = addr - s->readonly.base;
-    if ((uint64_t)rel + n <= s->readonly.len) return s->readonly.ptr + rel;
+    if (rel < s->readonly.len && n <= s->readonly.len - rel) return s->readonly.ptr + rel;
     return (uint8_t *)0;
 }
 

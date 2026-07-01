@@ -156,10 +156,10 @@ static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
  * region (a store to read-only memory returns NULL). */
 static uint8_t *byte_at(const RiscvEmulatorState_t *st, uint32_t a, int write) {
     uint32_t rel = a - st->writable.base;
-    if ((uint64_t)rel + 1 <= st->writable.len) return st->writable.ptr + rel;
+    if (rel < st->writable.len) return st->writable.ptr + rel;
     if (write) return (uint8_t *)0;
     rel = a - st->readonly.base;
-    if ((uint64_t)rel + 1 <= st->readonly.len) return st->readonly.ptr + rel;
+    if (rel < st->readonly.len) return st->readonly.ptr + rel;
     return (uint8_t *)0;
 }
 static void mem_read(const RiscvEmulatorState_t *st, uint32_t addr, uint8_t *dst, uint32_t len) {

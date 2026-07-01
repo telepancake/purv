@@ -224,9 +224,9 @@ static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
 #else
 static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
     uint32_t rel = a - s->writable.base;
-    if ((uint64_t)rel + 1 <= s->writable.len) return s->writable.ptr[rel];
+    if (rel < s->writable.len) return s->writable.ptr[rel];
     rel = a - s->readonly.base;
-    if ((uint64_t)rel + 1 <= s->readonly.len) return s->readonly.ptr[rel];
+    if (rel < s->readonly.len) return s->readonly.ptr[rel];
     return 0;
 }
 #endif

@@ -53,15 +53,16 @@ static inline __attribute__((always_inline)) uint32_t ld32(const uint8_t *q) {
  * Instruction fetch is the op cursor (g_prog), never a region -- purva's "code" is
  * packed op words, not data-addressable, so s->readonly holds only rodata. mem_xlate
  * is two base-relative bounded checks: a WRITE tests only the writable region; a
- * READ falls through to rodata. The bound is `(uint64_t)rel + n <= len`, correct for
- * ANY n (no unsigned underflow of len - n, no per-access base arithmetic). */
+ * READ falls through to rodata. The bound is `rel < len && n <= len - rel`, correct
+ * for ANY n -- once rel < len, len - rel can't underflow, and there is no per-access
+ * base arithmetic. */
 static inline __attribute__((always_inline))
 uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
     uint32_t rel = addr - s->writable.base;
-    if ((uint64_t)rel + n <= s->writable.len) return s->writable.ptr + rel;
+    if (rel < s->writable.len && n <= s->writable.len - rel) return s->writable.ptr + rel;
     if (write) return (uint8_t *)0;
     rel = addr - s->readonly.base;
-    if ((uint64_t)rel + n <= s->readonly.len) return s->readonly.ptr + rel;
+    if (rel < s->readonly.len && n <= s->readonly.len - rel) return s->readonly.ptr + rel;
     return (uint8_t *)0;
 }
 

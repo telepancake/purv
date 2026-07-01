@@ -54,7 +54,7 @@ typedef uint32_t (*RiscvEmulatorMemFn)(RiscvEmulatorState_t *state, int op,
 /* One memory region: host storage of `len` bytes holding the guest bytes at
  * [base, base + len). ptr == NULL (len 0) means the region is unmapped. Each region
  * is self-describing (carries its own base), so a translation is one bounded check
- * -- (uint64_t)(addr - base) + n <= len -- with no per-access base arithmetic. */
+ * -- rel = addr - base; rel < len && n <= len - rel -- with no per-access base math. */
 typedef struct {
     uint8_t *ptr;
     uint32_t len;
@@ -110,7 +110,7 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *state,
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint64_t max);
 
 /* (To read or write guest memory from outside the engine, test the two regions:
- * rel = addr - region.base; if ((uint64_t)rel + n <= region.len) it is region.ptr +
- * rel. Try `writable` first, then `readonly`.) */
+ * rel = addr - region.base; if (rel < region.len && n <= region.len - rel) it is
+ * region.ptr + rel. Try `writable` first, then `readonly`.) */
 
 #endif /* PURV_H_ */
