@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 #
-# pvcc - build C/H sources into a purva image in one command.
+# pvcc - build C/C++/asm sources into a purva image in one command.
 #
 #   pvcc foo.c bar.c -o foo.img              link as a program (needs _start)
+#   pvcc foo.cpp -o foo.img                  C++ sources compile with clang++ and
+#                                              the freestanding C++ flags below
+#                                              (-fno-rtti -fno-exceptions)
 #   pvcc fn.c --lib -o fn.img                link as a library (no _start; entry=0,
 #                                              call functions directly via --invoke)
 #
@@ -19,8 +22,12 @@ LD_SCRIPT="$HERE/purva.ld"
 TRANSCODE="$HERE/transcode"
 
 GUESTCC="${GUESTCC:-clang}"
+GUESTCXX="${GUESTCXX:-clang++}"
 GUEST_ARCH="--target=riscv32 -march=rv32im -mabi=ilp32"
 GUEST_CFLAGS="-ffreestanding -nostdlib -fno-builtin -fno-stack-protector -O2"
+# C++ adds the freestanding-C++ flavour: no RTTI and no exceptions (both pull in
+# runtime support this bare-metal target has no library for).
+GUEST_CXXFLAGS="$GUEST_CFLAGS -fno-rtti -fno-exceptions"
 RVLD="${RVLD:-ld.lld}"
 
 die() { echo "pvcc: $*" >&2; exit 2; }
@@ -38,7 +45,7 @@ while [ $# -gt 0 ]; do
     -h|--help)
       sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
-    *.c|*.S) sources+=("$1"); shift ;;
+    *.c|*.S|*.cc|*.cpp|*.cxx|*.c++|*.C) sources+=("$1"); shift ;;
     *) extra_cflags+=("$1"); shift ;;     # pass through -I/-D/-f.../-W... etc.
   esac
 done
@@ -50,8 +57,14 @@ trap 'rm -rf "$work"' EXIT
 objs=()
 for src in "${sources[@]}"; do
   obj="$work/$(basename "$src").o"
-  $GUESTCC $GUEST_ARCH $GUEST_CFLAGS "${extra_cflags[@]}" -c "$src" -o "$obj" \
-    || die "compile failed: $src"
+  case "$src" in
+    *.cc|*.cpp|*.cxx|*.c++|*.C)
+      $GUESTCXX $GUEST_ARCH $GUEST_CXXFLAGS "${extra_cflags[@]}" -c "$src" -o "$obj" \
+        || die "compile failed: $src" ;;
+    *)
+      $GUESTCC $GUEST_ARCH $GUEST_CFLAGS "${extra_cflags[@]}" -c "$src" -o "$obj" \
+        || die "compile failed: $src" ;;
+  esac
   objs+=("$obj")
 done
 
