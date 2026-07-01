@@ -75,6 +75,7 @@ enum {
     RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,
     RISCV_OP_SPILL2,        /* fused store-pair (peephole-only; decode() never emits it directly) */
     RISCV_OP_AUIPC_ABS,     /* auipc with a baked absolute value (see below; also peephole-only) */
+    RISCV_OP_LOOP,          /* basic-block loop (post-pass; replaces a backward conditional branch) */
     RISCV_OP_COUNT
 };
 
@@ -117,6 +118,12 @@ enum {
 #define TC_JOFF(w)  ((int32_t)(((w) & 0x1fffffu) << 11) >> 11)    /* 21-bit signed */
 #define TC_UIMM(w)  ((w) & 0xfffffu)                              /* 20-bit upper  */
 #define TC_OFF11(w) ((int32_t)(((w) & 0x7ffu) << 21) >> 21)       /* 11-bit signed (SPILL2) */
+
+/* LOOP encoding:  op[31:26] | rd[25:21] | rs1[20:16] | imm[15:0]
+ * rd  = first condition register  (TC_A)
+ * rs1 = second condition register (TC_B)
+ * imm[7:0]  = body_len (op words BEFORE this LOOP op that form the body)
+ * imm[11:8] = btype    (original_branch_op - RISCV_OP_BEQ; 0=beq..5=bgeu) */
 
 /* A transcoded program: just the op array and how far the code runs. ops[pc>>2] is
  * a SHORTCUT that only holds when nothing has fused -- see the header note above.

@@ -272,6 +272,90 @@ uint32_t *transcode_map(const uint8_t *code, uint32_t len, uint32_t *n_ops_out) 
     return transcode_map_ex(code, len, NULL, n_ops_out);
 }
 
+/* ---- post-pass: fuse basic-block loops ----
+ *
+ * Scans the EMITTED op array for backward conditional branches whose body
+ * (every op between the target and the branch) contains only "simple" ops:
+ * ALU, loads, stores, MUL/DIV, LUI, AUIPC, AUIPC_ABS, NOP, SPILL2, and
+ * forward conditional branches that stay within the body or exit past it.
+ * No JAL, JALR, ECALL, EBREAK, ILLEGAL, no backward branches inside the
+ * body, no external jump targets landing in the body interior.
+ *
+ * A qualifying backward branch is rewritten IN-PLACE to RISCV_OP_LOOP.
+ * The body ops stay untouched -- the evaluator's LOOP handler interprets
+ * them directly via an inner switch. */
+static int is_loop_body_op(uint8_t op) {
+    if (op == RISCV_OP_JAL || op == RISCV_OP_JALR) return 0;
+    if (op >= RISCV_OP_ECALL && op <= RISCV_OP_ILLEGAL) return 0;
+    if (op == RISCV_OP_LOOP) return 0;
+    return op < RISCV_OP_COUNT;
+}
+
+static void fuse_loops(uint32_t *ops, uint32_t n) {
+    /* Collect all branch/jal targets so we can reject bodies with interior targets. */
+    uint8_t *is_target = calloc((size_t)n, 1);
+    if (!is_target) return;
+    for (uint32_t i = 0; i < n; ) {
+        uint8_t op = TC_OP(ops[i]);
+        if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
+            int32_t delta = TC_IMM(ops[i]) >> 2;
+            int32_t t = (int32_t)i + delta;
+            if (t >= 0 && (uint32_t)t < n) is_target[t] = 1;
+        } else if (op == RISCV_OP_JAL) {
+            int32_t delta = TC_JOFF(ops[i]) >> 2;
+            int32_t t = (int32_t)i + delta;
+            if (t >= 0 && (uint32_t)t < n) is_target[t] = 1;
+        }
+        i += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+    }
+
+    for (uint32_t i = 0; i < n; ) {
+        uint8_t op = TC_OP(ops[i]);
+        if (!(op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU)) {
+            i += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+            continue;
+        }
+        int32_t delta = TC_IMM(ops[i]) >> 2;
+        if (delta >= 0) { i++; continue; }                    /* forward branch */
+
+        int32_t hdr = (int32_t)i + delta;
+        if (hdr < 0) { i++; continue; }
+        uint32_t body_len = i - (uint32_t)hdr;
+        if (body_len == 0 || body_len > 255) { i++; continue; }
+
+        /* Check body: all ops must be loop-safe, branches must be forward and contained. */
+        int ok = 1;
+        for (uint32_t j = (uint32_t)hdr; j < i; ) {
+            uint8_t bop = TC_OP(ops[j]);
+            if (!is_loop_body_op(bop)) { ok = 0; break; }
+            if (bop >= RISCV_OP_BEQ && bop <= RISCV_OP_BGEU) {
+                int32_t bd = TC_IMM(ops[j]) >> 2;
+                if (bd <= 0) { ok = 0; break; }               /* backward = nested loop */
+                int32_t bt = (int32_t)j + bd;
+                if (bt < hdr || bt > (int32_t)i + 1) { ok = 0; break; } /* escapes */
+            }
+            j += (bop == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+        }
+        if (!ok) { i++; continue; }
+
+        /* No exterior jump targets in the body interior. */
+        int interior = 0;
+        for (uint32_t j = (uint32_t)hdr + 1; j < i; j++) {
+            if (is_target[j]) { interior = 1; break; }
+        }
+        if (interior) { i++; continue; }
+
+        /* Rewrite the backward branch to LOOP. */
+        uint32_t btype = op - RISCV_OP_BEQ;
+        uint32_t rs1 = TC_A(ops[i]);
+        uint32_t rs2 = TC_B(ops[i]);
+        ops[i] = ((uint32_t)RISCV_OP_LOOP << 26) | (rs1 << 21) |
+                 (rs2 << 16) | (btype << 8) | body_len;
+        i++;
+    }
+    free(is_target);
+}
+
 void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ext, Transcoded *out) {
     Targets targets = collect_targets(code, len, ext);
     uint32_t n_ops;
@@ -293,6 +377,7 @@ void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ex
     }
     free(map);
     targets_free(&targets);
+    fuse_loops(out->ops, out->n_ops);
 }
 
 void transcode(const uint8_t *code, uint32_t len, Transcoded *out) {
