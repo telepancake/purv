@@ -260,13 +260,17 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * slots -- 1 (this op) + one per saved register -- into the body. */
     h_prologue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
-        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2], m = rmask, pi = 0;
+        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];
         uint8_t *q = mem_xlate(s, sp0 - 4 * cnt, 4 * cnt, 1);      /* one xlate for the whole block */
         if (q) {
-            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1;
-                st32(q + 4 * (cnt - 1 - pi), s->x[rank2reg[r]]); pi++; }   /* ra (lowest rank) highest slot */
+            q += 4 * cnt;                                          /* one past the top slot */
+            /* rank order ra,s0,s1,s2..s11 -> descending slots; q steps down only on a set bit. */
+            #define SAVE(bit, reg) if (rmask & (1u << (bit))) { q -= 4; st32(q, s->x[(reg)]); }
+            SAVE(0,1) SAVE(1,8) SAVE(2,9) SAVE(3,18) SAVE(4,19) SAVE(5,20) SAVE(6,21)
+            SAVE(7,22) SAVE(8,23) SAVE(9,24) SAVE(10,25) SAVE(11,26) SAVE(12,27)
+            #undef SAVE
         } else {                                                  /* off-stack fallback: per-reg */
-            uint32_t addr = sp0;
+            uint32_t addr = sp0, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_xlate(s, addr, 4, 1);
                 if (qq) st32(qq, v); else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, v); }
@@ -280,13 +284,16 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * checks the budget, exactly as the unfused sequence did. */
     h_epilogue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
-        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2], m = rmask, pi = 0;
+        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];
         uint8_t *q = mem_xlate(s, sp0 + frame - 4 * cnt, 4 * cnt, 0);   /* one xlate for the whole block */
         if (q) {
-            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1;
-                s->x[rank2reg[r]] = ld32(q + 4 * (cnt - 1 - pi)); pi++; }
+            q += 4 * cnt;
+            #define REST(bit, reg) if (rmask & (1u << (bit))) { q -= 4; s->x[(reg)] = ld32(q); }
+            REST(0,1) REST(1,8) REST(2,9) REST(3,18) REST(4,19) REST(5,20) REST(6,21)
+            REST(7,22) REST(8,23) REST(9,24) REST(10,25) REST(11,26) REST(12,27)
+            #undef REST
         } else {                                                       /* off-stack fallback: per-reg */
-            uint32_t addr = sp0 + frame;
+            uint32_t addr = sp0 + frame, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint8_t *qq = mem_xlate(s, addr, 4, 0);
                 s->x[rank2reg[r]] = qq ? ld32(qq) : (s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0); }
