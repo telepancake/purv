@@ -272,22 +272,27 @@ uint32_t *transcode_map(const uint8_t *code, uint32_t len, uint32_t *n_ops_out) 
     return transcode_map_ex(code, len, NULL, n_ops_out);
 }
 
-/* ---- post-pass: fuse basic-block loops ----
+/* ---- post-pass: fuse guarded basic-block loops ----
  *
- * Scans the EMITTED op array for backward conditional branches whose body
- * (every op between the target and the branch) contains only "simple" ops:
- * ALU, loads, stores, MUL/DIV, LUI, AUIPC, AUIPC_ABS, NOP, SPILL2, and
- * forward conditional branches that stay within the body or exit past it.
- * No JAL, JALR, ECALL, EBREAK, ILLEGAL, no backward branches inside the
- * body, no external jump targets landing in the body interior.
+ * Scans the EMITTED op array for a backward conditional branch (the "back"
+ * edge) whose body -- every op between its target and itself -- contains only
+ * "simple" ops: ALU, loads, stores, MUL/DIV, LUI, AUIPC, AUIPC_ABS, NOP,
+ * SPILL2, and forward conditional branches that stay within the body or exit
+ * just past it. No JAL, JALR, ECALL, EBREAK, ILLEGAL, no backward branches
+ * inside the body, no external jump targets landing in the body interior.
  *
- * A qualifying backward branch is rewritten IN-PLACE to RISCV_OP_LOOP.
- * The body ops stay untouched -- the evaluator's LOOP handler interprets
- * them directly via an inner switch. */
+ * Fusion also requires a matching GUARD: the op immediately above the body
+ * must be a forward conditional branch that is the inverse of the back edge,
+ * over the same two registers, targeting the instruction just past the back
+ * edge. That is the exact shape a compiler emits for a while/for loop whose
+ * trip count may be zero. When present, the guard slot becomes RISCV_OP_LOOP
+ * and the back-edge slot becomes RISCV_OP_LOOPEND (both carrying the back
+ * edge's test); the body between them is left untouched and runs through the
+ * normal dispatch. See transcode.h for the runtime contract. */
 static int is_loop_body_op(uint8_t op) {
     if (op == RISCV_OP_JAL || op == RISCV_OP_JALR) return 0;
     if (op >= RISCV_OP_ECALL && op <= RISCV_OP_ILLEGAL) return 0;
-    if (op == RISCV_OP_LOOP) return 0;
+    if (op == RISCV_OP_LOOP || op == RISCV_OP_LOOPEND) return 0;
     return op < RISCV_OP_COUNT;
 }
 
@@ -319,9 +324,19 @@ static void fuse_loops(uint32_t *ops, uint32_t n) {
         if (delta >= 0) { i++; continue; }                    /* forward branch */
 
         int32_t hdr = (int32_t)i + delta;
-        if (hdr < 0) { i++; continue; }
+        if (hdr < 1) { i++; continue; }                       /* need a slot above for the guard */
+        if (i + 1 >= n) { i++; continue; }                    /* need a real "past" slot below   */
         uint32_t body_len = i - (uint32_t)hdr;
         if (body_len == 0 || body_len > 255) { i++; continue; }
+
+        /* Matching guard directly above the body: forward branch, inverse test,
+         * same registers, targeting the instruction just past the back edge. */
+        uint32_t gi = (uint32_t)hdr - 1;
+        uint8_t gop = TC_OP(ops[gi]);
+        if (!(gop >= RISCV_OP_BEQ && gop <= RISCV_OP_BGEU)) { i++; continue; }
+        if (gop != (op ^ 1)) { i++; continue; }               /* inverse condition */
+        if (TC_A(ops[gi]) != TC_A(ops[i]) || TC_B(ops[gi]) != TC_B(ops[i])) { i++; continue; }
+        if ((int32_t)gi + (TC_IMM(ops[gi]) >> 2) != (int32_t)i + 1) { i++; continue; } /* skips to past */
 
         /* Check body: all ops must be loop-safe, branches must be forward and contained. */
         int ok = 1;
@@ -345,12 +360,14 @@ static void fuse_loops(uint32_t *ops, uint32_t n) {
         }
         if (interior) { i++; continue; }
 
-        /* Rewrite the backward branch to LOOP. */
+        /* Guard slot -> LOOP, back-edge slot -> LOOPEND; both carry the back edge's
+         * test (registers + btype) and the body length between them. */
         uint32_t btype = op - RISCV_OP_BEQ;
         uint32_t rs1 = TC_A(ops[i]);
         uint32_t rs2 = TC_B(ops[i]);
-        ops[i] = ((uint32_t)RISCV_OP_LOOP << 26) | (rs1 << 21) |
-                 (rs2 << 16) | (btype << 8) | body_len;
+        uint32_t enc = (rs1 << 21) | (rs2 << 16) | (btype << 8) | body_len;
+        ops[gi] = ((uint32_t)RISCV_OP_LOOP    << 26) | enc;
+        ops[i]  = ((uint32_t)RISCV_OP_LOOPEND << 26) | enc;
         i++;
     }
     free(is_target);

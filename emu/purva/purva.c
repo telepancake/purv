@@ -80,6 +80,20 @@ uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int
 
 static int32_t sext(uint32_t v, int bits) { int sh = 32 - bits; return (int32_t)(v << sh) >> sh; }
 
+/* The loop test shared by LOOP and LOOPEND: btype is (branch_op - RISCV_OP_BEQ),
+ * so 0=beq..5=bgeu, matching h_beq..h_bgeu. */
+static inline __attribute__((always_inline))
+int loop_cond(uint32_t btype, uint32_t va, uint32_t vb) {
+    switch (btype) {
+    case 0:  return va == vb;
+    case 1:  return va != vb;
+    case 2:  return (int32_t)va <  (int32_t)vb;
+    case 3:  return (int32_t)va >= (int32_t)vb;
+    case 4:  return va <  vb;
+    default: return va >= vb;
+    }
+}
+
 static const Transcoded *g_prog;
 
 void RiscvEmulatorSetProgram(const Transcoded *prog) { g_prog = prog; }
@@ -111,7 +125,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_LUI] = &&h_lui, [RISCV_OP_AUIPC] = &&h_auipc, [RISCV_OP_NOP] = &&h_nop,
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
         [RISCV_OP_SPILL2] = &&h_spill2, [RISCV_OP_AUIPC_ABS] = &&h_auipc_abs,
-        [RISCV_OP_LOOP] = &&h_loop,
+        [RISCV_OP_LOOP] = &&h_loop, [RISCV_OP_LOOPEND] = &&h_loopend,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -247,20 +261,24 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_auipc_abs: wr(s, TC_A(w), p[1]); k++; p += 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     h_nop:   NEXT();
 
+    /* Loop head (sits at the old guard slot, one op above the body). Test holds:
+     * fall into the body. Test fails: skip the body AND the LOOPEND below it,
+     * landing on `past`. Body and LOOPEND are blen and 1 op away respectively, so
+     * past is blen+2 ops ahead. */
     h_loop: {
-        uint32_t btype = (w >> 8) & 0xf;
-        uint32_t va = s->x[TC_A(w)], vb = s->x[TC_B(w)];
-        int cond;
-        switch (btype) {
-        case 0: cond = (va == vb); break;
-        case 1: cond = (va != vb); break;
-        case 2: cond = ((int32_t)va <  (int32_t)vb); break;
-        case 3: cond = ((int32_t)va >= (int32_t)vb); break;
-        case 4: cond = (va <  vb); break;
-        default: cond = (va >= vb); break;
+        if (loop_cond((w >> 8) & 0xf, s->x[TC_A(w)], s->x[TC_B(w)])) NEXT();
+        k++; p += (w & 0xff) + 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+    }
+    /* Loop tail (sits at the old backward-branch slot, one op below the body).
+     * Test holds: jump back to the body start, blen ops above. Test fails: fall
+     * through to `past`. No RELOC/budget check -- a fused loop is not interruptible
+     * mid-iteration; it runs to completion (or until a syscall/jalr in the body
+     * returns), by design (see the discussion of instruction counting). */
+    h_loopend: {
+        if (loop_cond((w >> 8) & 0xf, s->x[TC_A(w)], s->x[TC_B(w)])) {
+            k++; p -= (w & 0xff); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
         }
-        if (!cond) NEXT();
-        RELOC((uint32_t)(p - base) - (w & 0xff));
+        NEXT();
     }
 
     h_trap: {
