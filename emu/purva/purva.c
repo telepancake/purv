@@ -45,6 +45,9 @@ static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i]
 static inline __attribute__((always_inline)) void st32(uint8_t *q, uint32_t v) {
     q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24);
 }
+static inline __attribute__((always_inline)) uint32_t ld32(const uint8_t *q) {
+    return (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24;
+}
 
 /* Instructions fetch ONLY from region[RISCV_CODE] (via g_prog/the op cursor below,
  * never through here). A data access -- load OR store -- must NEVER reach it:
@@ -257,13 +260,16 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * slots -- 1 (this op) + one per saved register -- into the body. */
     h_prologue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
-        uint32_t sp0 = s->x[2], addr = sp0, cnt = 0;
-        for (uint32_t r = 0; r < 13; r++) if (rmask & (1u << r)) {
-            addr -= 4;
-            uint32_t v = s->x[rank2reg[r]];
-            uint8_t *q = mem_xlate(s, addr, 4, 1);
-            if (q) st32(q, v); else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, v);
-            cnt++;
+        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2], m = rmask, pi = 0;
+        uint8_t *q = mem_xlate(s, sp0 - 4 * cnt, 4 * cnt, 1);      /* one xlate for the whole block */
+        if (q) {
+            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1;
+                st32(q + 4 * (cnt - 1 - pi), s->x[rank2reg[r]]); pi++; }   /* ra (lowest rank) highest slot */
+        } else {                                                  /* off-stack fallback: per-reg */
+            uint32_t addr = sp0;
+            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
+                uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_xlate(s, addr, 4, 1);
+                if (qq) st32(qq, v); else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, v); }
         }
         s->x[2] = sp0 - frame;
         k += cnt + 1; p += cnt + 1; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
@@ -274,13 +280,16 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * checks the budget, exactly as the unfused sequence did. */
     h_epilogue: {
         uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
-        uint32_t sp0 = s->x[2], addr = sp0 + frame, cnt = 0;
-        for (uint32_t r = 0; r < 13; r++) if (rmask & (1u << r)) {
-            addr -= 4;
-            uint8_t *q = mem_xlate(s, addr, 4, 0);
-            s->x[rank2reg[r]] = q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24)
-                                  : (s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0);
-            cnt++;
+        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2], m = rmask, pi = 0;
+        uint8_t *q = mem_xlate(s, sp0 + frame - 4 * cnt, 4 * cnt, 0);   /* one xlate for the whole block */
+        if (q) {
+            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1;
+                s->x[rank2reg[r]] = ld32(q + 4 * (cnt - 1 - pi)); pi++; }
+        } else {                                                       /* off-stack fallback: per-reg */
+            uint32_t addr = sp0 + frame;
+            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
+                uint8_t *qq = mem_xlate(s, addr, 4, 0);
+                s->x[rank2reg[r]] = qq ? ld32(qq) : (s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0); }
         }
         s->x[2] = sp0 + frame;
         uint32_t t = s->x[1] & ~1u; k += cnt + 2;
