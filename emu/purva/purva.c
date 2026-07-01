@@ -23,14 +23,16 @@ int g_itrace;              /* TEMP debug: per-instruction register trace */
 unsigned long g_icount;    /* TEMP debug: running instruction counter for trace labels */
 uint32_t g_watch;          /* TEMP debug: store-address watchpoint, 0 = off */
 
-static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
+static inline __attribute__((always_inline))
+void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
     fprintf(stderr, "I%lu op=%u@%u(pc=%u)", g_icount++, TC_OP(*p), (unsigned)(p - base), (unsigned)(p - base) * 4);
     for (int i = 0; i < 32; i++) fprintf(stderr, " x%d=%x", i, s->x[i]);
     fprintf(stderr, "\n");
 }
 #define TRACE_STEP() do { if (g_itrace) trace_dump(s, p, base); } while (0)
 
-static void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i] = v; }
+static inline __attribute__((always_inline))
+void wr(RiscvEmulatorState_t *s, uint32_t i, uint32_t v) { if (i) s->x[i] = v; }
 
 /* A single 4-byte store, written the same way h_sw's does (GCC reliably folds this
  * exact shape into one unaligned mov). The fused prologue handler calls it once per
@@ -85,12 +87,24 @@ static const Transcoded *g_prog;
 void RiscvEmulatorSetProgram(const Transcoded *prog) { g_prog = prog; }
 
 __attribute__((optimize("no-gcse", "no-crossjumping")))
-uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
+uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s_in, uint64_t max) {
     const Transcoded *prog = g_prog;
     if (!prog) return 0;
     uint32_t *base = prog->ops, clen = prog->code_len;
-    uint32_t pc = s->pc;
+    uint32_t pc = s_in->pc;
     if (pc >= clen) return 0;                                  /* resume pc outside code */
+
+    /* Non-escaping local copy of the whole state for the hot loop. Because &st never
+     * reaches an opaque call (mem_xlate/wr/trace_dump are always_inline; ecall and the
+     * OOB callbacks are handed s_in, never &st), the compiler can prove that guest
+     * memory stores -- uint8_t writes, which legally alias every type -- cannot touch
+     * st, so it keeps the register file and region bounds alias-free instead of
+     * reloading them across every guest store. st is flushed to *s_in before every
+     * return and before any host call, and reloaded after a serviced ecall (which
+     * mutates guest registers). */
+    RiscvEmulatorState_t st = *s_in;
+    RiscvEmulatorState_t *const s = &st;
+    #define FLUSH() (*s_in = st)
 
     static const void *const tbl[RISCV_OP_COUNT] = {
         [RISCV_OP_ADD] = &&h_add, [RISCV_OP_SLL] = &&h_sll, [RISCV_OP_SLT] = &&h_slt,
@@ -122,7 +136,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     #define NEXT() do { k++; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
     /* Jump to op index `idx`: count it, budget-check (resume pc = idx<<2), relocate. */
     #define RELOC(idx) do { uint32_t i_ = (idx); k++; \
-        if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
+        if (k >= max) { s->pc = i_ << 2; FLUSH(); return k; } p = base + i_; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
 
     TRACE_STEP();
     goto *tbl[TC_OP(w)];
@@ -162,40 +176,40 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_lb: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
                 wr(s, rd, q ? (uint32_t)(int32_t)(int8_t)q[0]
-                            : (uint32_t)sext(s->callback(s, RISCV_MEM_LOAD, ad, 0), 8)); } }
+                            : (uint32_t)sext((FLUSH(), s_in->callback(s_in, RISCV_MEM_LOAD, ad, 0)), 8)); } }
           NEXT();
     h_lh: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
                 wr(s, rd, q ? (uint32_t)(int32_t)(int16_t)(q[0] | q[1] << 8)
-                            : (uint32_t)sext(s->callback(s, RISCV_MEM_LOAD, ad, 0), 16)); } }
+                            : (uint32_t)sext((FLUSH(), s_in->callback(s_in, RISCV_MEM_LOAD, ad, 0)), 16)); } }
           NEXT();
     h_lw: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 4, 0);
                 wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24)
-                            : (s->callback(s, RISCV_MEM_LOAD, ad, 0))); } }
+                            : ((FLUSH(), s_in->callback(s_in, RISCV_MEM_LOAD, ad, 0)))); } }
           NEXT();
     h_lbu: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
-                wr(s, rd, q ? q[0] : ((s->callback(s, RISCV_MEM_LOAD, ad, 0)) & 0xff)); } }
+                wr(s, rd, q ? q[0] : (((FLUSH(), s_in->callback(s_in, RISCV_MEM_LOAD, ad, 0))) & 0xff)); } }
           NEXT();
     h_lhu: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
                 wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8)
-                            : ((s->callback(s, RISCV_MEM_LOAD, ad, 0)) & 0xffff)); } }
+                            : (((FLUSH(), s_in->callback(s_in, RISCV_MEM_LOAD, ad, 0))) & 0xffff)); } }
           NEXT();
 
     h_sb: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 1, 1);
-            if (q) q[0] = (uint8_t)b; else s->callback(s, RISCV_MEM_STORE, ad, b); }
+            if (q) q[0] = (uint8_t)b; else (FLUSH(), s_in->callback(s_in, RISCV_MEM_STORE, ad, b)); }
           NEXT();
     h_sh: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 2, 1);
-            if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); } else s->callback(s, RISCV_MEM_STORE, ad, b); }
+            if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); } else (FLUSH(), s_in->callback(s_in, RISCV_MEM_STORE, ad, b)); }
           NEXT();
     h_sw: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 4, 1);
             extern uint32_t g_watch;
             if (g_watch && ad == g_watch)
                 fprintf(stderr, "WATCH sw ad=0x%x val=0x%x at op-idx=%u (pc=%u)\n", ad, b, (unsigned)(p - base), (unsigned)(p - base) * 4);
             if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); q[2] = (uint8_t)(b >> 16); q[3] = (uint8_t)(b >> 24); }
-            else s->callback(s, RISCV_MEM_STORE, ad, b); }
+            else (FLUSH(), s_in->callback(s_in, RISCV_MEM_STORE, ad, b)); }
           NEXT();
 
     h_beq:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a == b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
@@ -208,7 +222,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_jal:  { uint32_t idx = (uint32_t)(p - base); wr(s, TC_A(w), (idx << 2) + 4);
               RELOC(idx + (uint32_t)(TC_JOFF(w) >> 2)); }
     h_jalr: { uint32_t t = (s->x[TC_B(w)] + TC_IMM(w)) & ~1u; wr(s, TC_A(w), ((uint32_t)(p - base) << 2) + 4); k++;
-              if (t >= clen || k >= max) { s->pc = t; return k; }
+              if (t >= clen || k >= max) { s->pc = t; FLUSH(); return k; }
               p = base + (t >> 2); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; }
 
     h_lui:   wr(s, TC_A(w), TC_UIMM(w) << 12); NEXT();
@@ -240,7 +254,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t addr = sp0, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_xlate(s, addr, 4, 1);
-                if (qq) st32(qq, v); else s->callback(s, RISCV_MEM_STORE, addr, v); }
+                if (qq) st32(qq, v); else (FLUSH(), s_in->callback(s_in, RISCV_MEM_STORE, addr, v)); }
         }
         s->x[2] = sp0 - frame;
         k += cnt + 1; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
@@ -263,11 +277,11 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t addr = sp0 + frame, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint8_t *qq = mem_xlate(s, addr, 4, 0);
-                s->x[rank2reg[r]] = qq ? ld32(qq) : s->callback(s, RISCV_MEM_LOAD, addr, 0); }
+                s->x[rank2reg[r]] = qq ? ld32(qq) : (FLUSH(), s_in->callback(s_in, RISCV_MEM_LOAD, addr, 0)); }
         }
         s->x[2] = sp0 + frame;
         uint32_t t = s->x[1] & ~1u; k += cnt + 2;
-        if (t >= clen || k >= max) { s->pc = t; return k; }
+        if (t >= clen || k >= max) { s->pc = t; FLUSH(); return k; }
         p = base + (t >> 2); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     }
 
@@ -275,15 +289,18 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         uint32_t pc_ = (uint32_t)(p - base) << 2;
         uint8_t op = TC_OP(w);
         s->pc = pc_; s->inst = w; k++;     /* inst is OUR packed op word, not raw RISC-V */
-        int stop = (op == RISCV_OP_ECALL)  ? (s->ecall   ? s->ecall(s)   : 0)
-                 : (op == RISCV_OP_EBREAK) ? (s->ebreak  ? s->ebreak(s)  : 1)
-                 :                           (s->illegal ? s->illegal(s) : 1);
-        if (stop) return k;
-        if (k >= max) { s->pc = pc_ + 4; return k; }          /* serviced syscall: resume */
+        FLUSH();                           /* host handler works on *s_in, never &st */
+        int stop = (op == RISCV_OP_ECALL)  ? (s_in->ecall   ? s_in->ecall(s_in)   : 0)
+                 : (op == RISCV_OP_EBREAK) ? (s_in->ebreak  ? s_in->ebreak(s_in)  : 1)
+                 :                           (s_in->illegal ? s_in->illegal(s_in) : 1);
+        st = *s_in;                        /* reload: a serviced ecall mutates guest regs */
+        if (stop) return k;                /* *s_in already holds the final state */
+        if (k >= max) { s->pc = pc_ + 4; FLUSH(); return k; } /* serviced syscall: resume */
         w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
     }
     #undef NEXT
     #undef RELOC
+    #undef FLUSH
 }
 
 /* ------------------------------------------------------------------ init */
