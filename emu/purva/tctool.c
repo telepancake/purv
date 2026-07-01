@@ -254,12 +254,11 @@ static PcrelFixup *collect_pcrel_code_fixups(const Ehdr *eh, uint32_t code_len, 
     return out;
 }
 
-/* Re-encode each pair for the pc-to-pc displacement between the auipc (its op-
- * index, always correct as-is) and the target (resolved through the same map
- * patch_rela uses). Standard hi20/lo12 split when the auipc is still the cheap
- * 1-word form; if drift already forced it to the 2-word baked AUIPC_ABS, the
- * full target fits in that second word directly and the paired instruction
- * contributes nothing. */
+/* Re-encode each pair for the op-space displacement between the auipc (at its own op
+ * index at_hi) and the target (at_sym, resolved through the same map patch_rela uses):
+ * a standard hi20/lo12 split against at_hi*4. The runtime auipc adds uimm<<12 to its
+ * live op CURSOR (== at_hi*4), so this is correct however much fusion drifted the stream
+ * -- the displacement is measured in the same op space the cursor walks. */
 static void apply_pcrel_code_fixups(const PcrelFixup *fx, uint32_t n, const uint32_t *map, uint32_t *ops) {
     for (uint32_t i = 0; i < n; i++) {
         uint32_t at_hi = map[fx[i].hi_off >> 1], at_lo = map[fx[i].lo_off >> 1],
@@ -281,16 +280,49 @@ static void apply_pcrel_code_fixups(const PcrelFixup *fx, uint32_t n, const uint
         int32_t target_pc = (int32_t)(at_sym * 4) + fx[i].addend;   /* an addend is just an offset, same in either pc space */
         int32_t delta = target_pc - (int32_t)(at_hi * 4);
         uint8_t hi_op = TC_OP(ops[at_hi]);
-        if (hi_op == RISCV_OP_AUIPC) {
-            int32_t hi20 = (delta + 0x800) >> 12, lo12 = delta - (hi20 << 12);
-            ops[at_hi] = (ops[at_hi] & ~0xfffffu) | ((uint32_t)hi20 & 0xfffffu);
-            ops[at_lo] = (ops[at_lo] & ~0xffffu) | ((uint32_t)lo12 & 0xffffu);
-        } else if (hi_op == RISCV_OP_AUIPC_ABS) {
-            ops[at_hi + 1] = (uint32_t)target_pc;      /* whole value in one word; lo12 adds nothing */
-            ops[at_lo] = ops[at_lo] & ~0xffffu;
-        } else {
+        if (hi_op != RISCV_OP_AUIPC) {
             fprintf(stderr, "transcode: pcrel fixup at 0x%x: op %u is not an auipc\n", fx[i].hi_off, hi_op);
             exit(2);
+        }
+        int32_t hi20 = (delta + 0x800) >> 12, lo12 = delta - (hi20 << 12);
+        ops[at_hi] = (ops[at_hi] & ~0xfffffu) | ((uint32_t)hi20 & 0xfffffu);
+        ops[at_lo] = (ops[at_lo] & ~0xffffu) | ((uint32_t)lo12 & 0xffffu);
+    }
+}
+
+/* Any auipc that materialises a DATA address is a load-immediate (the address is a
+ * fixed constant -- code is non-relocatable), so it should be an LI_LO/LI_HI, not an
+ * auipc that the runtime evaluates cursor-relative (that value drifts with fusion and
+ * there is no code fixup to correct a data auipc). transcode.c's step() rewrites the
+ * ones it can classify by value alone, but leaves a bare auipc for the few whose value
+ * sits in the ~2KB around 0 a code address could also occupy. Here -- with the exact
+ * symbol from the PCREL_HI20 relocation, so no ambiguity -- rewrite every remaining
+ * data auipc to the LI that loads its own constant `val`; its paired lo12 still adds
+ * its offset. (A data auipc step() already rewrote is not an auipc here, so skipped.) */
+static void resolve_data_auipc(const Ehdr *eh, uint32_t code_len, const uint32_t *map, uint32_t *ops) {
+    for (int i = 0; i < eh->e_shnum; i++) {
+        const Shdr *sh = shdr(eh, i);
+        if (sh->sh_type != SHT_RELA) continue;
+        const Shdr *symsh = shdr(eh, sh->sh_link);
+        const Sym  *syms = (const Sym *)(g_elf + symsh->sh_offset);
+        const Rela *relas = (const Rela *)(g_elf + sh->sh_offset);
+        uint32_t cnt = sh->sh_size / sizeof(Rela);
+        for (uint32_t j = 0; j < cnt; j++) {
+            if ((relas[j].r_info & 0xff) != R_RISCV_PCREL_HI20) continue;
+            if (syms[relas[j].r_info >> 8].st_value < code_len) continue;   /* code auipc: fixed elsewhere */
+            uint32_t hi_off = relas[j].r_offset, at = map[hi_off >> 1];
+            if (at == TC_SENTINEL || TC_OP(ops[at]) != RISCV_OP_AUIPC) continue;   /* already an LI, or not a slot start */
+            uint32_t rd = (ops[at] >> 21) & 31, val = hi_off + ((ops[at] & 0xfffffu) << 12);
+            int32_t s0 = (int32_t)val, sh_ = (int32_t)(val - RISCV_HALF);
+            uint8_t op; uint32_t imm;
+            if (s0 > -(1 << 20) && s0 < (1 << 20))         { op = RISCV_OP_LI_LO; imm = val & 0x1fffffu; }
+            else if (sh_ > -(1 << 20) && sh_ < (1 << 20))  { op = RISCV_OP_LI_HI; imm = (val - RISCV_HALF) & 0x1fffffu; }
+            else {
+                fprintf(stderr, "transcode: data auipc at 0x%x -> 0x%x is >1MiB from both 0 and "
+                        "RISCV_HALF; too far for a 21-bit load-immediate\n", hi_off, val);
+                exit(2);
+            }
+            ops[at] = ((uint32_t)op << 26) | rd << 21 | imm;
         }
     }
 }
@@ -438,8 +470,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "TCVERIFY: first mismatch at off=0x%x: map=%u walked_at=%u\n", off, mapped, at);
                 break;
             }
-            uint8_t op = (uint8_t)(prog.ops[at] >> 26);
-            at += (op == RISCV_OP_AUIPC_ABS) ? 2 : 1;
+            at += 1;                                  /* every emitted op is one word */
         }
     }
 
@@ -457,6 +488,10 @@ int main(int argc, char **argv) {
      * address as data (see collect_pcrel_code_fixups) for the pc-to-pc
      * displacement it actually needs, now that the map exists. */
     apply_pcrel_code_fixups(fixups, n_fixups, map, prog.ops);
+
+    /* 4. rewrite any DATA auipc step() left bare (the near-zero ambiguous few) into the
+     * load-immediate it really is, now that the relocation gives its exact symbol. */
+    resolve_data_auipc(eh, code_len, map, prog.ops);
 
     Image img = {0};
     img.code_size   = prog.n_ops * 4;

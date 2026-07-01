@@ -21,11 +21,14 @@
  *   jal              op[31:26] rd[25:21]  disp[20:0]              (byte displacement)
  *   jalr             op[31:26] rd[25:21] rs1[20:16] imm[15:0]
  *   lui / auipc      op[31:26] rd[25:21]  uimm20[19:0]
+ *   li_lo / li_hi    op[31:26] rd[25:21]  imm[20:0]              (21-bit signed value)
  *   nop / ecall / ebreak / illegal   op[31:26]
  *   prologue / epilogue (fused)      op[31:26] regmask[25:13] frame[12:0]
  *
- * (auipc is its own op -- it needs the live pc, which the evaluator has -- so unlike
- * a baked absolute it fits one word. lui keeps only the 20-bit upper immediate.)
+ * (auipc is its own op -- it computes from the evaluator's live op cursor, so it fits
+ * one word; it survives only for CODE addresses, tctool re-encoding its uimm in op space.
+ * A DATA address is a constant and becomes a li_lo/li_hi load-immediate instead. lui
+ * keeps only the 20-bit upper immediate.)
  *
  * PROLOGUE/EPILOGUE fusion (see the encoding note below) collapses a function's frame
  * setup (`addi sp` + callee-saved stores) or teardown (callee-saved loads + `addi sp`
@@ -68,11 +71,10 @@ enum {
     RISCV_OP_JAL, RISCV_OP_JALR,
     RISCV_OP_LUI, RISCV_OP_AUIPC, RISCV_OP_NOP,
     RISCV_OP_ECALL, RISCV_OP_EBREAK, RISCV_OP_ILLEGAL,
-    RISCV_OP_AUIPC_ABS,     /* auipc with a baked absolute value (see below; peephole-only) */
     RISCV_OP_PROLOGUE,      /* fused frame-alloc + callee-saved register saves (peephole-only) */
     RISCV_OP_EPILOGUE,      /* fused callee-saved restores + frame-dealloc + ret (peephole-only) */
-    RISCV_OP_LI_LO,         /* rd = sext21(imm)              -- fused `la` near 0 (peephole-only) */
-    RISCV_OP_LI_HI,         /* rd = sext21(imm) + RISCV_HALF -- fused `la` near RISCV_HALF (peephole-only) */
+    RISCV_OP_LI_LO,         /* rd = sext21(imm)              -- data auipc/`la` near 0 (peephole-only) */
+    RISCV_OP_LI_HI,         /* rd = sext21(imm) + RISCV_HALF -- data auipc/`la` near RISCV_HALF (peephole-only) */
     RISCV_OP_COUNT
 };
 
@@ -95,38 +97,34 @@ enum {
  * frame:   frame size in bytes (the addi sp amount; <= 2047 in practice, 13 bits here).
  *
  * The whole run is ONE op word -- the collapsed instructions are removed during the
- * two passes, not left behind, so op-index falls behind pc/4 downstream (handled by
- * the auipc/auipc_abs upgrade below).
+ * two passes, not left behind, so op-index falls behind pc/4 downstream. That drift
+ * is invisible to the evaluator (it walks by op cursor, never by pc) and every op is
+ * still exactly one word wide, so nothing needs a drift-dependent form.
  * PROLOGUE: sp -= frame, do the stores, advance one op word into the body.
  * EPILOGUE: do the loads, sp += frame, return to ra (it never falls through). */
 
-/* RISCV_OP_AUIPC's runtime value (cursor*4 + uimm20<<12) is only correct as long as
- * op-index == pc/4 EVERYWHERE BEFORE this instruction -- the same invariant
- * prologue/epilogue fusion deliberately breaks once it's fired earlier in the stream
- * (fusion runs the op-index behind pc/4 for everything downstream of it). transcode_ex tracks
- * whether that drift has actually started by the time it reaches an auipc; if so,
- * it bakes the absolute value (computed from `off`, which the transcoder has and
- * the evaluator's cursor no longer reliably tracks) into a second word as
- * RISCV_OP_AUIPC_ABS rather than emitting the ordinary 1-word cursor-based
- * RISCV_OP_AUIPC.
+/* An auipc materialises `pc + uimm20<<12` into rd. Since code is non-relocatable that
+ * is always a compile-time CONSTANT (nothing here is truly pc-relative at run time):
  *
- * That baked value is safe unmodified for a data (rodata/rwdata) target because
- * neither region ever moves relative to code: they're separate regions (purv.h's
- * documented four-region layout -- code at [0, code.len), rodata growing down
- * from RISCV_HALF; see purva.ld and purva.c's mem_xlate), anchored to their own
- * fixed architectural boundaries rather than to "wherever code happens to end",
- * so fusion changing code's size can't move them.
+ *   DATA constant (the common case: the address half of a pc-relative load/store of a
+ *   global or rodata symbol) lands in a fixed data cluster -- just below 0 (rodata) or
+ *   near RISCV_HALF (globals) -- that no fusion ever moves. step() emits it as a one-
+ *   word LI_LO/LI_HI load-immediate, NOT an auipc; the lo12 load/store/addi that follows
+ *   adds its own offset on top. (The data lives in .rodata/.data; the auipc only forms a
+ *   POINTER to it -- "pc-relative" is how the linker encoded that pointer, not where the
+ *   data sits.)
  *
- * A CODE target is different: two positions in code can shift relative to each
- * other as fusion changes what's between them, so a value computed against one
- * position (the auipc's) isn't valid at another (the target's) -- an auipc
- * materializing a function pointer to store as data (`obj->method = someFunc;`,
- * as opposed to a static initializer, which is a link-time relocation and
- * already handled by patch_rela) needs the actual pc-to-pc displacement between
- * the two, not its own local value. tctool.c's collect_pcrel_code_fixups /
- * apply_pcrel_code_fixups do that: find the auipc+addi (or +load/store) pair via
- * the PCREL_HI20/LO12 relocations --emit-relocs keeps, and once the map exists,
- * re-encode both instructions for the real displacement. */
+ *   CODE constant (an auipc materialising a code address -- a function pointer stored as
+ *   data, or a far call target) is the target's op-index * 4. That is also a constant,
+ *   but it isn't known until the instruction->op map is built, so step() leaves a plain
+ *   1-word RISCV_OP_AUIPC and tctool fills the constant in a second pass
+ *   (apply_pcrel_code_fixups) once the map exists. The runtime handler computes from the
+ *   op CURSOR (its own op position, always exact), so tctool re-encoding the auipc's
+ *   uimm + the paired lo12 for the OP-space displacement makes it correct regardless of
+ *   how much fusion drifted the stream -- no baked-absolute form is needed. tctool finds
+ *   the auipc+addi (or +load/store/jalr) pair via the PCREL_HI20/LO12 relocations
+ *   --emit-relocs keeps. A function pointer in a static initializer is instead a link-
+ *   time R_RISCV_32 relocation, resolved through the map by patch_rela. */
 
 /* Packed-op field accessors. A/B/C are the three register slots; which register each
  * holds depends on the class (see the layout above), so handlers pick by name.

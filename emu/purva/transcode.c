@@ -111,12 +111,11 @@ static void decode(const uint8_t *code, uint32_t off, Dec *d) {
         d->op = RISCV_OP_NOP;
 }
 
-/* Output op words for an op: 2 for RISCV_OP_AUIPC_ABS (its baked absolute value
- * spills a second word -- see transcode.h), 0 for RISCV_OP_NOP (dropped during
- * translation -- it occupies no op slot), 1 for everything else, including a fused
- * SPILL2 (it covers 8 bytes of original code, but its consumed-byte count is
- * reported by try_fuse_spill2's return value, separate from this). */
-static int op_words(uint8_t op) { return op == RISCV_OP_AUIPC_ABS ? 2 : op == RISCV_OP_NOP ? 0 : 1; }
+/* Output op words for an op: 0 for RISCV_OP_NOP (dropped during translation -- it
+ * occupies no op slot), 1 for everything else (a fused prologue/epilogue/la covers
+ * several bytes of original code but still emits exactly one op word; its consumed-
+ * byte count is the fuse helper's return value, separate from this). */
+static int op_words(uint8_t op) { return op == RISCV_OP_NOP ? 0 : 1; }
 
 /* ---- target set: addresses that must keep their own op slot ---- */
 
@@ -276,21 +275,12 @@ static uint32_t try_fuse_la(const uint8_t *code, uint32_t len, uint32_t off,
 
 /* Decode (or fuse) the unit starting at `off`; returns the byte width consumed and
  * fills *d. Shared by build_map and transcode_ex's emit pass so they make the
- * identical decision -- both are pure functions of (code, len, off, at, targets).
- *
- * `at` is the op-word offset this unit will land at, tracked by the caller. If it
- * still equals off/4, no fusion has happened anywhere earlier in the stream, so
- * op-index == pc/4 holds and an auipc here is exactly as safe as it always was
- * (decode() already produced the ordinary 1-word RISCV_OP_AUIPC). Once at has
- * fallen behind off/4 (an earlier prologue/epilogue collapsed several instructions
- * into one op word), that identity is gone for everything downstream, including this
- * auipc -- so its cursor-based runtime value would be wrong, and step() upgrades it
- * to RISCV_OP_AUIPC_ABS, baking the real absolute value (off + uimm20<<12, using the
- * TRUE pc this function already has, not the drifted cursor the evaluator would have
- * at run time) into a second word (transcode.h has the full argument for why this is
- * safe: rodata is a separate region at its own fixed real address regardless of how
- * code transcoded, so the baked real address needs no further correction). */
-static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off, uint32_t at,
+ * identical decision -- both are pure functions of (code, len, off, targets). Every op
+ * it emits is exactly one op word wide (prologue/epilogue/la fusions collapse several
+ * instructions INTO one; a lone data auipc becomes one LI), so op layout never depends
+ * on anything but this decision -- there is no drift-dependent sizing to keep the two
+ * passes in lockstep on. */
+static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off,
                       const Targets *targets, Dec *d) {
     uint32_t fused = try_fuse_prologue(code, len, off, targets, d);
     if (fused) return fused;
@@ -299,9 +289,26 @@ static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off, uint32_t a
     fused = try_fuse_la(code, len, off, targets, d);
     if (fused) return fused;
     decode(code, off, d);
-    if (d->op == RISCV_OP_AUIPC && at != off / 4) {
-        d->op = RISCV_OP_AUIPC_ABS;
-        d->target = off + (d->imm << 12);
+    if (d->op == RISCV_OP_AUIPC) {
+        /* A lone auipc materialises a constant into rd: val = off + (uimm20<<12), the
+         * value at the TRUE pc (code is non-relocatable). When that constant lands in a
+         * DATA cluster it is an absolute address that no fusion ever moves, so load it
+         * straight -- LI_LO/LI_HI, one word, exactly like the fused `la` above -- and the
+         * following lo12 load/store/addi adds its own offset on top. The clusters are
+         * disjoint from code: a CODE auipc's value is within +/-2KB of a code target in
+         * [0, code_len), so a value <= -2049 (rodata, just below 0) or within 2^20 of
+         * RISCV_HALF (globals) cannot be code. Everything else stays a plain 1-word auipc:
+         * that is a CODE reference (or the top ~2KB of rodata a code value could alias,
+         * which tctool resolves too). tctool re-encodes those against the op-index map --
+         * a code address is a CONSTANT (the target's op index * 4), not pc-relative, but
+         * that constant isn't known until the map is built, so it's filled in a second
+         * pass; the runtime auipc computes from the op CURSOR, so once tctool re-encodes
+         * the offset in op space it is correct regardless of fusion drift (no baked
+         * absolute needed -- see transcode.h and tctool.c's apply_pcrel_code_fixups). */
+        uint32_t val = off + (d->imm << 12);
+        int32_t s0 = (int32_t)val, sh = (int32_t)(val - 0x80000000u);   /* dist from 0 / RISCV_HALF */
+        if (s0 <= -2049 && s0 >= -(1 << 20))         { d->op = RISCV_OP_LI_LO; d->imm = val & 0x1fffffu; }
+        else if (sh >= -(1 << 20) && sh < (1 << 20)) { d->op = RISCV_OP_LI_HI; d->imm = (val - 0x80000000u) & 0x1fffffu; }
     }
     return d->width;
 }
@@ -343,8 +350,6 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffff);
     } else if (op == RISCV_OP_LUI || op == RISCV_OP_AUIPC) {
         ops[at++] = w0 | rd << 21 | (d->imm & 0xfffff);            /* lui value / auipc upper */
-    } else if (op == RISCV_OP_AUIPC_ABS) {
-        ops[at++] = w0 | rd << 21; ops[at++] = d->target;          /* + baked absolute value */
     } else if (op == RISCV_OP_NOP) {
         /* dropped during translation -- emits zero op words (op_words == 0) */
     } else {                                                       /* traps (ecall/ebreak/illegal) */
@@ -365,7 +370,7 @@ static void build_map(const uint8_t *code, uint32_t len, const Targets *targets,
         uint16_t lo = code[off] | code[off+1] << 8;
         uint32_t wd = ((lo & 3) == 3) ? 4 : 2;
         if (off + wd > len) break;
-        wd = step(code, len, off, at, targets, &d);
+        wd = step(code, len, off, targets, &d);
         map[off >> 1] = at;
         at += op_words(d.op);
         off += wd;
@@ -400,7 +405,7 @@ void transcode_ex(const uint8_t *code, uint32_t len, const TcExternalTargets *ex
         uint16_t lo = code[off] | code[off+1] << 8;
         uint32_t wd = ((lo & 3) == 3) ? 4 : 2;
         if (off + wd > len) break;
-        wd = step(code, len, off, at, &targets, &d);
+        wd = step(code, len, off, &targets, &d);
         at = emit(out->ops, at, &d, map, len);
         off += wd;
     }

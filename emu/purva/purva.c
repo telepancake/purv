@@ -14,20 +14,9 @@
  * side map and no per-op pc bookkeeping.
  */
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "purva.h"   /* purv.h + transcode.h (the op vocabulary and field macros) */
-
-int g_itrace;              /* TEMP debug: per-instruction register trace */
-unsigned long g_icount;    /* TEMP debug: running instruction counter for trace labels */
-
-static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
-    fprintf(stderr, "I%lu op=%u@%u(pc=%u)", g_icount++, TC_OP(*p), (unsigned)(p - base), (unsigned)(p - base) * 4);
-    for (int i = 0; i < 32; i++) fprintf(stderr, " x%d=%x", i, s->x[i]);
-    fprintf(stderr, "\n");
-}
-#define TRACE_STEP() do { if (g_itrace) trace_dump(s, p, base); } while (0)
 
 /* Little-endian assemble/scatter of n bytes. n is a compile-time constant at every
  * call site, so GCC folds these to a single (unaligned) load/store of that width. */
@@ -84,7 +73,12 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t pc = s->pc;
     if (pc >= clen) return 0;                                  /* resume pc outside code */
 
-    static const void *const tbl[RISCV_OP_COUNT] = {
+    /* All 64 values the 6-bit op field (w>>26) can select are populated: the real ops
+     * below, then every unused encoding [RISCV_OP_COUNT, 63] filled with h_trap. So a
+     * garbage op -- e.g. a jalr/ret landing on a data word -- dispatches to h_trap ->
+     * illegal rather than running off the table into a wild `goto *NULL`. */
+    static const void *const tbl[64] = {
+        [RISCV_OP_COUNT ... 63] = &&h_trap,
         [RISCV_OP_ADD] = &&h_add, [RISCV_OP_SLL] = &&h_sll, [RISCV_OP_SLT] = &&h_slt,
         [RISCV_OP_SLTU] = &&h_sltu, [RISCV_OP_XOR] = &&h_xor, [RISCV_OP_SRL] = &&h_srl,
         [RISCV_OP_OR] = &&h_or, [RISCV_OP_AND] = &&h_and, [RISCV_OP_SUB] = &&h_sub, [RISCV_OP_SRA] = &&h_sra,
@@ -102,7 +96,6 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_JAL] = &&h_jal, [RISCV_OP_JALR] = &&h_jalr,
         [RISCV_OP_LUI] = &&h_lui, [RISCV_OP_AUIPC] = &&h_auipc, [RISCV_OP_NOP] = &&h_nop,
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
-        [RISCV_OP_AUIPC_ABS] = &&h_auipc_abs,
         [RISCV_OP_PROLOGUE] = &&h_prologue, [RISCV_OP_EPILOGUE] = &&h_epilogue,
         [RISCV_OP_LI_LO] = &&h_li_lo, [RISCV_OP_LI_HI] = &&h_li_hi,
     };
@@ -112,10 +105,10 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t a, b;
 
     /* Straight-line step: one op word forward (the cursor is the pc). */
-    #define NEXT() do { k++; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
+    #define NEXT() do { k++; w = *++p; goto *tbl[TC_OP(w)]; } while (0)
     /* Jump to op index `idx`: count it, budget-check (resume pc = idx<<2), relocate. */
     #define RELOC(idx) do { uint32_t i_ = (idx); k++; \
-        if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
+        if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; goto *tbl[TC_OP(w)]; } while (0)
     /* One load, one store. addr = x[rs1] + imm. LOAD(T): T is the loaded value's C
      * type -- sizeof(T) picks the byte width, and the cast to (T) then int32_t does
      * the sign/zero extension the width implies (LB/LH signed, LBU/LHU unsigned, LW
@@ -132,7 +125,6 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         uint8_t *q_ = mem_w(s, a_, (n)); \
         if (q_) st_le(q_, (n), v_); else s->callback(s, RISCV_MEM_STORE, a_, v_); } while (0)
 
-    TRACE_STEP();
     goto *tbl[TC_OP(w)];
 
     h_add:  s->x[TC_A(w)] = s->x[TC_B(w)] + s->x[TC_C(w)];                          NEXT();
@@ -192,18 +184,17 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
               if (rd) s->x[rd] = ((uint32_t)(p - base) << 2) + 4;
               k++;
               if (t >= clen || k >= max) { s->pc = t; return k; }
-              p = base + (t >> 2); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; }
+              p = base + (t >> 2); w = *p; goto *tbl[TC_OP(w)]; }
 
     h_lui:   s->x[TC_A(w)] = TC_UIMM(w) << 12; NEXT();
-    /* Cursor-based: correct only when nothing before this op has fused (op-index ==
-     * pc/4 still holds). transcode_ex only emits this form when it verified that --
-     * see transcode.h's RISCV_OP_AUIPC_ABS note. */
+    /* Only CODE-address auipc reach here (data auipc are fused to LI at transcode time).
+     * The value is cursor-based -- (this op's index)*4 + uimm<<12 -- which is exact
+     * whatever the fusion drift, because the cursor IS the op position; tctool re-encoded
+     * uimm (and the paired lo12) for the op-space displacement. See transcode.h. */
     h_auipc: s->x[TC_A(w)] = ((uint32_t)(p - base) << 2) + (TC_UIMM(w) << 12); NEXT();
-    /* Drift has occurred upstream: the transcoder baked the real absolute value
-     * (computed from the TRUE pc, not a drifted cursor) into the next word. */
-    h_auipc_abs: s->x[TC_A(w)] = p[1]; k++; p += 2; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
-    /* Fused `la` (transcode.h): materialise a data address in one op. LI_LO is the
-     * value straight (rodata just below 0, or code); LI_HI adds RISCV_HALF (globals). */
+    /* Materialise a data address in one op (transcode.h): a fused `la`, or a lone data
+     * auipc. LI_LO is the value straight (rodata just below 0); LI_HI adds RISCV_HALF
+     * (globals). Any lo12 load/store/addi that used the auipc's rd still follows. */
     h_li_lo: s->x[TC_A(w)] = (uint32_t)TC_JOFF(w);              NEXT();
     h_li_hi: s->x[TC_A(w)] = (uint32_t)TC_JOFF(w) + RISCV_HALF; NEXT();
     h_nop:   NEXT();
@@ -230,7 +221,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
                 if (qq) st_le(qq, 4, v); else s->callback(s, RISCV_MEM_STORE, addr, v); }
         }
         s->x[2] = sp0 - frame;
-        k += cnt + 1; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+        k += cnt + 1; w = *++p; goto *tbl[TC_OP(w)];
     }
     /* Fused epilogue (transcode.h): restore the callee-saved set from the top of the
      * frame (p-th set register at sp+frame-4-4p), deallocate, and return to ra. The
@@ -255,7 +246,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         s->x[2] = sp0 + frame;
         uint32_t t = s->x[1] & ~1u; k += cnt + 2;
         if (t >= clen || k >= max) { s->pc = t; return k; }
-        p = base + (t >> 2); w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+        p = base + (t >> 2); w = *p; goto *tbl[TC_OP(w)];
     }
 
     h_trap: {
@@ -267,7 +258,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
                  :                           (s->illegal ? s->illegal(s) : 1);
         if (stop) return k;
         if (k >= max) { s->pc = pc_ + 4; return k; }          /* serviced syscall: resume */
-        w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
+        w = *++p; goto *tbl[TC_OP(w)];
     }
     #undef NEXT
     #undef RELOC
