@@ -202,12 +202,15 @@ benchmark: host host-purvs host-purva guest-bench.elf guest-bench-purva.img benc
 	 painsns=$$(sed -n 's/.*insns=\([0-9]*\).*/\1/p' purva.err); \
 	 insns=$$(sed -n 's/.*insns=\([0-9]*\).*/\1/p' purv.err); \
 	 lines=$$(wc -l <purv.out | tr -d ' '); \
+	 rvtext=$$(size guest-bench.elf 2>/dev/null | awk 'NR==2{print $$1}'); \
+	 pabytes=$$(od -An -tu4 -N4 guest-bench-purva.img | tr -d ' '); \
+	 rvkib=$$(( $${rvtext:-0} / 1024 )); pakib=$$(( $${pabytes:-0} / 1024 )); \
 	 echo; \
 	 printf '  SQLite freestanding benchmark   (BENCH_SCALE=%s, %s-line transcript, identical)\n\n' "$(SCALE)" "$$lines"; \
 	 printf '    %-20s %5d.%03d s\n' 'native (host)' $$((nat/1000)) $$((nat%1000)); \
-	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions\n' 'purv (RV32IMC)' $$((pv/1000)) $$((pv%1000)) "$$pvm" "$$insns"; \
-	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions\n' 'purvs (RV32IMC)' $$((ps/1000)) $$((ps%1000)) "$$psm" "$$insns"; \
-	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions\n' 'purva (RV32IM)' $$((pa/1000)) $$((pa%1000)) "$$pam" "$$painsns"; \
+	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions  (%s KiB .text)\n' 'purv (RV32IMC)' $$((pv/1000)) $$((pv%1000)) "$$pvm" "$$insns" "$$rvkib"; \
+	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions  (%s KiB .text)\n' 'purvs (RV32IMC)' $$((ps/1000)) $$((ps%1000)) "$$psm" "$$insns" "$$rvkib"; \
+	 printf '    %-20s %5d.%03d s   %s MIPS, %s instructions  (%s KiB bytecode)\n' 'purva (RV32IM)' $$((pa/1000)) $$((pa%1000)) "$$pam" "$$painsns" "$$pakib"; \
 	 [ "$$nat" -gt 0 ] && printf '    %-20s purv %dx, purvs %dx, purva %dx\n' 'slowdown vs native' $$((pv/nat)) $$((ps/nat)) $$((pa/nat)); \
 	 echo
 
