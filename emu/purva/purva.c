@@ -248,142 +248,19 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_nop:   NEXT();
 
     h_loop: {
-        uint32_t blen = w & 0xff;
-        uint32_t *body = p - blen;
         uint32_t btype = (w >> 8) & 0xf;
-        uint32_t r1 = TC_A(w), r2 = TC_B(w);
-        for (;;) {
-            /* The LOOP op replaced a backward conditional branch. When dispatch
-             * reaches it, the body has already run once. Check if we should loop. */
-            uint32_t va = s->x[r1], vb = s->x[r2];
-            int cond;
-            switch (btype) {
-            case 0: cond = (va == vb); break;
-            case 1: cond = (va != vb); break;
-            case 2: cond = ((int32_t)va <  (int32_t)vb); break;
-            case 3: cond = ((int32_t)va >= (int32_t)vb); break;
-            case 4: cond = (va <  vb); break;
-            default: cond = (va >= vb); break;
-            }
-            if (!cond) NEXT();                                     /* not taken: exit loop */
-            k++;                                                   /* taken: count branch */
-            if (k >= max) { s->pc = (uint32_t)(body - base) << 2; return k; }
-            /* Execute the body via an inner interpreter. */
-            uint32_t j = 0;
-            while (j < blen) {
-                uint32_t bw = body[j];
-                uint8_t bop = TC_OP(bw);
-                switch (bop) {
-                case RISCV_OP_ADD:  wr(s, TC_A(bw), s->x[TC_B(bw)] + s->x[TC_C(bw)]); break;
-                case RISCV_OP_SUB:  wr(s, TC_A(bw), s->x[TC_B(bw)] - s->x[TC_C(bw)]); break;
-                case RISCV_OP_SLL:  wr(s, TC_A(bw), s->x[TC_B(bw)] << (s->x[TC_C(bw)] & 31)); break;
-                case RISCV_OP_SLT:  wr(s, TC_A(bw), (int32_t)s->x[TC_B(bw)] < (int32_t)s->x[TC_C(bw)]); break;
-                case RISCV_OP_SLTU: wr(s, TC_A(bw), s->x[TC_B(bw)] < s->x[TC_C(bw)]); break;
-                case RISCV_OP_XOR:  wr(s, TC_A(bw), s->x[TC_B(bw)] ^ s->x[TC_C(bw)]); break;
-                case RISCV_OP_SRL:  wr(s, TC_A(bw), s->x[TC_B(bw)] >> (s->x[TC_C(bw)] & 31)); break;
-                case RISCV_OP_SRA:  wr(s, TC_A(bw), (uint32_t)((int32_t)s->x[TC_B(bw)] >> (s->x[TC_C(bw)] & 31))); break;
-                case RISCV_OP_OR:   wr(s, TC_A(bw), s->x[TC_B(bw)] | s->x[TC_C(bw)]); break;
-                case RISCV_OP_AND:  wr(s, TC_A(bw), s->x[TC_B(bw)] & s->x[TC_C(bw)]); break;
-                case RISCV_OP_ADDI:  wr(s, TC_A(bw), s->x[TC_B(bw)] + TC_IMM(bw)); break;
-                case RISCV_OP_SLLI:  wr(s, TC_A(bw), s->x[TC_B(bw)] << (TC_IMM(bw) & 31)); break;
-                case RISCV_OP_SLTI:  wr(s, TC_A(bw), (int32_t)s->x[TC_B(bw)] < TC_IMM(bw)); break;
-                case RISCV_OP_SLTIU: wr(s, TC_A(bw), s->x[TC_B(bw)] < (uint32_t)TC_IMM(bw)); break;
-                case RISCV_OP_XORI:  wr(s, TC_A(bw), s->x[TC_B(bw)] ^ (uint32_t)TC_IMM(bw)); break;
-                case RISCV_OP_SRLI:  wr(s, TC_A(bw), s->x[TC_B(bw)] >> (TC_IMM(bw) & 31)); break;
-                case RISCV_OP_ORI:   wr(s, TC_A(bw), s->x[TC_B(bw)] | (uint32_t)TC_IMM(bw)); break;
-                case RISCV_OP_ANDI:  wr(s, TC_A(bw), s->x[TC_B(bw)] & (uint32_t)TC_IMM(bw)); break;
-                case RISCV_OP_SRAI:  wr(s, TC_A(bw), (uint32_t)((int32_t)s->x[TC_B(bw)] >> (TC_IMM(bw) & 31))); break;
-                case RISCV_OP_MUL:    wr(s, TC_A(bw), s->x[TC_B(bw)] * s->x[TC_C(bw)]); break;
-                case RISCV_OP_MULH:   { uint32_t ma = s->x[TC_B(bw)], mb = s->x[TC_C(bw)];
-                    wr(s, TC_A(bw), (uint32_t)(((int64_t)(int32_t)ma * (int32_t)mb) >> 32)); break; }
-                case RISCV_OP_MULHSU: { uint32_t ma = s->x[TC_B(bw)], mb = s->x[TC_C(bw)];
-                    wr(s, TC_A(bw), (uint32_t)(((int64_t)((uint64_t)(int32_t)ma * mb)) >> 32)); break; }
-                case RISCV_OP_MULHU:  { uint32_t ma = s->x[TC_B(bw)], mb = s->x[TC_C(bw)];
-                    wr(s, TC_A(bw), (uint32_t)(((uint64_t)ma * mb) >> 32)); break; }
-                case RISCV_OP_DIV:    { uint32_t da = s->x[TC_B(bw)], db = s->x[TC_C(bw)];
-                    wr(s, TC_A(bw), db == 0 ? 0xffffffffu : (da == 0x80000000u && (int32_t)db == -1) ? da : (uint32_t)((int32_t)da / (int32_t)db)); break; }
-                case RISCV_OP_DIVU:   { uint32_t da = s->x[TC_B(bw)], db = s->x[TC_C(bw)];
-                    wr(s, TC_A(bw), db == 0 ? 0xffffffffu : da / db); break; }
-                case RISCV_OP_REM:    { uint32_t da = s->x[TC_B(bw)], db = s->x[TC_C(bw)];
-                    wr(s, TC_A(bw), db == 0 ? da : (da == 0x80000000u && (int32_t)db == -1) ? 0 : (uint32_t)((int32_t)da % (int32_t)db)); break; }
-                case RISCV_OP_REMU:   { uint32_t da = s->x[TC_B(bw)], db = s->x[TC_C(bw)];
-                    wr(s, TC_A(bw), db == 0 ? da : da % db); break; }
-                case RISCV_OP_LB: { uint32_t rd = TC_A(bw), ad = s->x[TC_B(bw)] + TC_IMM(bw);
-                    if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
-                        wr(s, rd, q ? (uint32_t)(int32_t)(int8_t)q[0]
-                                    : (uint32_t)sext(s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0, 8)); }
-                    break; }
-                case RISCV_OP_LH: { uint32_t rd = TC_A(bw), ad = s->x[TC_B(bw)] + TC_IMM(bw);
-                    if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
-                        wr(s, rd, q ? (uint32_t)(int32_t)(int16_t)(q[0] | q[1] << 8)
-                                    : (uint32_t)sext(s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0, 16)); }
-                    break; }
-                case RISCV_OP_LW: { uint32_t rd = TC_A(bw), ad = s->x[TC_B(bw)] + TC_IMM(bw);
-                    if (rd) { uint8_t *q = mem_xlate(s, ad, 4, 0);
-                        wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24)
-                                    : (s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0)); }
-                    break; }
-                case RISCV_OP_LBU: { uint32_t rd = TC_A(bw), ad = s->x[TC_B(bw)] + TC_IMM(bw);
-                    if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
-                        wr(s, rd, q ? q[0] : ((s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0) & 0xff)); }
-                    break; }
-                case RISCV_OP_LHU: { uint32_t rd = TC_A(bw), ad = s->x[TC_B(bw)] + TC_IMM(bw);
-                    if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
-                        wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8)
-                                    : ((s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0) & 0xffff)); }
-                    break; }
-                case RISCV_OP_SB: { uint32_t ad = s->x[TC_B(bw)] + TC_IMM(bw); uint32_t v = s->x[TC_A(bw)];
-                    uint8_t *q = mem_xlate(s, ad, 1, 1);
-                    if (q) q[0] = (uint8_t)v; else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, v);
-                    break; }
-                case RISCV_OP_SH: { uint32_t ad = s->x[TC_B(bw)] + TC_IMM(bw); uint32_t v = s->x[TC_A(bw)];
-                    uint8_t *q = mem_xlate(s, ad, 2, 1);
-                    if (q) { q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); }
-                    else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, v);
-                    break; }
-                case RISCV_OP_SW: { uint32_t ad = s->x[TC_B(bw)] + TC_IMM(bw); uint32_t v = s->x[TC_A(bw)];
-                    uint8_t *q = mem_xlate(s, ad, 4, 1);
-                    if (q) st32(q, v); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, v);
-                    break; }
-                case RISCV_OP_SPILL2: {
-                    uint32_t sb = s->x[TC_A(bw)], v1 = s->x[TC_B(bw)], v2 = s->x[TC_C(bw)];
-                    uint32_t ad = sb + (uint32_t)TC_OFF11(bw);
-                    uint8_t *q1 = mem_xlate(s, ad, 4, 1);
-                    if (q1) st32(q1, v1); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, v1);
-                    uint8_t *q2 = mem_xlate(s, ad + 4, 4, 1);
-                    if (q2) st32(q2, v2); else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad + 4, v2);
-                    k++; break; }                                  /* 2 insns; other k++ below */
-                case RISCV_OP_LUI:       wr(s, TC_A(bw), TC_UIMM(bw) << 12); break;
-                case RISCV_OP_AUIPC:     wr(s, TC_A(bw), ((uint32_t)(body + j - base) << 2) + (TC_UIMM(bw) << 12)); break;
-                case RISCV_OP_AUIPC_ABS: wr(s, TC_A(bw), body[j + 1]); k++; j += 2; continue;
-                case RISCV_OP_NOP:       break;
-                case RISCV_OP_BEQ: case RISCV_OP_BNE: case RISCV_OP_BLT:
-                case RISCV_OP_BGE: case RISCV_OP_BLTU: case RISCV_OP_BGEU: {
-                    uint32_t ba = s->x[TC_A(bw)], bb = s->x[TC_B(bw)];
-                    int taken;
-                    switch (bop) {
-                    case RISCV_OP_BEQ:  taken = (ba == bb); break;
-                    case RISCV_OP_BNE:  taken = (ba != bb); break;
-                    case RISCV_OP_BLT:  taken = ((int32_t)ba <  (int32_t)bb); break;
-                    case RISCV_OP_BGE:  taken = ((int32_t)ba >= (int32_t)bb); break;
-                    case RISCV_OP_BLTU: taken = (ba <  bb); break;
-                    default:            taken = (ba >= bb); break;
-                    }
-                    if (taken) {
-                        uint32_t tj = (uint32_t)((int32_t)j + (TC_IMM(bw) >> 2));
-                        k++;
-                        if (tj > blen) {                           /* break: past the loop */
-                            p++; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)];
-                        }
-                        if (tj >= blen) break;                     /* continue: re-check */
-                        j = tj; continue;                          /* skip within body */
-                    }
-                    break; }
-                default: break;
-                }
-                k++; j++;
-            }
+        uint32_t va = s->x[TC_A(w)], vb = s->x[TC_B(w)];
+        int cond;
+        switch (btype) {
+        case 0: cond = (va == vb); break;
+        case 1: cond = (va != vb); break;
+        case 2: cond = ((int32_t)va <  (int32_t)vb); break;
+        case 3: cond = ((int32_t)va >= (int32_t)vb); break;
+        case 4: cond = (va <  vb); break;
+        default: cond = (va >= vb); break;
         }
+        if (!cond) NEXT();
+        RELOC((uint32_t)(p - base) - (w & 0xff));
     }
 
     h_trap: {
