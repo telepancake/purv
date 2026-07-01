@@ -45,17 +45,17 @@ static int in_heap(uint32_t addr, uint32_t len) {
     return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_region_len;
 }
 
-/* One guest byte, through purva's two-cluster layout (mirrors purva.c's mem_xlate;
- * purvhost_guest_byte still speaks the old four-region half-split that purv/purvs
- * use, so purva reads its own memory here). Writable cluster is stack-then-heap
- * around RISCV_HALF; rodata sits at small NEGATIVE addresses below 0. */
+/* One guest byte, through purva's two self-describing regions (mirrors purva.c's
+ * mem_xlate; purvhost_guest_byte still speaks the old four-region half-split that
+ * purv/purvs use, so purva reads its own memory here). One bounded check per
+ * region -- writable first, then read-only rodata. */
 static uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    const RiscvEmulatorRegion_t *stack = &s->region[RISCV_STACK];
-    uint32_t wrel = a - (RISCV_HALF - stack->len);
-    if (wrel < stack->len + s->region[RISCV_HEAP].len) return stack->ptr[wrel];
-    const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
-    int32_t ro = (int32_t)a;
-    if (ro >= -(int32_t)rodata->len && ro < 0) return rodata->ptr[(uint32_t)(ro + (int32_t)rodata->len)];
+    const RiscvEmulatorRegion_t *rw = &s->region[RISCV_WRITABLE];
+    uint32_t rel = a - rw->base;
+    if ((uint64_t)rel + 1 <= rw->len) return rw->ptr[rel];
+    const RiscvEmulatorRegion_t *ro = &s->region[RISCV_READONLY];
+    rel = a - ro->base;
+    if ((uint64_t)rel + 1 <= ro->len) return ro->ptr[rel];
     return 0;
 }
 

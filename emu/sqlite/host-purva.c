@@ -109,16 +109,15 @@ static uint32_t on_oob(RiscvEmulatorState_t *st, int op, uint32_t addr, uint32_t
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 
-/* Mirrors purva.c's mem_xlate (two contiguous clusters): the writable cluster is
- * stack-then-heap around RISCV_HALF; rodata is at small NEGATIVE addresses, below
- * 0. Code is never data-addressable. */
+/* Mirrors purva.c's mem_xlate: two self-describing regions, each { ptr, len, base }.
+ * One bounded check per region -- writable first, then read-only rodata. */
 static uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    const RiscvEmulatorRegion_t *stack = &s->region[RISCV_STACK];
-    uint32_t wrel = a - (RISCV_HALF - stack->len);
-    if (wrel < stack->len + s->region[RISCV_HEAP].len) return stack->ptr[wrel];
-    const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
-    int32_t ro = (int32_t)a;
-    if (ro >= -(int32_t)rodata->len && ro < 0) return rodata->ptr[(uint32_t)(ro + (int32_t)rodata->len)];
+    const RiscvEmulatorRegion_t *rw = &s->region[RISCV_WRITABLE];
+    uint32_t rel = a - rw->base;
+    if ((uint64_t)rel + 1 <= rw->len) return rw->ptr[rel];
+    const RiscvEmulatorRegion_t *ro = &s->region[RISCV_READONLY];
+    rel = a - ro->base;
+    if ((uint64_t)rel + 1 <= ro->len) return ro->ptr[rel];
     return 0;
 }
 

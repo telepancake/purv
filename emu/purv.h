@@ -50,12 +50,15 @@ enum { RISCV_MEM_LOAD = 0, RISCV_MEM_STORE = 1 };
 typedef uint32_t (*RiscvEmulatorMemFn)(RiscvEmulatorState_t *state, int op,
                                        uint32_t addr, uint32_t value);
 
-/* One memory region: host storage of `len` bytes mapped at the region's (fixed)
- * base. There is no writable flag -- writability follows the address half. ptr ==
- * NULL (len 0) means the region is unmapped. */
+/* One memory region: host storage of `len` bytes holding the guest bytes at
+ * [base, base + len). ptr == NULL (len 0) means the region is unmapped. `base` makes
+ * a region self-describing so a translation is one bounded check (addr - base < len)
+ * with no per-access base arithmetic. The purv/purvs engines still derive base by
+ * convention and leave this 0; purva (see purva.c) sets it and uses it directly. */
 typedef struct {
     uint8_t *ptr;
     uint32_t len;
+    uint32_t base;
 } RiscvEmulatorRegion_t;
 
 /* The four regions, indexed `half*2 + direction`. The low bit is the grow
@@ -66,6 +69,9 @@ typedef struct {
  *   region[RISCV_HEAP]   [RISCV_HALF, RISCV_HALF + len)   read/write data
  *   region[RISCV_STACK]  [2^32 - len, 2^32)               read/write, grows down */
 enum { RISCV_CODE, RISCV_RODATA, RISCV_HEAP, RISCV_STACK };
+/* purva models data memory as just TWO self-describing regions (see purva.c) and
+ * names two slots by role: the whole writable span, and the read-only span. */
+enum { RISCV_WRITABLE = RISCV_HEAP, RISCV_READONLY = RISCV_RODATA };
 
 /* The whole VM state. Set it up by writing the fields:
  *   - pc:       the next instruction to execute (the run loop resumes here);
