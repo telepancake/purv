@@ -42,35 +42,34 @@ static inline __attribute__((always_inline)) uint32_t ld32(const uint8_t *q) {
     return (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24;
 }
 
-/* Instructions fetch ONLY from region[RISCV_CODE] (via g_prog/the op cursor below,
- * never through here). A data access -- load OR store -- must NEVER reach it:
- * purva's "code" is packed op words, not real RISC-V bytes (unlike purv, whose
- * code stays real bytes forever, so reading it as data is meaningless but
- * harmless there); there is nothing sane to read, and self-modifying code isn't
- * a thing this engine supports. So the lower half only ever resolves into
- * region[RISCV_RODATA] -- read-only, based at RISCV_HALF - its own length,
- * EXACTLY purv.h's documented formula for a region that grows down from a
- * half's top, unchanged from the original. No extra state or setter needed:
- * purva.ld places rodata to grow down from RISCV_HALF for exactly this reason
- * (a genuinely separate region from code, anchored the same way the engine
- * already computes it, not derived from region[RISCV_CODE].len or anything
- * about how code transcoded). The upper half is unchanged from purv.h's
- * documented model: region[RISCV_HEAP] grows up from RISCV_HALF,
- * region[RISCV_STACK] grows down from 2^32. */
+/* Data memory is two clusters, each ONE contiguous host buffer (see purv.h):
+ *
+ *   writable  [RISCV_HALF - stack.len, RISCV_HALF + heap.len)
+ *             stack grows down from RISCV_HALF, heap up from it, back to back in
+ *             a single buffer -- region[RISCV_STACK].ptr is its base (the stack
+ *             bottom), region[RISCV_HEAP].ptr the seam at RISCV_HALF.
+ *   read-only [0 - rodata.len, 0)   (i.e. small NEGATIVE guest addresses)
+ *             rodata grows down from 0; region[RISCV_RODATA].ptr is its base.
+ *
+ * region[RISCV_CODE] is never data-addressable -- purva's "code" is packed op
+ * words, fetched via the op cursor, not real RISC-V bytes (unlike purv). Code
+ * sits at [0, ...) but a data access there resolves to nothing.
+ *
+ * This makes mem_xlate what it should be: a WRITE is ONE unsigned range check
+ * (the writable cluster); a READ falls through to rodata at the negative end
+ * only after missing the writable cluster. No half split, no per-region base
+ * arithmetic -- the bases fall out of the two fixed anchors (RISCV_HALF and 0)
+ * and the region lengths. */
 static inline __attribute__((always_inline))
 uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
-    if (addr < RISCV_HALF) {
-        if (write) return (uint8_t *)0;
-        const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
-        uint32_t down = RISCV_HALF - rodata->len;
-        return (addr >= down && addr + n <= RISCV_HALF) ? rodata->ptr + (addr - down) : (uint8_t *)0;
-    }
-    const RiscvEmulatorRegion_t *heap = &s->region[RISCV_HEAP];
-    uint32_t lo = addr & (RISCV_HALF - 1);
-    if (lo + n <= heap->len) return heap->ptr + lo;
     const RiscvEmulatorRegion_t *stack = &s->region[RISCV_STACK];
-    uint32_t down = RISCV_HALF - stack->len;
-    if (lo >= down && lo + n <= RISCV_HALF) return stack->ptr + (lo - down);
+    uint32_t wrel = addr - (RISCV_HALF - stack->len);
+    if (wrel <= stack->len + s->region[RISCV_HEAP].len - n) return stack->ptr + wrel;
+    if (write) return (uint8_t *)0;
+    const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
+    int32_t ro = (int32_t)addr;
+    if (ro >= -(int32_t)rodata->len && ro + (int32_t)n <= 0)
+        return rodata->ptr + (uint32_t)(ro + (int32_t)rodata->len);
     return (uint8_t *)0;
 }
 
@@ -304,6 +303,6 @@ void RiscvEmulatorInit(RiscvEmulatorState_t *s,
     s->region[RISCV_HEAP]   = heap;
     s->region[RISCV_STACK]  = stack;
     s->callback = default_callback;
-    s->x[2] = 0;
+    s->x[2] = RISCV_HALF;                         /* sp: stack grows down from RISCV_HALF */
     s->pc = 0;
 }

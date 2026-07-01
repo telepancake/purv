@@ -21,10 +21,10 @@
  * against the REAL address: if our image silently closed a real gap, every such
  * reference would land on the wrong byte. code is fixed at 0 and rwdata at
  * RISCV_HALF (every purva linker script agrees on both); rodata is READ BACK from
- * wherever the linker actually placed it (purva.ld: growing down from RISCV_HALF,
- * a genuinely separate region from code, matching purv.h's documented four-region
- * layout -- see merge_progbits's MERGE_AUTO_BASE) rather than assumed, so the
- * image never needs to (and never does) move it relative to what auipc-computed
+ * wherever the linker actually placed it (purva.ld: growing DOWN from 0, so it
+ * ends exactly at 2^32 and lives at small negative addresses -- see purv.h's
+ * two-cluster layout and merge_progbits's MERGE_AUTO_BASE) rather than assumed, so
+ * the image never needs to (and never does) move it relative to what auipc-computed
  * or relocation-held pointers into it were baked against.
  *
  * What it does, in order:
@@ -105,10 +105,11 @@ static void sort_spans(Span *s, int n) {
  * for rodata specifically: unlike code (always 0) and rwdata (always
  * RISCV_HALF, both fixed architectural boundaries every purva linker script
  * agrees on), rodata's real link-time address depends on the linker script (see
- * purva.ld: placed to grow down from RISCV_HALF, matching purv.h's documented
- * four-region layout) -- and whatever it is, that is what auipc-computed
- * pointers into it were baked against, so the image must preserve it exactly,
- * not assume a fixed value or shift it to match anything transcode-time. */
+ * purva.ld: placed to grow down from 0, so it ends at 2^32 and sits at small
+ * negative addresses, matching purv.h's two-cluster layout) -- and whatever it
+ * is, that is what auipc-computed pointers into it were baked against, so the
+ * image must preserve it exactly, not assume a fixed value or shift it to match
+ * anything transcode-time. */
 static uint8_t *merge_progbits(const Ehdr *eh, int want_exec, int want_write, uint32_t base,
                                 uint32_t *len, uint32_t *out_base) {
     Span spans[64]; int n = 0;
@@ -333,9 +334,12 @@ static void patch_all_relas(const Ehdr *eh, uint32_t rodata_base, uint8_t *rodat
         const Shdr *sh = shdr(eh, i);
         if (sh->sh_type != SHT_RELA) continue;
         const Shdr *target = shdr(eh, sh->sh_info);     /* section this .rela.X applies to */
-        if (rodata_len && target->sh_addr >= rodata_base && target->sh_addr < rodata_base + rodata_len)
+        /* Relative unsigned tests: rodata now grows down to end EXACTLY at 2^32, so
+         * rodata_base + rodata_len wraps to 0 -- a `sh_addr < base + len` form would
+         * be false for every section. `sh_addr - base < len` is wrap-safe. */
+        if (rodata_len && (uint32_t)(target->sh_addr - rodata_base) < rodata_len)
             patch_rela(eh, i, rodata_base, rodata, rodata_len, map, code_len);
-        else if (rwdata_len && target->sh_addr >= rwdata_base && target->sh_addr < rwdata_base + rwdata_len)
+        else if (rwdata_len && (uint32_t)(target->sh_addr - rwdata_base) < rwdata_len)
             patch_rela(eh, i, rwdata_base, rwdata, rwdata_len, map, code_len);
     }
 }
@@ -362,28 +366,27 @@ int main(int argc, char **argv) {
      * alignment padding between .text and .rodata) is zero-filled, not closed, so
      * every pc-relative / absolute reference baked by the linker still lands right.
      * code (base 0) and rwdata (base RISCV_HALF) are fixed architectural boundaries
-     * every purva linker script agrees on. rodata's is too -- RISCV_HALF minus its
-     * own length, purv.h's documented formula for a region that grows down from a
-     * half's top (purva.ld places .rodata there for exactly this reason: a
-     * genuinely separate region from code, not a fixed distance from it, so the
-     * engine can compute its base the same way at run time with no extra state --
-     * see purva.c's mem_xlate). That base isn't known until rodata_len is (its
-     * length is exactly what merge_progbits computes), so MERGE_AUTO_BASE reads
-     * the real address back from the ELF instead of assuming it, then this
-     * asserts the linker actually produced purv.h's layout rather than silently
-     * trusting an arbitrary address (which mem_xlate's fixed formula would then
-     * get wrong at run time). */
+     * every purva linker script agrees on. rodata's is too -- 0 minus its own
+     * length, purv.h's formula for read-only data that grows down from 0 to end
+     * exactly at 2^32 (purva.ld places .rodata there for exactly this reason: it
+     * sits at small negative addresses just below code, so the engine can compute
+     * its base the same way at run time with no extra state -- see purva.c's
+     * mem_xlate). That base isn't known until rodata_len is (its length is exactly
+     * what merge_progbits computes), so MERGE_AUTO_BASE reads the real address back
+     * from the ELF instead of assuming it, then this asserts the linker actually
+     * produced purv.h's layout rather than silently trusting an arbitrary address
+     * (which mem_xlate's fixed formula would then get wrong at run time). */
     uint32_t code_len;
     uint8_t *code_bytes = merge_progbits(eh, 1, 0, 0, &code_len, NULL);          /* exec, base 0 */
     if (!code_bytes) { fprintf(stderr, "transcode: no executable section\n"); return 2; }
 
     uint32_t rodata_len, rodata_base;
     uint8_t *rodata_bytes = merge_progbits(eh, 0, 0, MERGE_AUTO_BASE, &rodata_len, &rodata_base);
-    if (rodata_len && rodata_base != RISCV_HALF - rodata_len) {
-        fprintf(stderr, "transcode: rodata at 0x%x, expected 0x%x (RISCV_HALF - rodata_len) --\n"
-                "  the linker script must place rodata to grow down from RISCV_HALF,\n"
-                "  like purva.ld; the engine derives its base from length alone.\n",
-                rodata_base, RISCV_HALF - rodata_len);
+    if (rodata_len && rodata_base != 0u - rodata_len) {
+        fprintf(stderr, "transcode: rodata at 0x%x, expected 0x%x (0 - rodata_len) --\n"
+                "  the linker script must place rodata to grow down from 0 (the top of\n"
+                "  the read-only region), like purva.ld; base is derived from length.\n",
+                rodata_base, 0u - rodata_len);
         return 2;
     }
 

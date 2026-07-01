@@ -109,21 +109,16 @@ static uint32_t on_oob(RiscvEmulatorState_t *st, int op, uint32_t addr, uint32_t
 }
 static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 
-/* Mirrors purva.c's mem_xlate exactly (code is never data-addressable -- see
- * image.h -- so the lower half only ever resolves into RODATA, based at
- * RISCV_HALF - its own length; the upper half is HEAP then STACK, unchanged). */
+/* Mirrors purva.c's mem_xlate (two contiguous clusters): the writable cluster is
+ * stack-then-heap around RISCV_HALF; rodata is at small NEGATIVE addresses, below
+ * 0. Code is never data-addressable. */
 static uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    if (a < RISCV_HALF) {
-        const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
-        uint32_t down = RISCV_HALF - rodata->len;
-        return (a >= down) ? rodata->ptr[a - down] : 0;
-    }
-    const RiscvEmulatorRegion_t *heap = &s->region[RISCV_HEAP];
-    uint32_t lo = a & (RISCV_HALF - 1);
-    if (lo < heap->len) return heap->ptr[lo];
     const RiscvEmulatorRegion_t *stack = &s->region[RISCV_STACK];
-    uint32_t down = RISCV_HALF - stack->len;
-    if (lo >= down) return stack->ptr[lo - down];
+    uint32_t wrel = a - (RISCV_HALF - stack->len);
+    if (wrel < stack->len + s->region[RISCV_HEAP].len) return stack->ptr[wrel];
+    const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
+    int32_t ro = (int32_t)a;
+    if (ro >= -(int32_t)rodata->len && ro < 0) return rodata->ptr[(uint32_t)(ro + (int32_t)rodata->len)];
     return 0;
 }
 
@@ -183,27 +178,25 @@ int main(int argc, char **argv) {
     Image img;
     if (image_read(argv[1], &img) != 0) { fprintf(stderr, "host-purva: cannot read %s\n", argv[1]); return 2; }
 
-    /* region[CODE] and region[RODATA] are genuinely separate regions -- purva.c's
-     * mem_xlate never resolves a data access into region[CODE] at all (purva's
-     * "code" is packed op words, not real RISC-V bytes; see image.h). img.code
-     * and img.rodata (from image_read) are used directly as those two regions;
-     * rodata's guest base is RISCV_HALF - img.rodata_size (purv.h's formula for
-     * a region that grows down from a half's top), not derived from code_size,
-     * so a fusion pass shrinking or growing the op array never moves it. */
-
-    /* region[HEAP]: rwdata, then bss (the compiled code's global/static variables --
-     * their addresses are baked in at the linker's real offset, right after rwdata,
-     * same as purv/host.c), then the malloc arena. The arena must start AFTER bss,
-     * not overlapping it -- sized to RAM_BYTES same as host.c so both engines run
-     * the identical heap budget. */
+    /* Two contiguous clusters (purv.h / purva.c mem_xlate):
+     *
+     * read-only: region[RODATA] is img.rodata, guest base 0 - rodata_size -- it grows
+     *   down from 0, living at small NEGATIVE addresses. region[CODE] is the packed op
+     *   words; purva never data-addresses code (see image.h), so it needs no data map.
+     *
+     * writable: ONE buffer, stack then heap, back to back. The stack occupies
+     *   [RISCV_HALF - STACK_BYTES, RISCV_HALF) (sp starts at RISCV_HALF, grows down);
+     *   the heap occupies [RISCV_HALF, RISCV_HALF + heap_len): rwdata, then bss (the
+     *   compiled code's globals, baked in at the linker's real offset right after
+     *   rwdata), then the malloc arena (RAM_BYTES, same budget as host.c). */
     uint32_t heap_len = img.rwdata_size + img.bss_size + RAM_BYTES;
-    g_heap = calloc(1, heap_len);
+    uint8_t *writable = calloc(1, (size_t)STACK_BYTES + heap_len);
+    g_stack = writable;                       /* stack bottom = guest RISCV_HALF - STACK_BYTES */
+    g_heap  = writable + STACK_BYTES;         /* heap base    = guest RISCV_HALF */
     if (img.rwdata_size) memcpy(g_heap, img.rwdata, img.rwdata_size);
     uint32_t heap_base = RISCV_HALF + img.rwdata_size + img.bss_size;
     heap_base = (heap_base + 15u) & ~15u;
     heap_init(heap_base, RISCV_HALF + heap_len);
-
-    g_stack = calloc(1, STACK_BYTES);
 
     RiscvEmulatorState_t state;
     RiscvEmulatorInit(&state,

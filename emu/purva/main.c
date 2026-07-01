@@ -23,7 +23,9 @@
 #include "../purvhost.h"  /* PurvHost / purvhost_slurp / purvhost_sym (symbols only) */
 
 #define PURV_HEAP_DEFAULT (256u * 1024u * 1024u)
-#define STACK_MEM_BASE(stack_len) ((uint32_t)(0u - (stack_len)))
+/* Stack now lives just BELOW RISCV_HALF (grows down from it), back to back with the
+ * heap above it -- one writable cluster (see purva.c's mem_xlate). */
+#define STACK_MEM_BASE(stack_len) ((uint32_t)(RISCV_HALF - (stack_len)))
 static uint8_t *g_heap, *g_stack;
 static uint32_t g_heap_size;      /* the DYNAMIC (brk-grown) budget alone, not bss/rwdata */
 static uint32_t g_heap_region_len; /* the full region[HEAP] length: rwdata + bss + g_heap_size */
@@ -41,6 +43,20 @@ static uint32_t  g_tohost, g_begin_sig, g_end_sig;
 
 static int in_heap(uint32_t addr, uint32_t len) {
     return addr >= RISCV_HALF && (uint64_t)addr + len <= (uint64_t)RISCV_HALF + g_heap_region_len;
+}
+
+/* One guest byte, through purva's two-cluster layout (mirrors purva.c's mem_xlate;
+ * purvhost_guest_byte still speaks the old four-region half-split that purv/purvs
+ * use, so purva reads its own memory here). Writable cluster is stack-then-heap
+ * around RISCV_HALF; rodata sits at small NEGATIVE addresses below 0. */
+static uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
+    const RiscvEmulatorRegion_t *stack = &s->region[RISCV_STACK];
+    uint32_t wrel = a - (RISCV_HALF - stack->len);
+    if (wrel < stack->len + s->region[RISCV_HEAP].len) return stack->ptr[wrel];
+    const RiscvEmulatorRegion_t *rodata = &s->region[RISCV_RODATA];
+    int32_t ro = (int32_t)a;
+    if (ro >= -(int32_t)rodata->len && ro < 0) return rodata->ptr[(uint32_t)(ro + (int32_t)rodata->len)];
+    return 0;
 }
 
 /* ------------------------------------------------ trap handlers */
@@ -69,7 +85,7 @@ static int on_ecall(RiscvEmulatorState_t *state) {
     uint32_t num = state->x[17], a0 = state->x[10], a1 = state->x[11], a2 = state->x[12], ret;
     switch (num) {
     case 64:
-        for (uint32_t i = 0; i < a2; i++) putchar(purvhost_guest_byte(state, a1 + i));
+        for (uint32_t i = 0; i < a2; i++) putchar(gbyte(state, a1 + i));
         ret = a2; fflush(stdout); (void)a0;
         break;
     case 93: case 94:
@@ -121,7 +137,7 @@ static void dump_signature(const char *path, uint32_t gran) {
 static void gpoke(uint32_t addr, uint32_t v) { memcpy(&g_stack[addr - STACK_MEM_BASE(g_stack_size)], &v, 4); }
 
 static uint32_t setup_user_stack(int argc, char **argv) {
-    uint32_t sp = 0, ptr[64] = {0};
+    uint32_t sp = RISCV_HALF, ptr[64] = {0};      /* top of the stack cluster */
     if (argc > 64) argc = 64;
     for (int i = argc - 1; i >= 0; i--) {
         uint32_t len = (uint32_t)strlen(argv[i]) + 1;
@@ -195,23 +211,24 @@ int main(int argc, char **argv) {
      * "code" is packed op words, not real RISC-V bytes; there is nothing sane
      * for a data load to read there); img.code (already exactly code_size bytes,
      * from image_read) IS region[CODE], no copy needed. img.rodata is placed at
-     * RISCV_HALF - img.rodata_size, purv.h's formula for a region that grows
-     * down from a half's top (mem_xlate derives it the same way, no separate
-     * base needed) -- not derived from code_size, so a fusion pass shrinking or
-     * growing the op array never moves it. */
+     * 0 - img.rodata_size, purv.h's formula for read-only data that grows down
+     * from 0 (mem_xlate derives it the same way from the length, no separate base
+     * needed) -- at small negative addresses, not derived from code_size, so a
+     * fusion pass shrinking or growing the op array never moves it. */
 
-    /* region[HEAP]: rwdata, then bss (the compiled code's global/static variables --
-     * their addresses are baked in at the linker's real offset, right after rwdata,
-     * same as purv), then the dynamic (brk-grown) heap. g_heap_size is the dynamic
-     * budget alone (--ram=, default below); bss is additional and must not be
-     * folded into it, or brk's start address overlaps live bss variables. */
+    /* The writable cluster is ONE buffer: the stack just below RISCV_HALF (grows
+     * down from it), then the heap from RISCV_HALF up -- rwdata, then bss (the
+     * compiled code's globals, baked in at the linker's real offset right after
+     * rwdata, same as purv), then the dynamic (brk-grown) heap. g_heap_size is the
+     * dynamic budget alone (--ram=, default below); bss is additional and must not
+     * be folded into it, or brk's start address overlaps live bss variables. */
     g_heap_region_len = img.rwdata_size + img.bss_size + g_heap_size;
-    g_heap = calloc(1, g_heap_region_len ? g_heap_region_len : 1);
+    g_stack_size = img.stack_size > (16u * 1024 * 1024) ? img.stack_size : (16u * 1024 * 1024);
+    uint8_t *writable = calloc(1, (size_t)g_stack_size + g_heap_region_len);
+    g_stack = writable;                               /* [RISCV_HALF - g_stack_size, RISCV_HALF) */
+    g_heap  = writable + g_stack_size;                /* [RISCV_HALF, RISCV_HALF + g_heap_region_len) */
     if (img.rwdata_size) memcpy(g_heap, img.rwdata, img.rwdata_size);
     g_brk = RISCV_HALF + img.rwdata_size + img.bss_size;
-
-    g_stack_size = img.stack_size > (16u * 1024 * 1024) ? img.stack_size : (16u * 1024 * 1024);
-    g_stack = calloc(1, g_stack_size);
 
     RiscvEmulatorState_t state;
     RiscvEmulatorInit(&state,
