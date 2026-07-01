@@ -133,9 +133,11 @@ host-purvs: host.c ../purvs/purvs.c ../purvs/purvs.h hostcalls.h
 
 # purva (the AOT-transcoded engine): host-purva loads a purva IMAGE directly (no
 # ELF, no decode at run time -- see host-purva.c) and drives the same evaluator
-# (purva.c) the standalone purva binary uses. transcode itself isn't built here
-# (it lives in ../purva); build it there once with `make -C ../purva transcode`.
-$(TRANSCODE):
+# (purva.c) the standalone purva binary uses. transcode lives in ../purva; delegate
+# to its own (incremental) build via FORCE so a stale transcode binary here is
+# rebuilt when its sources change -- without FORCE this recipe runs only when the
+# binary is absent, and an out-of-date transcode would silently mis-transcode.
+$(TRANSCODE): FORCE
 	$(MAKE) -C ../purva transcode
 host-purva: host-purva.c ../purva/purva.c ../purva/purva.h ../purva/image.h hostcalls.h
 	$(HOSTCC) $(HOSTFLAGS) host-purva.c ../purva/purva.c -I.. -I../purva -o $@
