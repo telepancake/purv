@@ -84,6 +84,7 @@ static const Transcoded *g_prog;
 
 void RiscvEmulatorSetProgram(const Transcoded *prog) { g_prog = prog; }
 
+__attribute__((optimize("no-gcse", "no-crossjumping")))
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     const Transcoded *prog = g_prog;
     if (!prog) return 0;
