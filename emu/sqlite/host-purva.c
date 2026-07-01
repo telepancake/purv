@@ -159,14 +159,12 @@ static int on_ecall(RiscvEmulatorState_t *st) {
 /* ------------------------------------------------------------------- main */
 
 extern int g_itrace;    /* TEMP debug */
-extern uint32_t g_watch; /* TEMP debug */
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <guest.img> [--max-insns=N] [--stats]\n", argv[0]); return 2; }
     uint64_t max_insns = 20000ull * 1000 * 1000;
     int stats = 0;
     g_itrace = getenv("ITRACE") != NULL;
-    if (getenv("WATCH")) g_watch = (uint32_t)strtoul(getenv("WATCH"), 0, 0);
     for (int i = 2; i < argc; i++) {
         if (!strncmp(argv[i], "--max-insns=", 12)) max_insns = strtoull(argv[i] + 12, 0, 0);
         else if (!strcmp(argv[i], "--stats")) stats = 1;

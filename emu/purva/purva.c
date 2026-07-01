@@ -21,7 +21,6 @@
 
 int g_itrace;              /* TEMP debug: per-instruction register trace */
 unsigned long g_icount;    /* TEMP debug: running instruction counter for trace labels */
-uint32_t g_watch;          /* TEMP debug: store-address watchpoint, 0 = off */
 
 static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
     fprintf(stderr, "I%lu op=%u@%u(pc=%u)", g_icount++, TC_OP(*p), (unsigned)(p - base), (unsigned)(p - base) * 4);
@@ -30,18 +29,16 @@ static void trace_dump(RiscvEmulatorState_t *s, uint32_t *p, uint32_t *base) {
 }
 #define TRACE_STEP() do { if (g_itrace) trace_dump(s, p, base); } while (0)
 
-/* A single 4-byte store, written the same way h_sw's does (GCC reliably folds this
- * exact shape into one unaligned mov). The fused prologue handler calls it once per
- * saved register into the contiguous save block. */
-static inline __attribute__((always_inline)) void st32(uint8_t *q, uint32_t v) {
-    q[0] = (uint8_t)v; q[1] = (uint8_t)(v >> 8); q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24);
+/* Little-endian assemble/scatter of n bytes. n is a compile-time constant at every
+ * call site, so GCC folds these to a single (unaligned) load/store of that width. */
+static inline __attribute__((always_inline)) uint32_t ld_le(const uint8_t *q, uint32_t n) {
+    uint32_t v = q[0]; if (n > 1) v |= (uint32_t)q[1] << 8;
+    if (n > 2) v |= (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; return v;
 }
-static inline __attribute__((always_inline)) uint32_t ld32(const uint8_t *q) {
-    return (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24;
+static inline __attribute__((always_inline)) void st_le(uint8_t *q, uint32_t n, uint32_t v) {
+    q[0] = (uint8_t)v; if (n > 1) q[1] = (uint8_t)(v >> 8);
+    if (n > 2) { q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24); }
 }
-
-/* Sign-extend the low `bits` of v (the load path uses it for LB/LH). */
-static int32_t sext(uint32_t v, int bits) { int sh = 32 - bits; return (int32_t)(v << sh) >> sh; }
 
 /* Data memory is the two self-describing regions of the state (see purv.h):
  *
@@ -52,12 +49,10 @@ static int32_t sext(uint32_t v, int bits) { int sh = 32 - bits; return (int32_t)
  *                 small negative addresses. (Instruction fetch is the op cursor, not
  *                 a region -- purva's "code" is packed op words, not data.)
  *
- * mem_w resolves a WRITABLE block to a host pointer (or NULL); mem_r resolves a
- * READ block (writable, then read-only). One base-relative bounded check each:
- * `rel < len && n <= len - rel` is correct for any n -- once rel < len, len - rel
- * can't underflow. The LOAD/STORE macros build the whole load/store on top of these:
- * assemble/scatter n little-endian bytes, a miss goes to the callback. The block
- * pointers are also what the fused prologue/epilogue want (one check per frame). */
+ * mem_w resolves a WRITABLE block to a host pointer (or NULL); mem_r resolves a READ
+ * block (writable, then read-only). One base-relative bounded check each: `rel < len
+ * && n <= len - rel` is correct for any n -- once rel < len, len - rel can't
+ * underflow. The LOAD/STORE macros and the fused prologue/epilogue build on these. */
 static inline __attribute__((always_inline))
 uint8_t *mem_w(const RiscvEmulatorState_t *s, uint32_t a, uint32_t n) {
     uint32_t rel = a - s->writable.base;
@@ -69,24 +64,6 @@ uint8_t *mem_r(const RiscvEmulatorState_t *s, uint32_t a, uint32_t n) {
     if (q) return q;
     uint32_t rel = a - s->readonly.base;
     return (rel < s->readonly.len && n <= s->readonly.len - rel) ? s->readonly.ptr + rel : (uint8_t *)0;
-}
-static inline __attribute__((always_inline))
-uint32_t mem_load(RiscvEmulatorState_t *s, uint32_t a, uint32_t n, int sgn) {
-    const uint8_t *q = mem_r(s, a, n);
-    uint32_t v;
-    if (q) { v = q[0]; if (n > 1) v |= (uint32_t)q[1] << 8;
-             if (n > 2) v |= (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; }
-    else v = s->callback(s, RISCV_MEM_LOAD, a, 0);
-    return sgn ? (uint32_t)sext(v, 8 * n) : (n == 4 ? v : v & ((1u << (8 * n)) - 1));
-}
-static inline __attribute__((always_inline))
-void mem_store(RiscvEmulatorState_t *s, uint32_t a, uint32_t n, uint32_t v) {
-    extern uint32_t g_watch;                       /* TEMP debug: store watchpoint */
-    if (g_watch && a == g_watch) fprintf(stderr, "WATCH store ad=0x%x val=0x%x n=%u\n", a, v, n);
-    uint8_t *q = mem_w(s, a, n);
-    if (q) { q[0] = (uint8_t)v; if (n > 1) q[1] = (uint8_t)(v >> 8);
-             if (n > 2) { q[2] = (uint8_t)(v >> 16); q[3] = (uint8_t)(v >> 24); } }
-    else s->callback(s, RISCV_MEM_STORE, a, v);
 }
 
 /* PROLOGUE/EPILOGUE regmask bit -> register number, in canonical save rank order
@@ -136,15 +113,21 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     /* Jump to op index `idx`: count it, budget-check (resume pc = idx<<2), relocate. */
     #define RELOC(idx) do { uint32_t i_ = (idx); k++; \
         if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; TRACE_STEP(); goto *tbl[TC_OP(w)]; } while (0)
-    /* One load, one store. addr = x[rs1] + imm; LOAD writes the sign/zero-extended
-     * result to rd, discarding a load into x0. Loads and JAL/JALR are the only ops
-     * that reach a handler with rd == 0 (a bare jump discards its link, a load into x0
-     * still probes memory) -- the transcoder drops every x0-destination ALU/LUI/AUIPC
-     * op during translation (it is a nop), so those handlers write s->x[...] with no
-     * guard. */
-    #define LOAD(n, sgn)  do { uint32_t rd_ = TC_A(w); \
-        if (rd_) s->x[rd_] = mem_load(s, s->x[TC_B(w)] + TC_IMM(w), (n), (sgn)); } while (0)
-    #define STORE(n)      mem_store(s, s->x[TC_B(w)] + TC_IMM(w), (n), s->x[TC_A(w)])
+    /* One load, one store. addr = x[rs1] + imm. LOAD(T): T is the loaded value's C
+     * type -- sizeof(T) picks the byte width, and the cast to (T) then int32_t does
+     * the sign/zero extension the width implies (LB/LH signed, LBU/LHU unsigned, LW
+     * full word), for both a region hit and a callback miss. A load into x0 is
+     * discarded (the only rd==0 case a load reaches; JAL/JALR handle their own) --
+     * the transcoder drops every x0-destination ALU/LUI/AUIPC op during translation,
+     * so those handlers write s->x[...] with no guard. STORE(n) writes n bytes; a
+     * miss (or a store to read-only) goes to the callback. */
+    #define LOAD(T) do { uint32_t rd_ = TC_A(w); \
+        if (rd_) { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w); const uint8_t *q_ = mem_r(s, a_, sizeof(T)); \
+            s->x[rd_] = (uint32_t)(int32_t)(T)(q_ ? ld_le(q_, sizeof(T)) \
+                                                  : s->callback(s, RISCV_MEM_LOAD, a_, 0)); } } while (0)
+    #define STORE(n) do { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w), v_ = s->x[TC_A(w)]; \
+        uint8_t *q_ = mem_w(s, a_, (n)); \
+        if (q_) st_le(q_, (n), v_); else s->callback(s, RISCV_MEM_STORE, a_, v_); } while (0)
 
     TRACE_STEP();
     goto *tbl[TC_OP(w)];
@@ -181,11 +164,11 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
               s->x[TC_A(w)] = b == 0 ? a : (a == 0x80000000u && (int32_t)b == -1) ? 0 : (uint32_t)((int32_t)a % (int32_t)b); NEXT();
     h_remu:   a = s->x[TC_B(w)]; b = s->x[TC_C(w)]; s->x[TC_A(w)] = b == 0 ? a : a % b; NEXT();
 
-    h_lb:  LOAD(1, 1); NEXT();
-    h_lh:  LOAD(2, 1); NEXT();
-    h_lw:  LOAD(4, 1); NEXT();
-    h_lbu: LOAD(1, 0); NEXT();
-    h_lhu: LOAD(2, 0); NEXT();
+    h_lb:  LOAD(int8_t);   NEXT();
+    h_lh:  LOAD(int16_t);  NEXT();
+    h_lw:  LOAD(int32_t);  NEXT();
+    h_lbu: LOAD(uint8_t);  NEXT();
+    h_lhu: LOAD(uint16_t); NEXT();
 
     h_sb:  STORE(1); NEXT();
     h_sh:  STORE(2); NEXT();
@@ -229,7 +212,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         if (q) {
             q += 4 * cnt;                                          /* one past the top slot */
             /* rank order ra,s0,s1,s2..s11 -> descending slots; q steps down only on a set bit. */
-            #define SAVE(bit, reg) if (rmask & (1u << (bit))) { q -= 4; st32(q, s->x[(reg)]); }
+            #define SAVE(bit, reg) if (rmask & (1u << (bit))) { q -= 4; st_le(q, 4, s->x[(reg)]); }
             SAVE(0,1) SAVE(1,8) SAVE(2,9) SAVE(3,18) SAVE(4,19) SAVE(5,20) SAVE(6,21)
             SAVE(7,22) SAVE(8,23) SAVE(9,24) SAVE(10,25) SAVE(11,26) SAVE(12,27)
             #undef SAVE
@@ -237,7 +220,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t addr = sp0, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_w(s, addr, 4);
-                if (qq) st32(qq, v); else s->callback(s, RISCV_MEM_STORE, addr, v); }
+                if (qq) st_le(qq, 4, v); else s->callback(s, RISCV_MEM_STORE, addr, v); }
         }
         s->x[2] = sp0 - frame;
         k += cnt + 1; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
@@ -252,7 +235,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         uint8_t *q = mem_r(s, sp0 + frame - 4 * cnt, 4 * cnt);   /* one resolve for the whole block */
         if (q) {
             q += 4 * cnt;
-            #define REST(bit, reg) if (rmask & (1u << (bit))) { q -= 4; s->x[(reg)] = ld32(q); }
+            #define REST(bit, reg) if (rmask & (1u << (bit))) { q -= 4; s->x[(reg)] = ld_le(q, 4); }
             REST(0,1) REST(1,8) REST(2,9) REST(3,18) REST(4,19) REST(5,20) REST(6,21)
             REST(7,22) REST(8,23) REST(9,24) REST(10,25) REST(11,26) REST(12,27)
             #undef REST
@@ -260,7 +243,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t addr = sp0 + frame, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint8_t *qq = mem_r(s, addr, 4);
-                s->x[rank2reg[r]] = qq ? ld32(qq) : s->callback(s, RISCV_MEM_LOAD, addr, 0); }
+                s->x[rank2reg[r]] = qq ? ld_le(qq, 4) : s->callback(s, RISCV_MEM_LOAD, addr, 0); }
         }
         s->x[2] = sp0 + frame;
         uint32_t t = s->x[1] & ~1u; k += cnt + 2;
