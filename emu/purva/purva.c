@@ -162,40 +162,40 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_lb: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
                 wr(s, rd, q ? (uint32_t)(int32_t)(int8_t)q[0]
-                            : (uint32_t)sext(s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0, 8)); } }
+                            : (uint32_t)sext(s->callback(s, RISCV_MEM_LOAD, ad, 0), 8)); } }
           NEXT();
     h_lh: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
                 wr(s, rd, q ? (uint32_t)(int32_t)(int16_t)(q[0] | q[1] << 8)
-                            : (uint32_t)sext(s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0, 16)); } }
+                            : (uint32_t)sext(s->callback(s, RISCV_MEM_LOAD, ad, 0), 16)); } }
           NEXT();
     h_lw: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 4, 0);
                 wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24)
-                            : (s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0)); } }
+                            : (s->callback(s, RISCV_MEM_LOAD, ad, 0))); } }
           NEXT();
     h_lbu: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 1, 0);
-                wr(s, rd, q ? q[0] : ((s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0) & 0xff)); } }
+                wr(s, rd, q ? q[0] : ((s->callback(s, RISCV_MEM_LOAD, ad, 0)) & 0xff)); } }
           NEXT();
     h_lhu: { uint32_t rd = TC_A(w), ad = s->x[TC_B(w)] + TC_IMM(w);
             if (rd) { uint8_t *q = mem_xlate(s, ad, 2, 0);
                 wr(s, rd, q ? ((uint32_t)q[0] | (uint32_t)q[1] << 8)
-                            : ((s->callback ? s->callback(s, RISCV_MEM_LOAD, ad, 0) : 0) & 0xffff)); } }
+                            : ((s->callback(s, RISCV_MEM_LOAD, ad, 0)) & 0xffff)); } }
           NEXT();
 
     h_sb: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 1, 1);
-            if (q) q[0] = (uint8_t)b; else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
+            if (q) q[0] = (uint8_t)b; else s->callback(s, RISCV_MEM_STORE, ad, b); }
           NEXT();
     h_sh: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 2, 1);
-            if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); } else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
+            if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); } else s->callback(s, RISCV_MEM_STORE, ad, b); }
           NEXT();
     h_sw: { uint32_t ad = s->x[TC_B(w)] + TC_IMM(w); b = s->x[TC_A(w)]; uint8_t *q = mem_xlate(s, ad, 4, 1);
             extern uint32_t g_watch;
             if (g_watch && ad == g_watch)
                 fprintf(stderr, "WATCH sw ad=0x%x val=0x%x at op-idx=%u (pc=%u)\n", ad, b, (unsigned)(p - base), (unsigned)(p - base) * 4);
             if (q) { q[0] = (uint8_t)b; q[1] = (uint8_t)(b >> 8); q[2] = (uint8_t)(b >> 16); q[3] = (uint8_t)(b >> 24); }
-            else if (s->callback) s->callback(s, RISCV_MEM_STORE, ad, b); }
+            else s->callback(s, RISCV_MEM_STORE, ad, b); }
           NEXT();
 
     h_beq:  a = s->x[TC_A(w)]; b = s->x[TC_B(w)]; if (a == b)                   RELOC((uint32_t)(p - base) + (uint32_t)(TC_IMM(w) >> 2)); NEXT();
@@ -240,7 +240,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t addr = sp0, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_xlate(s, addr, 4, 1);
-                if (qq) st32(qq, v); else if (s->callback) s->callback(s, RISCV_MEM_STORE, addr, v); }
+                if (qq) st32(qq, v); else s->callback(s, RISCV_MEM_STORE, addr, v); }
         }
         s->x[2] = sp0 - frame;
         k += cnt + 1; w = *++p; TRACE_STEP(); goto *tbl[TC_OP(w)];
@@ -263,7 +263,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             uint32_t addr = sp0 + frame, m = rmask;
             while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
                 uint8_t *qq = mem_xlate(s, addr, 4, 0);
-                s->x[rank2reg[r]] = qq ? ld32(qq) : (s->callback ? s->callback(s, RISCV_MEM_LOAD, addr, 0) : 0); }
+                s->x[rank2reg[r]] = qq ? ld32(qq) : s->callback(s, RISCV_MEM_LOAD, addr, 0); }
         }
         s->x[2] = sp0 + frame;
         uint32_t t = s->x[1] & ~1u; k += cnt + 2;
@@ -288,6 +288,9 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
 
 /* ------------------------------------------------------------------ init */
 
+/* Installed by RiscvEmulatorInit so s->callback is ALWAYS valid; the load/store miss
+ * paths invoke it unconditionally rather than null-checking. A miss with no host
+ * handler thus reads 0 / drops the write, same as a NULL callback would have. */
 static uint32_t default_callback(RiscvEmulatorState_t *s, int op, uint32_t addr, uint32_t value) {
     (void)s; (void)op; (void)addr; (void)value; return 0;
 }
