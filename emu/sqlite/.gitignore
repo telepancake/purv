@@ -19,3 +19,7 @@ purva.err
 host-purva
 guest-bench-purva.elf
 guest-bench-purva.img
+host-purva-noloop
+callgrind.out.*
+cg-*.err
+cg-*.out
