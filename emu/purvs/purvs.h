@@ -20,19 +20,19 @@
 
 #include <stdint.h>
 
-/* The address space is split in half at the bit-31 boundary. Each half holds two
- * regions that grow toward each other from its ends:
+/* Data memory is two self-describing regions (each carries its own base), clustered
+ * around the two fixed anchors 0 and RISCV_HALF:
  *
- *   lower half [0, RISCV_HALF)        -- readable, NOT writable:
- *       code   [0, code.len)              (also the instruction-fetch window)
- *       rodata [RISCV_HALF - rodata.len, RISCV_HALF)
- *   upper half [RISCV_HALF, 2^32)     -- readable AND writable:
- *       heap   [RISCV_HALF, RISCV_HALF + heap.len)
- *       stack  [2^32 - stack.len, 2^32)   (grows down from 0; sp starts at 0)
+ *   readonly  the read-only span around 0 -- code (also the instruction-fetch
+ *             window, at [0, code.len)) and rodata.
+ *   writable  the read/write span around RISCV_HALF -- the stack just below it
+ *             (grows down from RISCV_HALF) and the heap just above, as ONE region.
+ *             sp starts at RISCV_HALF.
  *
- * A data load outside all four regions, or a store to the lower (read-only) half
- * or outside, calls the memory callback (which a default no-op installs). */
-#define RISCV_HALF  0x80000000u                  /* lower/upper boundary; heap base */
+ * A load that misses both regions, or a store outside the writable region, calls the
+ * memory callback (which a default no-op installs). A translation is one bounded
+ * check per region -- no half-split, no growing-toward-each-other pairs. */
+#define RISCV_HALF  0x80000000u                  /* stack/heap boundary; sp starts here */
 
 typedef struct RiscvEmulatorState RiscvEmulatorState_t;
 
@@ -57,22 +57,15 @@ enum { RISCV_MEM_LOAD = 0, RISCV_MEM_STORE = 1 };
 typedef uint32_t (*RiscvEmulatorMemFn)(RiscvEmulatorState_t *state, int op,
                                        uint32_t addr, uint32_t value);
 
-/* One memory region: host storage of `len` bytes mapped at the region's (fixed)
- * base. There is no writable flag -- writability follows the address half. ptr ==
- * NULL (len 0) means the region is unmapped. */
+/* One memory region: host storage of `len` bytes holding the guest bytes at
+ * [base, base + len). ptr == NULL (len 0) means the region is unmapped. Each region
+ * is self-describing (carries its own base), so a translation is one bounded check
+ * -- (uint64_t)(addr - base) + n <= len -- with no per-access base arithmetic. */
 typedef struct {
     uint8_t *ptr;
     uint32_t len;
+    uint32_t base;
 } RiscvEmulatorRegion_t;
-
-/* The four regions, indexed `half*2 + direction`. The low bit is the grow
- * direction within a half (0 = up from the half's base, 1 = down from its top);
- * the high bit is the half (0 = lower / read-only, 1 = upper / read-write):
- *   region[RISCV_CODE]   [0, len)                     fetch + read-only data
- *   region[RISCV_RODATA] [RISCV_HALF - len, RISCV_HALF)   read-only data
- *   region[RISCV_HEAP]   [RISCV_HALF, RISCV_HALF + len)   read/write data
- *   region[RISCV_STACK]  [2^32 - len, 2^32)               read/write, grows down */
-enum { RISCV_CODE, RISCV_RODATA, RISCV_HEAP, RISCV_STACK };
 
 /* ---- decoded instruction: the engine's wide internal form ----
  *
@@ -192,11 +185,13 @@ typedef uint32_t (*RiscvEmulatorEvalFn)(RiscvEmulatorState_t *state,
 /* The whole VM state. Set it up by writing the fields:
  *   - pc:       the next instruction to execute (the run loop resumes here);
  *   - x[1..31]: registers (x[0] reads as zero; the engine never writes it);
- *   - region[]: the four memory regions above (sp starts at 0, grows down into
- *               region[RISCV_STACK]; instruction fetch reads region[RISCV_CODE]);
+ *   - readonly: the read-only span around 0 -- code (also the instruction-fetch
+ *               window at [0, code.len)) and rodata; based at 0;
+ *   - writable: the read/write span around RISCV_HALF -- stack (grows down from
+ *               RISCV_HALF) and heap (up from it) as ONE region; sp starts at RISCV_HALF;
  *   - ecall/ebreak/illegal: the trap handlers the engine calls;
- *   - callback: handles a data access that misses the regions or hits read-only
- *               memory (see RiscvEmulatorMemFn); Init installs a no-op default;
+ *   - callback: handles a data access that misses both regions, or a store into the
+ *               read-only region (see RiscvEmulatorMemFn); Init installs a no-op default;
  *   - eval: the pluggable per-instruction evaluator (see RiscvEmulatorEvalFn);
  *           Init installs RiscvEmulatorDefaultEval (ordinary RV32 semantics).
  * `inst` is engine-internal scratch: the run loop keeps the live next-pc in a
@@ -206,19 +201,19 @@ struct RiscvEmulatorState {
     uint32_t pc;
     uint32_t inst;                               /* internal: raw word of the faulting insn */
     uint32_t x[32];
-    RiscvEmulatorRegion_t region[4];
+    RiscvEmulatorRegion_t readonly;              /* code (+ rodata): read-only, fetch window */
+    RiscvEmulatorRegion_t writable;              /* stack + heap: one read/write span */
     RiscvEmulatorTrapFn   ecall, ebreak, illegal;
     RiscvEmulatorMemFn    callback;
     RiscvEmulatorEvalFn   eval;                  /* the value semantics; Init -> default */
 };
 
-/* Optional convenience: zero the state, map the four regions, install the default
- * (no-op) memory callback and the default eval, set sp (x[2]) to 0 -- the stack
- * grows down from 2^32 -- and pc to 0 (code is based at 0). Allocate the struct
- * yourself (stack or heap); there is no create/destroy. */
+/* Optional convenience: zero the state, map the two regions, install the default
+ * (no-op) memory callback and the default eval, set sp (x[2]) to RISCV_HALF -- the
+ * stack grows down from there -- and pc to 0. Allocate the struct yourself; there is
+ * no create/destroy. */
 void RiscvEmulatorInit(RiscvEmulatorState_t *state,
-                       RiscvEmulatorRegion_t code, RiscvEmulatorRegion_t rodata,
-                       RiscvEmulatorRegion_t heap, RiscvEmulatorRegion_t stack);
+                       RiscvEmulatorRegion_t readonly, RiscvEmulatorRegion_t writable);
 
 /* ---- The VM ----
  * Execute up to `max` instructions and return the number actually executed.
@@ -249,9 +244,8 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *state, uint64_t max);
 uint32_t RiscvEmulatorDefaultEval(RiscvEmulatorState_t *state,
                                   const RiscvEmulatorDecoded_t *block);
 
-/* (To read or write guest memory from outside the engine, pick the region from
- * the address: half = addr >> 31, then within the half lo = addr & (RISCV_HALF-1)
- * is region[half*2]'s offset if lo < its len, else region[half*2+1] grows down
- * from RISCV_HALF.) */
+/* (To read or write guest memory from outside the engine, test the two regions:
+ * rel = addr - region.base; if ((uint64_t)rel + n <= region.len) it is region.ptr +
+ * rel. Try `writable` first, then `readonly`.) */
 
 #endif /* PURVS_H_ */

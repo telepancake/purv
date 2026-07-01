@@ -63,20 +63,19 @@ enum { RISCV_BLOCK_MAX = 64, RISCV_BLOCK_SLOTS = 2 * RISCV_BLOCK_MAX + 1 };
 static inline int op_has_imm(uint8_t op) { return (int)((RISCV_IMM_MASK >> op) & 1u); }
 
 /* ---- memory: one address translation, used by every load and store ---- */
-/* mem_xlate maps [addr, addr+n) to host storage, or NULL on a miss (and on a
- * write to the read-only lower half). The half (addr >> 31) selects a pair of
- * adjacent regions that grow toward each other: region[half*2] up from the half's
- * base, region[half*2+1] down from RISCV_HALF. The load/store sites read/write the
- * bytes explicitly per width (little-endian, so the byte-or / byte-store idioms
+/* mem_xlate maps [addr, addr+n) to host storage, or NULL on a miss (and on a write
+ * to the read-only region). Two self-describing regions, one bounded check each: a
+ * WRITE tests only the writable span; a READ falls through to the read-only span.
+ * `(uint64_t)rel + n <= len` is correct for any n. The load/store sites read/write
+ * the bytes explicitly per width (little-endian, so the byte-or / byte-store idioms
  * compile to a single unaligned sized access). */
 static inline __attribute__((always_inline))
 uint8_t *mem_xlate(const RiscvEmulatorState_t *s, uint32_t addr, uint32_t n, int write) {
-    if (write && addr < RISCV_HALF) return (uint8_t *)0;     /* lower half is read-only */
-    const RiscvEmulatorRegion_t *r = &s->region[(addr >> 31) << 1];
-    uint32_t lo = addr & (RISCV_HALF - 1);
-    if (lo + n <= r[0].len) return r[0].ptr + lo;            /* grows up from the base */
-    uint32_t down = RISCV_HALF - r[1].len;                   /* grows down from RISCV_HALF */
-    if (lo >= down && lo + n <= RISCV_HALF) return r[1].ptr + (lo - down);
+    uint32_t rel = addr - s->writable.base;
+    if ((uint64_t)rel + n <= s->writable.len) return s->writable.ptr + rel;
+    if (write) return (uint8_t *)0;
+    rel = addr - s->readonly.base;
+    if ((uint64_t)rel + n <= s->readonly.len) return s->readonly.ptr + rel;
     return (uint8_t *)0;
 }
 
@@ -533,8 +532,8 @@ static uint32_t fixup_pc(const uint8_t *code, uint32_t pc, uint32_t records, uin
 
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     RiscvEmulatorDecoded_t block[RISCV_BLOCK_SLOTS];    /* head + imm slots, incl. END */
-    const uint8_t *code = s->region[RISCV_CODE].ptr;    /* instruction-fetch window... */
-    uint32_t code_len = s->region[RISCV_CODE].len;      /* ...based at 0 */
+    const uint8_t *code = s->readonly.ptr;    /* instruction-fetch window... */
+    uint32_t code_len = s->readonly.len;      /* ...the read-only span, based at 0 */
     RiscvEmulatorEvalFn eval = s->eval ? s->eval : RiscvEmulatorDefaultEval;
     uint64_t k = 0;
 
@@ -634,15 +633,12 @@ static uint32_t default_callback(RiscvEmulatorState_t *s, int op, uint32_t addr,
 }
 
 void RiscvEmulatorInit(RiscvEmulatorState_t *s,
-                       RiscvEmulatorRegion_t code, RiscvEmulatorRegion_t rodata,
-                       RiscvEmulatorRegion_t heap, RiscvEmulatorRegion_t stack) {
+                       RiscvEmulatorRegion_t readonly, RiscvEmulatorRegion_t writable) {
     memset(s, 0, sizeof *s);              /* clears registers, regions, handlers */
-    s->region[RISCV_CODE]   = code;       /* [0, len): instruction fetch + read-only data */
-    s->region[RISCV_RODATA] = rodata;     /* read-only data, just below RISCV_HALF */
-    s->region[RISCV_HEAP]   = heap;       /* read/write, from RISCV_HALF up */
-    s->region[RISCV_STACK]  = stack;      /* read/write, grows down, ends at the last address */
+    s->readonly = readonly;               /* code (+ rodata): fetch window + read-only data */
+    s->writable = writable;               /* stack + heap: one read/write span */
     s->callback = default_callback;       /* no-op until the host installs its own */
     s->eval     = RiscvEmulatorDefaultEval;  /* threaded RV32 semantics until swapped */
-    s->x[2] = 0;                          /* sp = 0 == 2^32, one past the top of the stack */
+    s->x[2] = RISCV_HALF;                 /* sp: stack grows down from RISCV_HALF */
     s->pc = 0;                            /* code is based at 0 */
 }

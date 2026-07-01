@@ -34,16 +34,16 @@
 
 /* ------------------------------------------------------------------ memory */
 
-/* Three host buffers map the engine's four regions:
- *   g_code  -> code   [0, CODE_BYTES)            lower half: text + rodata (RO, fetched)
- *   g_heap  -> heap   [RISCV_HALF, +heap_size)   upper half: data + bss + heap (RW)
- *   g_stack -> stack  [STACK_MEM_BASE, 2^32)     upper half: the stack, grows down
- * (The engine's separate `rodata` region is left unmapped here; a guest's .rodata
- * rides in the code region.) sp starts at 0 (== 2^32, one past the stack top). */
+/* Host buffers map the engine's two regions:
+ *   g_code  -> readonly [0, CODE_BYTES)              text + rodata (RO, also fetched)
+ *   g_stack -> writable [STACK_MEM_BASE, RISCV_HALF) the stack, grows down from RISCV_HALF
+ *   g_heap  -> writable [RISCV_HALF, +heap_size)     data + bss + heap, one buffer with the stack
+ * (g_stack and g_heap are two views into purvhost's single writable buffer.) sp starts
+ * at RISCV_HALF. */
 #define CODE_BYTES        (64u * 1024u * 1024u)
 #define PURV_HEAP_DEFAULT (256u * 1024u * 1024u)
 #define STACK_BYTES       (16u * 1024u * 1024u)
-#define STACK_MEM_BASE    ((uint32_t)(0u - STACK_BYTES))   /* host base of the stack buffer */
+#define STACK_MEM_BASE    (RISCV_HALF - STACK_BYTES)       /* guest base of the stack buffer */
 static uint8_t *g_code;
 static uint8_t *g_heap;
 static uint32_t g_heap_size;
@@ -162,10 +162,10 @@ static void gpoke(uint32_t addr, uint32_t v) {
 
 /* Build the initial process stack (RISC-V Linux ABI): sp points at argc,
  * followed by the argv pointers, a NULL, an empty envp, and an AT_NULL auxv.
- * Built at the top of the stack region (sp starts at 0 == 2^32); argument
+ * Built at the top of the stack region (sp starts at RISCV_HALF); argument
  * strings sit just below the top. Returns the new sp. */
 static uint32_t setup_user_stack(int argc, char **argv) {
-    uint32_t sp = 0;                                 /* 2^32: one past the last address */
+    uint32_t sp = RISCV_HALF;                         /* top of the stack, grows down */
     uint32_t ptr[64] = {0};
     if (argc > 64) argc = 64;
     for (int i = argc - 1; i >= 0; i--) {

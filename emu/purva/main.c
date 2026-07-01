@@ -28,7 +28,7 @@
 #define STACK_MEM_BASE(stack_len) ((uint32_t)(RISCV_HALF - (stack_len)))
 static uint8_t *g_heap, *g_stack;
 static uint32_t g_heap_size;      /* the DYNAMIC (brk-grown) budget alone, not bss/rwdata */
-static uint32_t g_heap_region_len; /* the full region[HEAP] length: rwdata + bss + g_heap_size */
+static uint32_t g_heap_region_len; /* the heap part of the writable region: rwdata + bss + g_heap_size */
 static uint32_t g_stack_size;
 
 static int      g_halt;
@@ -50,12 +50,10 @@ static int in_heap(uint32_t addr, uint32_t len) {
  * purv/purvs use, so purva reads its own memory here). One bounded check per
  * region -- writable first, then read-only rodata. */
 static uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    const RiscvEmulatorRegion_t *rw = &s->region[RISCV_WRITABLE];
-    uint32_t rel = a - rw->base;
-    if ((uint64_t)rel + 1 <= rw->len) return rw->ptr[rel];
-    const RiscvEmulatorRegion_t *ro = &s->region[RISCV_READONLY];
-    rel = a - ro->base;
-    if ((uint64_t)rel + 1 <= ro->len) return ro->ptr[rel];
+    uint32_t rel = a - s->writable.base;
+    if ((uint64_t)rel + 1 <= s->writable.len) return s->writable.ptr[rel];
+    rel = a - s->readonly.base;
+    if ((uint64_t)rel + 1 <= s->readonly.len) return s->readonly.ptr[rel];
     return 0;
 }
 
@@ -206,15 +204,12 @@ int main(int argc, char **argv) {
         g_have_symbols = 1;
     }
 
-    /* region[CODE] and region[RODATA] are genuinely separate regions -- purva.c's
-     * mem_xlate never resolves a data access into region[CODE] at all (purva's
-     * "code" is packed op words, not real RISC-V bytes; there is nothing sane
-     * for a data load to read there); img.code (already exactly code_size bytes,
-     * from image_read) IS region[CODE], no copy needed. img.rodata is placed at
-     * 0 - img.rodata_size, purv.h's formula for read-only data that grows down
-     * from 0 (mem_xlate derives it the same way from the length, no separate base
-     * needed) -- at small negative addresses, not derived from code_size, so a
-     * fusion pass shrinking or growing the op array never moves it. */
+    /* purva's readonly region is img.rodata alone -- its "code" is packed op words,
+     * not real RISC-V bytes, so a data load never resolves into code (img.code is
+     * installed as the program, not a data region). rodata is based at 0 -
+     * img.rodata_size (read-only data growing down from 0, at small negative
+     * addresses; mem_xlate derives the base from the length), not from code_size, so
+     * a fusion pass shrinking or growing the op array never moves it. */
 
     /* The writable cluster is ONE buffer: the stack just below RISCV_HALF (grows
      * down from it), then the heap from RISCV_HALF up -- rwdata, then bss (the
@@ -232,10 +227,9 @@ int main(int argc, char **argv) {
 
     RiscvEmulatorState_t state;
     RiscvEmulatorInit(&state,
-        (RiscvEmulatorRegion_t){ img.code, img.code_size },
-        (RiscvEmulatorRegion_t){ img.rodata, img.rodata_size },
-        (RiscvEmulatorRegion_t){ g_heap, g_heap_region_len },
-        (RiscvEmulatorRegion_t){ g_stack, g_stack_size });
+        (RiscvEmulatorRegion_t){ img.rodata, img.rodata_size, 0u - img.rodata_size },     /* readonly: rodata below 0 */
+        (RiscvEmulatorRegion_t){ writable, g_stack_size + g_heap_region_len, RISCV_HALF - g_stack_size }); /* writable: stack+heap */
+    /* img.code is the op array, installed as the program below -- not a data region. */
     RiscvEmulatorState_t *st = &state;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;

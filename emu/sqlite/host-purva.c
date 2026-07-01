@@ -112,12 +112,10 @@ static int on_ebreak(RiscvEmulatorState_t *st) { (void)st; return 1; }
 /* Mirrors purva.c's mem_xlate: two self-describing regions, each { ptr, len, base }.
  * One bounded check per region -- writable first, then read-only rodata. */
 static uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    const RiscvEmulatorRegion_t *rw = &s->region[RISCV_WRITABLE];
-    uint32_t rel = a - rw->base;
-    if ((uint64_t)rel + 1 <= rw->len) return rw->ptr[rel];
-    const RiscvEmulatorRegion_t *ro = &s->region[RISCV_READONLY];
-    rel = a - ro->base;
-    if ((uint64_t)rel + 1 <= ro->len) return ro->ptr[rel];
+    uint32_t rel = a - s->writable.base;
+    if ((uint64_t)rel + 1 <= s->writable.len) return s->writable.ptr[rel];
+    rel = a - s->readonly.base;
+    if ((uint64_t)rel + 1 <= s->readonly.len) return s->readonly.ptr[rel];
     return 0;
 }
 
@@ -177,11 +175,11 @@ int main(int argc, char **argv) {
     Image img;
     if (image_read(argv[1], &img) != 0) { fprintf(stderr, "host-purva: cannot read %s\n", argv[1]); return 2; }
 
-    /* Two contiguous clusters (purv.h / purva.c mem_xlate):
+    /* Two regions (purv.h / purva.c mem_xlate):
      *
-     * read-only: region[RODATA] is img.rodata, guest base 0 - rodata_size -- it grows
-     *   down from 0, living at small NEGATIVE addresses. region[CODE] is the packed op
-     *   words; purva never data-addresses code (see image.h), so it needs no data map.
+     * readonly: img.rodata, guest base 0 - rodata_size -- it grows down from 0, living
+     *   at small NEGATIVE addresses. img.code (the packed op words) is never data-
+     *   addressable (see image.h); it is installed as the program, not a data region.
      *
      * writable: ONE buffer, stack then heap, back to back. The stack occupies
      *   [RISCV_HALF - STACK_BYTES, RISCV_HALF) (sp starts at RISCV_HALF, grows down);
@@ -199,10 +197,10 @@ int main(int argc, char **argv) {
 
     RiscvEmulatorState_t state;
     RiscvEmulatorInit(&state,
-        (RiscvEmulatorRegion_t){ img.code, img.code_size },
-        (RiscvEmulatorRegion_t){ img.rodata, img.rodata_size },
-        (RiscvEmulatorRegion_t){ g_heap, heap_len },
-        (RiscvEmulatorRegion_t){ g_stack, STACK_BYTES });
+        (RiscvEmulatorRegion_t){ img.rodata, img.rodata_size, 0u - img.rodata_size },     /* readonly: rodata below 0 */
+        (RiscvEmulatorRegion_t){ writable, STACK_BYTES + heap_len, RISCV_HALF - STACK_BYTES }); /* writable: stack+heap */
+    /* img.code is the transcoded op array -- installed as the program below, not a
+     * data region (purva fetches from the op cursor, never data-addresses code). */
     RiscvEmulatorState_t *st = &state;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;

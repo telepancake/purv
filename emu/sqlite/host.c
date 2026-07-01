@@ -41,7 +41,6 @@
 
 #define RAM_BYTES   (256u * 1024 * 1024)
 #define STACK_BYTES (16u * 1024 * 1024)
-#define STACK_MEM_BASE ((uint32_t)(0u - STACK_BYTES))   /* stack ends at the last address */
 #ifdef PURV_TAGGED
 /* purvs (old engine): one RAM region at RAM_ORIGIN holds code + data + heap. */
 static uint8_t *g_ram;
@@ -51,11 +50,11 @@ static int in_ram(uint32_t a, uint32_t n) {
     return a >= RAM_ORIGIN && (uint64_t)a + n <= (uint64_t)RAM_ORIGIN + RAM_BYTES;
 }
 #else
-/* purv (four-region engine): code (text+rodata) in the read-only lower half at 0;
- * heap (data+bss+malloc) in the read/write upper half at RISCV_HALF; stack at the
- * top. The K&R allocator's arena lives in the heap region. */
+/* purv (two-region engine): readonly = code (text+rodata) at 0; writable = the stack
+ * (just below RISCV_HALF) and heap (data+bss+malloc, from RISCV_HALF up) as ONE
+ * contiguous buffer. The K&R allocator's arena lives in the heap part. */
 #define CODE_BYTES (64u * 1024 * 1024)
-static uint8_t *g_code, *g_heap, *g_stack;
+static uint8_t *g_code, *g_heap;
 #define g_arena    g_heap
 #define ARENA_BASE RISCV_HALF
 static int in_code(uint32_t a, uint32_t n) {
@@ -216,18 +215,18 @@ static inline void     spc(RiscvEmulatorState_t *s, uint32_t v)    { s->pc = v; 
 static inline uint32_t gpc(const RiscvEmulatorState_t *s)          { return s->pc; }
 #endif
 
-/* A guest byte for the write syscall -- it may point into any region (the stack
- * is its own region now), so purv walks the region map; purvs reads region 0. */
+/* A guest byte for the write syscall. purv tests the two self-describing regions
+ * (writable first, then read-only); purvs' tagged variant reads its flat RAM. */
 #ifdef PURV_TAGGED
 static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
     (void)s; return in_ram(a, 1) ? g_ram[a - RAM_ORIGIN] : 0;
 }
 #else
 static inline uint8_t gbyte(const RiscvEmulatorState_t *s, uint32_t a) {
-    const RiscvEmulatorRegion_t *r = &s->region[(a >> 31) << 1];
-    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
-    if (lo < r[0].len)  return r[0].ptr[lo];
-    if (lo >= down && r[1].len) return r[1].ptr[lo - down];
+    uint32_t rel = a - s->writable.base;
+    if ((uint64_t)rel + 1 <= s->writable.len) return s->writable.ptr[rel];
+    rel = a - s->readonly.base;
+    if ((uint64_t)rel + 1 <= s->readonly.len) return s->readonly.ptr[rel];
     return 0;
 }
 #endif
@@ -345,23 +344,21 @@ int main(int argc, char **argv) {
     if (!st) { fprintf(stderr, "cannot create state\n"); return 2; }
     rset(st, 2, RAM_ORIGIN + RAM_BYTES);   /* sp at top of region 0 */
 #else
-    /* purv: code (text+rodata) is the read-only lower half at 0; the heap holds the
-     * guest's data+bss and the malloc arena (just past the data); the stack is the
-     * top region. Init wires the four regions, sp, pc, and the default callback. */
-    g_code  = calloc(1, CODE_BYTES);
-    g_heap  = calloc(1, RAM_BYTES);
-    g_stack = calloc(1, STACK_BYTES);
-    if (!g_code || !g_heap || !g_stack) { fprintf(stderr, "OOM\n"); return 2; }
+    /* purv: readonly = code (text+rodata) at 0; writable = one buffer holding the
+     * stack (just below RISCV_HALF) then the heap (guest data+bss + malloc arena,
+     * from RISCV_HALF up). Init wires the two regions, sp (RISCV_HALF), pc, callback. */
+    g_code = calloc(1, CODE_BYTES);
+    uint8_t *g_writable = calloc(1, (size_t)STACK_BYTES + RAM_BYTES);
+    g_heap = g_writable + STACK_BYTES;                 /* heap base = guest RISCV_HALF */
+    if (!g_code || !g_writable) { fprintf(stderr, "OOM\n"); return 2; }
     uint32_t entry = load_elf(argv[1]);
     uint32_t heap_base = (g_image_end + 15u) & ~15u;   /* malloc arena: past the data */
     if (heap_base < RISCV_HALF) heap_base = RISCV_HALF;
     heap_init(heap_base, RISCV_HALF + RAM_BYTES);
-    RiscvEmulatorRegion_t code   = { g_code,  CODE_BYTES };
-    RiscvEmulatorRegion_t rodata = { 0, 0 };
-    RiscvEmulatorRegion_t heap   = { g_heap,  RAM_BYTES };
-    RiscvEmulatorRegion_t stack  = { g_stack, STACK_BYTES };
+    RiscvEmulatorRegion_t readonly = { g_code, CODE_BYTES, 0 };
+    RiscvEmulatorRegion_t writable = { g_writable, STACK_BYTES + RAM_BYTES, RISCV_HALF - STACK_BYTES };
     RiscvEmulatorState_t state;
-    RiscvEmulatorInit(&state, code, rodata, heap, stack);
+    RiscvEmulatorInit(&state, readonly, writable);
     RiscvEmulatorState_t *st = &state;
     st->ecall = on_ecall;
     st->ebreak = on_ebreak;

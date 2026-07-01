@@ -150,26 +150,27 @@ static void reg_set(RiscvEmulatorState_t *st, uint32_t i, uint32_t v) {
     else if (i)  st->x[i] = v;              /* x0 stays zero */
 }
 
-/* Guest memory resolved like the engine does: the half picks a pair of regions,
- * the lower grows up from the base, the upper grows down from RISCV_HALF. Returns
- * a byte pointer or NULL (out of range). Writes are allowed only in the writable
- * upper half, so the caller checks the half before storing. */
-static uint8_t *byte_at(const RiscvEmulatorState_t *st, uint32_t a) {
-    const RiscvEmulatorRegion_t *r = &st->region[(a >> 31) << 1];
-    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
-    if (lo < r[0].len)          return r[0].ptr + lo;
-    if (lo >= down && r[1].len) return r[1].ptr + (lo - down);
+/* Guest memory resolved like the engine does (see mem_xlate): the two self-describing
+ * regions, writable first then read-only, each a base-relative bounded check. Returns
+ * a byte pointer or NULL. A write passes write=1 so it resolves only in the writable
+ * region (a store to read-only memory returns NULL). */
+static uint8_t *byte_at(const RiscvEmulatorState_t *st, uint32_t a, int write) {
+    uint32_t rel = a - st->writable.base;
+    if ((uint64_t)rel + 1 <= st->writable.len) return st->writable.ptr + rel;
+    if (write) return (uint8_t *)0;
+    rel = a - st->readonly.base;
+    if ((uint64_t)rel + 1 <= st->readonly.len) return st->readonly.ptr + rel;
     return (uint8_t *)0;
 }
 static void mem_read(const RiscvEmulatorState_t *st, uint32_t addr, uint8_t *dst, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
-        uint8_t *p = byte_at(st, addr + i);
+        uint8_t *p = byte_at(st, addr + i, 0);
         dst[i] = p ? *p : 0;
     }
 }
 static void mem_write(RiscvEmulatorState_t *st, uint32_t addr, const uint8_t *src, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
-        uint8_t *p = (addr + i) & RISCV_HALF ? byte_at(st, addr + i) : (uint8_t *)0;
+        uint8_t *p = byte_at(st, addr + i, 1);
         if (p) *p = src[i];
     }
 }

@@ -31,9 +31,9 @@
 #error "include the engine header (purv.h or purvs.h) before purvhost.h"
 #endif
 
-/* Default region sizes; #define before including to override. The lower half holds
- * code (text+rodata, read-only, fetched); the upper half holds the heap (data+bss+
- * malloc arena) at RISCV_HALF and the stack at the very top. */
+/* Default region sizes; #define before including to override. `readonly` holds code
+ * (text+rodata, read-only, also fetched) at 0; `writable` is one buffer holding the
+ * stack (just below RISCV_HALF) then the heap (data+bss+malloc arena) from RISCV_HALF. */
 #ifndef PURVHOST_CODE_BYTES
 #define PURVHOST_CODE_BYTES   (64u * 1024 * 1024)
 #endif
@@ -44,10 +44,11 @@
 #define PURVHOST_STACK_BYTES  (16u * 1024 * 1024)
 #endif
 
-/* The three host buffers and what loading discovered. The stack buffer maps to the
- * top of the address space (it ends at 2^32, sp starts at 0 and grows down). */
+/* The host buffers and what loading discovered. `stack` and `heap` are two views into
+ * ONE writable allocation (stack is its base, at RISCV_HALF - stack_len; heap begins
+ * stack_len bytes in, at RISCV_HALF); sp starts at RISCV_HALF and grows down. */
 typedef struct {
-    uint8_t *code,  *heap,  *stack;          /* host storage for the three RW/RO areas */
+    uint8_t *code,  *heap,  *stack;          /* code = readonly; stack = writable base, heap its seam */
     uint32_t code_len, heap_len, stack_len;
     uint32_t entry;                          /* image entry point (pc starts here)     */
     uint32_t data_end;                       /* one past the highest writable-data byte */
@@ -92,27 +93,25 @@ static inline int purvhost_alloc(PurvHost *h, uint32_t code_len, uint32_t heap_l
     h->heap_len  = heap_len  ? heap_len  : PURVHOST_HEAP_BYTES;
     h->stack_len = stack_len ? stack_len : PURVHOST_STACK_BYTES;
     h->code  = calloc(1, h->code_len);
-    h->heap  = calloc(1, h->heap_len);
-    h->stack = calloc(1, h->stack_len);
+    h->stack = calloc(1, (size_t)h->stack_len + h->heap_len);  /* ONE writable buffer: stack then heap */
+    h->heap  = h->stack ? h->stack + h->stack_len : NULL;      /* heap view, based at RISCV_HALF */
     h->data_end = RISCV_HALF;                /* no writable data until an ELF places some */
-    if (!h->code || !h->heap || !h->stack) {
+    if (!h->code || !h->stack) {
         fprintf(stderr, "purvhost: cannot allocate regions\n");
-        free(h->code); free(h->heap); free(h->stack);
+        free(h->code); free(h->stack);
         h->code = h->heap = h->stack = NULL;
         return -1;
     }
     return 0;
 }
 
-/* Map the buffers into the engine's four regions and Init the state (sp=0, pc=0,
- * default callback + eval). The caller then assigns trap handlers and pc. rodata is
- * left unmapped -- a guest's .rodata rides in the code region. */
+/* Map the buffers into the engine's two regions and Init the state (sp=RISCV_HALF,
+ * pc=0, default callback + eval). The caller then assigns trap handlers and pc. A
+ * guest's .rodata rides in the code (readonly) region. */
 static inline void purvhost_init(const PurvHost *h, RiscvEmulatorState_t *st) {
-    RiscvEmulatorRegion_t code   = { h->code,  h->code_len  };
-    RiscvEmulatorRegion_t rodata = { 0, 0 };
-    RiscvEmulatorRegion_t heap   = { h->heap,  h->heap_len  };
-    RiscvEmulatorRegion_t stack  = { h->stack, h->stack_len };
-    RiscvEmulatorInit(st, code, rodata, heap, stack);
+    RiscvEmulatorRegion_t readonly = { h->code,  h->code_len, 0 };                          /* code+rodata at 0 */
+    RiscvEmulatorRegion_t writable = { h->stack, h->stack_len + h->heap_len, RISCV_HALF - h->stack_len };
+    RiscvEmulatorInit(st, readonly, writable);
 }
 
 /* Load an ELF32 RISC-V image: each PT_LOAD goes to the half its vaddr names --
@@ -185,14 +184,14 @@ static inline int purvhost_sym(const PurvHost *h, const char *name, uint32_t *ou
     return 0;
 }
 
-/* Read one guest byte through the engine's region map (the half picks a pair of
- * regions; the lower grows up from the base, the upper grows down from RISCV_HALF).
- * For host-side syscalls and signature dumps that touch guest memory. */
+/* Read one guest byte through the engine's two regions (writable first, then the
+ * read-only span), each a base-relative bounded check. For host-side syscalls and
+ * signature dumps that touch guest memory. */
 static inline uint8_t purvhost_guest_byte(const RiscvEmulatorState_t *st, uint32_t a) {
-    const RiscvEmulatorRegion_t *r = &st->region[(a >> 31) << 1];
-    uint32_t lo = a & (RISCV_HALF - 1), down = RISCV_HALF - r[1].len;
-    if (lo < r[0].len)          return r[0].ptr[lo];
-    if (lo >= down && r[1].len) return r[1].ptr[lo - down];
+    uint32_t rel = a - st->writable.base;
+    if ((uint64_t)rel + 1 <= st->writable.len) return st->writable.ptr[rel];
+    rel = a - st->readonly.base;
+    if ((uint64_t)rel + 1 <= st->readonly.len) return st->readonly.ptr[rel];
     return 0;
 }
 
