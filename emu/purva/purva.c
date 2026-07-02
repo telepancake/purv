@@ -204,19 +204,21 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * sp-4-4p, independent of frame size. The whole run is one op word, so advance
      * one word into the body (k counts the addi + every save it stood in for). */
     h_prologue: {
-        uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
-        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];
-        uint8_t *q = mem_w(s, sp0 - 4 * cnt, 4 * cnt);      /* one resolve for the whole block */
+        uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu, sp0 = s->x[2], cnt = 0;
+        /* The saves occupy the TOP of the frame; check the WHOLE frame [sp0-frame, sp0)
+         * in one resolve (a superset -- frame >= 4*popcount always) so we never need the
+         * saved-register count up front. cnt is just tallied as we walk, for the k budget. */
+        uint8_t *q = mem_w(s, sp0 - frame, frame);
         if (q) {
-            q += 4 * cnt;                                          /* one past the top slot */
+            q += frame;                                           /* top of frame == caller's sp */
             /* rank order ra,s0,s1,s2..s11 -> descending slots; q steps down only on a set bit. */
-            #define SAVE(bit, reg) if (rmask & (1u << (bit))) { q -= 4; st_le(q, 4, s->x[(reg)]); }
+            #define SAVE(bit, reg) if (rmask & (1u << (bit))) { q -= 4; st_le(q, 4, s->x[(reg)]); cnt++; }
             SAVE(0,1) SAVE(1,8) SAVE(2,9) SAVE(3,18) SAVE(4,19) SAVE(5,20) SAVE(6,21)
             SAVE(7,22) SAVE(8,23) SAVE(9,24) SAVE(10,25) SAVE(11,26) SAVE(12,27)
             #undef SAVE
         } else {                                                  /* off-stack fallback: per-reg */
             uint32_t addr = sp0, m = rmask;
-            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
+            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4; cnt++;
                 uint32_t v = s->x[rank2reg[r]]; uint8_t *qq = mem_w(s, addr, 4);
                 if (qq) st_le(qq, 4, v); else s->callback(s, RISCV_MEM_STORE, addr, v); }
         }
@@ -228,18 +230,19 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
      * whole run is one op word and this op never falls through -- it jumps to ra.
      * Only the ret checks the budget, exactly as the unfused sequence did. */
     h_epilogue: {
-        uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu;
-        uint32_t cnt = (uint32_t)__builtin_popcount(rmask), sp0 = s->x[2];
-        uint8_t *q = mem_r(s, sp0 + frame - 4 * cnt, 4 * cnt);   /* one resolve for the whole block */
+        uint32_t rmask = (w >> 13) & 0x1fffu, frame = w & 0x1fffu, sp0 = s->x[2], cnt = 0;
+        /* Mirror of the prologue: one resolve of the WHOLE frame [sp0, sp0+frame), whose
+         * top is the caller's sp; walk the saves down from there, tallying cnt for k. */
+        uint8_t *q = mem_r(s, sp0, frame);
         if (q) {
-            q += 4 * cnt;
-            #define REST(bit, reg) if (rmask & (1u << (bit))) { q -= 4; s->x[(reg)] = ld_le(q, 4); }
+            q += frame;                                                /* top of frame == caller's sp */
+            #define REST(bit, reg) if (rmask & (1u << (bit))) { q -= 4; s->x[(reg)] = ld_le(q, 4); cnt++; }
             REST(0,1) REST(1,8) REST(2,9) REST(3,18) REST(4,19) REST(5,20) REST(6,21)
             REST(7,22) REST(8,23) REST(9,24) REST(10,25) REST(11,26) REST(12,27)
             #undef REST
         } else {                                                       /* off-stack fallback: per-reg */
             uint32_t addr = sp0 + frame, m = rmask;
-            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4;
+            while (m) { uint32_t r = (uint32_t)__builtin_ctz(m); m &= m - 1; addr -= 4; cnt++;
                 uint8_t *qq = mem_r(s, addr, 4);
                 s->x[rank2reg[r]] = qq ? ld_le(qq, 4) : s->callback(s, RISCV_MEM_LOAD, addr, 0); }
         }
