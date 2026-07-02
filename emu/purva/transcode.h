@@ -29,6 +29,7 @@
  *   lwlw (fused)                     op[31:26] rd[25:21] rs1[20:16] o1[15:8] o2[7:0]
  *   lwjalr (fused)                   op[31:26] rd[25:21] rs1[20:16] off[15:0]
  *   load+beqz/bnez (fused, 2 words)  op[31:26] rd[25:21] rs1[20:16] off[15:0] | disp32
+ *   lwsw (fused)                     op[31:26] rd[25:21] rs1[20:16] rs2[15:11] o1w[10:6] o2w[5:0]
  *
  * (auipc is its own op -- it computes from the evaluator's live op cursor, so it fits
  * one word; it survives only for CODE addresses, tctool re-encoding its uimm in op space.
@@ -93,6 +94,7 @@ enum {
     RISCV_OP_LW_BNEZ,       /* lw  T,o(a);  bne T,x0                                          */
     RISCV_OP_LBU_BEQZ,      /* lbu T,o(a);  beq T,x0                                          */
     RISCV_OP_LBU_BNEZ,      /* lbu T,o(a);  bne T,x0                                          */
+    RISCV_OP_LWSW,          /* lw T,o1(a); sw T,o2(b) -> the word copy; o1/o2 word-scaled     */
     RISCV_OP_COUNT
 };
 
@@ -158,6 +160,8 @@ enum {
 #define TC_OFF11(w) ((int32_t)((w) << 21) >> 21)                  /* lwx 11-bit signed */
 #define TC_O1(w)    ((int32_t)(int8_t)((w) >> 8))                 /* lwlw offsets  */
 #define TC_O2(w)    ((int32_t)(int8_t)(w))
+#define TC_W1(w)    ((((w) >> 6) & 31u) << 2)                     /* lwsw offsets  */
+#define TC_W2(w)    (((w) & 63u) << 2)                            /*  (word-scaled, unsigned) */
 
 /* A transcoded program: just the op array and how far the code runs. ops[pc>>2] is
  * a SHORTCUT that only holds when nothing has fused -- see the header note above.

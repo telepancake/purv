@@ -162,6 +162,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_LWLW] = &&h_lwlw, [RISCV_OP_LWJALR] = &&h_lwjalr,
         [RISCV_OP_LW_BEQZ] = &&h_lw_beqz, [RISCV_OP_LW_BNEZ] = &&h_lw_bnez,
         [RISCV_OP_LBU_BEQZ] = &&h_lbu_beqz, [RISCV_OP_LBU_BNEZ] = &&h_lbu_bnez,
+        [RISCV_OP_LWSW] = &&h_lwsw,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -266,6 +267,14 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
               a_ = (q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0)) + (uint32_t)TC_O2(w);
               q_ = mem_r(s, a_, 4);
               s->x[TC_A(w)] = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0);
+              k++; NEXT(); }
+    h_lwsw: { uint32_t a_ = s->x[TC_B(w)] + TC_W1(w);
+              const uint8_t *q_ = mem_r(s, a_, 4);
+              uint32_t v_ = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0);
+              s->x[TC_A(w)] = v_;                     /* T first: the store base may BE T */
+              a_ = s->x[TC_C(w)] + TC_W2(w);
+              uint8_t *qw_ = mem_w(s, a_, 4);
+              if (qw_) st_le(qw_, 4, v_); else s->callback(s, RISCV_MEM_STORE, a_, v_);
               k++; NEXT(); }
     h_lwjalr: { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w);
                 const uint8_t *q_ = mem_r(s, a_, 4);

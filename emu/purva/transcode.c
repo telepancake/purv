@@ -320,6 +320,16 @@ static uint32_t try_fuse_pair(const uint8_t *code, uint32_t len, uint32_t off,
             out->imm = (a.imm & 0xffu) << 8 | (b.imm & 0xffu);
             return 8;
         }
+        /* lw T,o1(a) ; sw T,o2(b)  ->  LWSW (the word copy). The offsets are
+         * word-scaled unsigned 5/6-bit fields -- measured to cover ~100% of the
+         * pattern (struct-field copies). b == T is fine: the handler reads the
+         * store base after writing T, exactly like the real sequence. */
+        if (b.op == RISCV_OP_SW && b.rs2 == a.rd &&
+            a.imm < 128 && (a.imm & 3) == 0 && b.imm < 256 && (b.imm & 3) == 0) {
+            out->op = RISCV_OP_LWSW; out->rd = a.rd; out->rs1 = a.rs1; out->rs2 = b.rs1;
+            out->imm = (a.imm >> 2) << 6 | (b.imm >> 2);
+            return 8;
+        }
         /* lw T,off(a) ; jalr ra,0(T)  ->  LWJALR (the virtual call) */
         if (b.op == RISCV_OP_JALR && b.rd == 1 && b.rs1 == a.rd && (int32_t)b.imm == 0) {
             out->op = RISCV_OP_LWJALR; out->rd = a.rd; out->rs1 = a.rs1; out->imm = a.imm;
@@ -411,6 +421,8 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
     else if (op == RISCV_OP_SHADD)                                  /* rd, rs1, rs2, sh[10:6] */
         ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 31) << 6;
     else if (op == RISCV_OP_LWX)                                    /* rd, rs1, rs2, off[10:0] */
+        ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 0x7ffu);
+    else if (op == RISCV_OP_LWSW)                                   /* rd, rs1, rs2, o1w|o2w */
         ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 0x7ffu);
     else if (op == RISCV_OP_LWLW || op == RISCV_OP_LWJALR)          /* rd, rs1, packed offs / off16 */
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffffu);
