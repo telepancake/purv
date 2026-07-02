@@ -37,6 +37,7 @@
 #define N_JOIN    SCALED(500)     /* self-join window (O(n^2)-ish, indexed)  */
 #define N_COLLATZ SCALED(1000)    /* Collatz starting values                 */
 #define N_MANDEL  SCALED(24)      /* Mandelbrot grid is N_MANDEL x N_MANDEL  */
+#define N_JSON    SCALED(3000)    /* rows serialized into JSON documents     */
 #define N_REPS    2               /* repeat the aggregate/window block       */
 
 /* bench_emit is provided by whichever shell wraps this file (guest vs native). */
@@ -197,6 +198,38 @@ int bench_run(void) {
             N_MANDEL, N_MANDEL, N_MANDEL, N_MANDEL);
         if (sql) { q("mandelbrot", sql); sqlite3_free(sql); } else g_rc = 1;
     }
+
+    /* -- phase 10: JSON -- sqlite's core json.c, a real parser/serializer:
+     * build documents from the table, extract paths, walk arrays with the
+     * json_each table-valued function, mutate with json_set/json_remove, and
+     * re-aggregate with json_group_array. Strictly integer-valued JSON (the
+     * build is -DSQLITE_OMIT_FLOATING_POINT: a real would trap, loudly).
+     * This is the string-heavy counterweight to the integer phases above --
+     * parse/serialize churn is where memcmp/strlen/memcpy actually run. */
+    x("CREATE TABLE j(id INTEGER PRIMARY KEY, doc TEXT);");
+    xf("INSERT INTO j(id,doc)"
+       " SELECT id, json_object('id', id, 'k', k, 'v', v, 's', s,"
+       "        'tags', json_array(k%%7, k%%11, k%%13),"
+       "        'sub', json_object('a', id%%251, 'b', v%%257))"
+       " FROM t WHERE id<=%d;", N_JSON);
+    q("json-build", "SELECT count(*), sum(length(doc)) FROM j;");
+    for (int r = 0; r < N_REPS; r++)
+        q("json-extract",
+          "SELECT sum(json_extract(doc,'$.v')%1000000007),"
+          "       sum(json_extract(doc,'$.sub.a')),"
+          "       sum(json_array_length(doc,'$.tags')),"
+          "       sum(json_extract(doc,'$.tags[1]')) FROM j;");
+    q("json-each",
+      "SELECT count(*), sum(je.value%1000000007), sum(je.key) FROM j,"
+      " json_each(j.doc,'$.tags') je;");
+    x("UPDATE j SET doc=json_set(doc,'$.sub.c', id*3, '$.tags[3]', id%17) WHERE id%3=0;");
+    x("UPDATE j SET doc=json_remove(doc,'$.s') WHERE id%5=0;");
+    q("json-mutate",
+      "SELECT count(*), sum(length(doc)),"
+      "       sum(json_extract(doc,'$.sub.c') IS NOT NULL),"
+      "       sum(json_type(doc,'$.tags')='array') FROM j;");
+    q("json-agg",
+      "SELECT length(json_group_array(json(doc))), count(*) FROM j WHERE id%97<3;");
 
     sqlite3_close(DB);
     bench_emit(g_rc ? "FAILED\n" : "done.\n");
