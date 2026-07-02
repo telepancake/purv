@@ -162,7 +162,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_LWLW] = &&h_lwlw, [RISCV_OP_LWJALR] = &&h_lwjalr,
         [RISCV_OP_LW_BEQZ] = &&h_lw_beqz, [RISCV_OP_LW_BNEZ] = &&h_lw_bnez,
         [RISCV_OP_LBU_BEQZ] = &&h_lbu_beqz, [RISCV_OP_LBU_BNEZ] = &&h_lbu_bnez,
-        [RISCV_OP_LWSW] = &&h_lwsw,
+        [RISCV_OP_LWSW] = &&h_lwsw, [RISCV_OP_VCALL] = &&h_vcall,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -276,6 +276,19 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
               uint8_t *qw_ = mem_w(s, a_, 4);
               if (qw_) st_le(qw_, 4, v_); else s->callback(s, RISCV_MEM_STORE, a_, v_);
               k++; NEXT(); }
+    /* The vtable call: load the vptr, load the slot, call it. LWLW's loads, then
+     * LWJALR's tail. rd ends up caller-saved-clobbered garbage-by-ABI in compiled
+     * code, but write it anyway -- replaying the exact effects costs nothing. */
+    h_vcall: { uint32_t a_ = s->x[TC_B(w)] + (uint32_t)TC_O1(w);
+               const uint8_t *q_ = mem_r(s, a_, 4);
+               a_ = (q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0)) + (uint32_t)TC_O2(w);
+               q_ = mem_r(s, a_, 4);
+               uint32_t t = (q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0)) & ~1u;
+               s->x[TC_A(w)] = t;
+               s->x[1] = ((uint32_t)(p - base) << 2) + 4;
+               k += 3;
+               if (t >= clen || k >= max) { s->pc = t; return k; }
+               p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)]; }
     h_lwjalr: { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w);
                 const uint8_t *q_ = mem_r(s, a_, 4);
                 uint32_t t = (q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0)) & ~1u;

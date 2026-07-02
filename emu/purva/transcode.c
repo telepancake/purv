@@ -312,12 +312,23 @@ static uint32_t try_fuse_pair(const uint8_t *code, uint32_t len, uint32_t off,
         return 8;
     }
     if (a.op == RISCV_OP_LW && a.rd != 0) {
-        /* lw T,o1(a) ; lw T,o2(T)  ->  LWLW (the double indirection) */
+        /* lw T,o1(a) ; lw T,o2(T)  ->  LWLW (the double indirection). When a
+         * `jalr ra,0(T)` follows, take all THREE: that is the C++ vtable call
+         * (load vptr, load slot, call), the hot indirect-call shape -- fusing
+         * only the pair would leave a lone jalr behind (measured: it does). */
         if (b.op == RISCV_OP_LW && b.rd == a.rd && b.rs1 == a.rd &&
             (int32_t)a.imm >= -128 && (int32_t)a.imm < 128 &&
             (int32_t)b.imm >= -128 && (int32_t)b.imm < 128) {
             out->op = RISCV_OP_LWLW; out->rd = a.rd; out->rs1 = a.rs1;
             out->imm = (a.imm & 0xffu) << 8 | (b.imm & 0xffu);
+            if (off + 12 <= len && !targets_has(targets, off + 8)) {
+                Dec c;
+                decode(code, off + 8, &c);
+                if (c.op == RISCV_OP_JALR && c.rd == 1 && c.rs1 == a.rd && (int32_t)c.imm == 0) {
+                    out->op = RISCV_OP_VCALL;
+                    return 12;
+                }
+            }
             return 8;
         }
         /* lw T,o1(a) ; sw T,o2(b)  ->  LWSW (the word copy). The offsets are
@@ -424,7 +435,7 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 0x7ffu);
     else if (op == RISCV_OP_LWSW)                                   /* rd, rs1, rs2, o1w|o2w */
         ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 0x7ffu);
-    else if (op == RISCV_OP_LWLW || op == RISCV_OP_LWJALR)          /* rd, rs1, packed offs / off16 */
+    else if (op == RISCV_OP_LWLW || op == RISCV_OP_LWJALR || op == RISCV_OP_VCALL)
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffffu);
     else if (op >= RISCV_OP_LW_BEQZ && op <= RISCV_OP_LBU_BNEZ) {   /* word1: load; word2: disp */
         int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;

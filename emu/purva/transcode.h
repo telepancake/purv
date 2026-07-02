@@ -95,6 +95,8 @@ enum {
     RISCV_OP_LBU_BEQZ,      /* lbu T,o(a);  beq T,x0                                          */
     RISCV_OP_LBU_BNEZ,      /* lbu T,o(a);  bne T,x0                                          */
     RISCV_OP_LWSW,          /* lw T,o1(a); sw T,o2(b) -> the word copy; o1/o2 word-scaled     */
+    RISCV_OP_VCALL,         /* lw T,o1(a); lw T,o2(T); jalr ra,0(T) -> the vtable call
+                             * (LWLW field layout; link register implied ra). THREE insns.    */
     RISCV_OP_COUNT
 };
 
