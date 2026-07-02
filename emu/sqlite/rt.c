@@ -48,6 +48,29 @@ __asm__(
 
 /* ------------------------------------------------------------ mem / string */
 
+#ifdef PURV_CUSTOM_MEMOPS
+/* purva-only build: memcpy/memset/memmove are each ONE custom instruction
+ * (.insn r in the custom-0 opcode space -- see ../purva/transcode.h
+ * RISCV_OP_MEMOP), evaluated as a host-side bulk copy. dst rides in the rd
+ * slot (read by the evaluator), src/c in rs1, n in rs2. purv/purvs would trap
+ * on it -- that engine lock-in is exactly the trade this option measures
+ * against the portable word-wise loops below. */
+void *memcpy(void *d, const void *s, size_t n) {
+    void *r = d;
+    __asm__ volatile(".insn r 0x0b, 0x0, 0x0, %0, %1, %2" : "+r"(r) : "r"(s), "r"(n) : "memory");
+    return r;
+}
+void *memmove(void *d, const void *s, size_t n) {   /* the evaluator copy is overlap-safe */
+    void *r = d;
+    __asm__ volatile(".insn r 0x0b, 0x0, 0x0, %0, %1, %2" : "+r"(r) : "r"(s), "r"(n) : "memory");
+    return r;
+}
+void *memset(void *d, int c, size_t n) {
+    void *r = d;
+    __asm__ volatile(".insn r 0x0b, 0x1, 0x0, %0, %1, %2" : "+r"(r) : "r"((long)c), "r"(n) : "memory");
+    return r;
+}
+#else
 /* memcpy/memset/memmove are word-wise: on an emulated CPU every instruction is
  * ~a dispatch, so the byte loop pays 4x the accesses AND 4x the loop overhead --
  * profile.py showed these three's lbu/sb/addi/bne chains among the hottest
@@ -92,6 +115,7 @@ void *memset(void *d, int c, size_t n) {
     while (n--) *p++ = (unsigned char)c;
     return d;
 }
+#endif /* PURV_CUSTOM_MEMOPS */
 int memcmp(const void *a, const void *b, size_t n) {
     const unsigned char *x = a, *y = b;
     while (n--) { if (*x != *y) return *x - *y; x++; y++; }

@@ -97,6 +97,12 @@ enum {
     RISCV_OP_LWSW,          /* lw T,o1(a); sw T,o2(b) -> the word copy; o1/o2 word-scaled     */
     RISCV_OP_VCALL,         /* lw T,o1(a); lw T,o2(T); jalr ra,0(T) -> the vtable call
                              * (LWLW field layout; link register implied ra). THREE insns.    */
+    RISCV_OP_MEMOP,         /* guest custom-0 (.insn r 0x0b): bulk memcpy/memset as ONE
+                             * instruction (rt.c's PURV_CUSTOM_MEMOPS bodies). bit0 selects:
+                             * 0: memcpy  dst=x[rd] (read!), src=x[rs1], n=x[rs2]  (overlap-safe)
+                             * 1: memset  dst=x[rd] (read!), c=x[rs1],   n=x[rs2]
+                             * Fuel: 1 + n/4 -- what the word-wise loop it replaces would cost.
+                             * This takes the LAST opcode slot: the dispatch table is now full. */
     RISCV_OP_COUNT
 };
 

@@ -133,12 +133,12 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t pc = s->pc;
     if (pc >= clen) return 0;                                  /* resume pc outside code */
 
-    /* All 64 values the 6-bit op field (w>>26) can select are populated: the real ops
-     * below, then every unused encoding [RISCV_OP_COUNT, 63] filled with h_trap. So a
-     * garbage op -- e.g. a jalr/ret landing on a data word -- dispatches to h_trap ->
-     * illegal rather than running off the table into a wild `goto *NULL`. */
+    /* All 64 values the 6-bit op field (w>>26) can select are populated -- the op set
+     * now fills the table exactly (RISCV_OP_COUNT == 64), so there is no unused
+     * encoding left to trap-fill and no `goto *NULL` is reachable. (A jalr/ret landing
+     * on a data word now dispatches to SOME real handler rather than trapping; the
+     * next fetch outside the code window still ends the run.) */
     static const void *const tbl[64] = {
-        [RISCV_OP_COUNT ... 63] = &&h_trap,
         [RISCV_OP_ADD] = &&h_add, [RISCV_OP_SLL] = &&h_sll, [RISCV_OP_SLT] = &&h_slt,
         [RISCV_OP_SLTU] = &&h_sltu, [RISCV_OP_XOR] = &&h_xor, [RISCV_OP_SRL] = &&h_srl,
         [RISCV_OP_OR] = &&h_or, [RISCV_OP_AND] = &&h_and, [RISCV_OP_SUB] = &&h_sub, [RISCV_OP_SRA] = &&h_sra,
@@ -163,6 +163,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_LW_BEQZ] = &&h_lw_beqz, [RISCV_OP_LW_BNEZ] = &&h_lw_bnez,
         [RISCV_OP_LBU_BEQZ] = &&h_lbu_beqz, [RISCV_OP_LBU_BNEZ] = &&h_lbu_bnez,
         [RISCV_OP_LWSW] = &&h_lwsw, [RISCV_OP_VCALL] = &&h_vcall,
+        [RISCV_OP_MEMOP] = &&h_memop,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -363,6 +364,40 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         uint32_t t = s->x[1] & ~1u; k += cnt + 2;
         if (t >= clen || k >= max) { s->pc = t; return k; }
         p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)];
+    }
+
+    /* Bulk memcpy/memset as one guest instruction (transcode.h RISCV_OP_MEMOP;
+     * emitted by rt.c's PURV_CUSTOM_MEMOPS bodies). dst is READ from the rd slot.
+     * When the whole range resolves into the regions it is one host memmove/memset;
+     * otherwise a bytewise fallback routes misses through the callback. Fuel is
+     * 1 + n/4 -- what the word-wise guest loop this replaces would have cost --
+     * charged in full even though the op is atomic (the budget check happens at
+     * the next jump, same overshoot rule as every straight-line run). */
+    h_memop: {
+        uint32_t n_ = s->x[TC_C(w)], dst_ = s->x[TC_A(w)];
+        if (w & 1) {                                              /* memset */
+            uint32_t c_ = s->x[TC_B(w)];
+            uint8_t *qd_ = mem_w(s, dst_, n_);
+            if (qd_) memset(qd_, (int)c_, n_);
+            else for (uint32_t i_ = 0; i_ < n_; i_++) {
+                uint8_t *qq_ = mem_w(s, dst_ + i_, 1);
+                if (qq_) *qq_ = (uint8_t)c_; else s->callback(s, RISCV_MEM_STORE, dst_ + i_, c_);
+            }
+        } else {                                                  /* memcpy (overlap-safe) */
+            uint32_t src_ = s->x[TC_B(w)];
+            uint8_t *qd_ = mem_w(s, dst_, n_);
+            const uint8_t *qs_ = mem_r(s, src_, n_);
+            if (qd_ && qs_) memmove(qd_, qs_, n_);
+            else for (uint32_t i_ = 0; i_ < n_; i_++) {           /* miss: bytewise, low to high */
+                uint32_t j_ = dst_ > src_ ? n_ - 1 - i_ : i_;     /* (overlap direction) */
+                const uint8_t *q1_ = mem_r(s, src_ + j_, 1);
+                uint32_t v_ = q1_ ? *q1_ : s->callback(s, RISCV_MEM_LOAD, src_ + j_, 0);
+                uint8_t *q2_ = mem_w(s, dst_ + j_, 1);
+                if (q2_) *q2_ = (uint8_t)v_; else s->callback(s, RISCV_MEM_STORE, dst_ + j_, v_);
+            }
+        }
+        k += 1 + (n_ >> 2);
+        NEXT();
     }
 
     h_trap: {
