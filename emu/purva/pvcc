@@ -9,6 +9,13 @@
 #                                               -fno-threadsafe-statics)
 #   pvcc fn.c --lib -o fn.img                link as a library (no _start; entry=0,
 #                                              call functions directly via --invoke)
+#   pvcc app.c --rt -o app.img               link the freestanding runtime (the
+#                                              sqlite rt: _start -> cmain(), the libc
+#                                              subset incl. single-instruction mem/str
+#                                              ops, malloc via the hostcall ABI, and
+#                                              rt-cxx for C++). The app implements
+#                                              int cmain(void); run the image with
+#                                              purvarun.h or the sqlite hosts.
 #
 # Wraps the finicky part: the right clang freestanding flags, purva.ld, and
 # --emit-relocs (the transcoder needs the kept relocations to find function
@@ -38,6 +45,7 @@ die() { echo "pvcc: $*" >&2; exit 2; }
 
 out="a.img"
 lib=0
+rt=0
 sources=()
 extra_cflags=()
 
@@ -45,6 +53,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     --lib) lib=1; shift ;;
+    --rt) rt=1; shift ;;
     -h|--help)
       sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -58,6 +67,21 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 objs=()
+if [ "$rt" = 1 ]; then
+  # The freestanding runtime lives with the sqlite workload (its first user);
+  # rt-cxx (operator new/delete over the malloc hostcalls) with the bench corpus.
+  RTDIR="$HERE/../sqlite"
+  extra_cflags+=("-I$RTDIR" "-I$RTDIR/include")
+  $GUESTCC $GUEST_ARCH $GUEST_CFLAGS -I"$RTDIR" -I"$RTDIR/include" -c "$RTDIR/rt.c" -o "$work/rt.o" \
+    || die "compile failed: rt.c"
+  $GUESTCC $GUEST_ARCH $GUEST_CFLAGS -c "$RTDIR/builtins.c" -o "$work/builtins.o" \
+    || die "compile failed: builtins.c"
+  objs+=("$work/rt.o" "$work/builtins.o")
+  for src in "${sources[@]}"; do case "$src" in *.cc|*.cpp|*.cxx|*.c++|*.C)
+    $GUESTCXX $GUEST_ARCH $GUEST_CXXFLAGS -c "$HERE/../bench/rt-cxx.cc" -o "$work/rt-cxx.o" \
+      || die "compile failed: rt-cxx.cc"
+    objs+=("$work/rt-cxx.o"); break ;; esac; done
+fi
 for src in "${sources[@]}"; do
   obj="$work/$(basename "$src").o"
   case "$src" in

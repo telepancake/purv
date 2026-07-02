@@ -21,7 +21,8 @@ emu/
   gdbserve.py launcher that brokers a gdb connection and hands purv the fd
   tools/      flatten.py / inline.py / compact.py — the atoom-distilling pipeline (history)
   examples/   fn.c (bare functions), sigtest.S (signature demo), loop.c (gdb reverse-exec)
-  purva/      the AOT pipeline: transcode RV32IM to a free-encoding image + its evaluator
+  purva/      THE PACKAGED PRODUCT: C/C++ -> compact image (pvcc) + embed API
+              (purvarun.h) with fuel metering -- see purva/README.md
   sqlite/     freestanding SQLite guest + the reusable hosts and hostcall ABI
   bench/      the benchmark corpus beyond sqlite: zlib (C), richards + deltablue (C++)
 ```

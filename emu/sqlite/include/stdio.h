@@ -1,5 +1,9 @@
 #ifndef _STDIO_H
 #define _STDIO_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <stddef.h>
 #include <stdarg.h>
 typedef struct _FILE FILE;
@@ -16,4 +20,8 @@ FILE *fopen(const char *, const char *);
 int fclose(FILE *);
 size_t fread(void *, size_t, size_t, FILE *);
 size_t fwrite(const void *, size_t, size_t, FILE *);
+#ifdef __cplusplus
+}
+#endif
+
 #endif

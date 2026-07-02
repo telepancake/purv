@@ -2,6 +2,7 @@
 #
 #   make            build ./transcode (tool) and ./purva (evaluator)
 #   make test       transcode the RV32IM examples to .img and run them on purva
+#   make embed-demo build+run the embedding example (pvcc --rt guest, purvarun.h host)
 #
 # `transcode in.elf out.img` is the ONLY thing that decodes RISC-V: it lowers a
 # whole RV32IM image into a self-contained runnable image (image.h: packed ops +
@@ -65,5 +66,11 @@ test: transcode purva fn.img sigtest.img hello.img args.img
 	@./purva sigtest.img --symbols=sigtest.elf --signature=out.sig && \
 	  echo "signature:" && sed 's/^/  /' out.sig
 
+# --- the embedding demo: pvcc-built guest + purvarun.h host, end to end ------
+embed-demo: transcode purva-engine.o
+	./pvcc ../examples/embed-app.c --rt -o embed-app.img
+	$(CC) $(CFLAGS) ../examples/embed.c purva-engine.o -I. -I.. -o embed-host
+	./embed-host embed-app.img
+
 clean:
-	rm -f transcode purva *.o *.elf *.img out.sig
+	rm -f transcode purva *.o *.elf *.img out.sig embed-host embed-app.elf

@@ -1,5 +1,9 @@
 #ifndef _STDLIB_H
 #define _STDLIB_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <stddef.h>
 void *malloc(size_t);
 void  free(void *);
@@ -14,4 +18,8 @@ int   atoi(const char *);
 void  exit(int);
 char *getenv(const char *);
 #define RAND_MAX 0x7fffffff
+#ifdef __cplusplus
+}
+#endif
+
 #endif

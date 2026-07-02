@@ -1,7 +1,7 @@
 transcode
 purva
+embed-host
 *.o
 *.elf
 *.img
-*.ops
-*.sig
+out.sig
