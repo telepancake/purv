@@ -48,19 +48,47 @@ __asm__(
 
 /* ------------------------------------------------------------ mem / string */
 
+/* memcpy/memset/memmove are word-wise: on an emulated CPU every instruction is
+ * ~a dispatch, so the byte loop pays 4x the accesses AND 4x the loop overhead --
+ * profile.py showed these three's lbu/sb/addi/bne chains among the hottest
+ * pairs in the sqlite bench. Same-alignment inputs (the overwhelming case) copy
+ * a word per iteration after a byte head; differing alignment stays bytewise. */
 void *memcpy(void *d, const void *s, size_t n) {
     unsigned char *p = d; const unsigned char *q = s;
+    if (n >= 8 && (((uintptr_t)p ^ (uintptr_t)q) & 3) == 0) {
+        while ((uintptr_t)p & 3) { *p++ = *q++; n--; }
+        uint32_t *pw = (uint32_t *)p; const uint32_t *qw = (const uint32_t *)q;
+        for (; n >= 16; n -= 16) { pw[0] = qw[0]; pw[1] = qw[1]; pw[2] = qw[2]; pw[3] = qw[3]; pw += 4; qw += 4; }
+        for (; n >= 4; n -= 4) *pw++ = *qw++;
+        p = (unsigned char *)pw; q = (const unsigned char *)qw;
+    }
     while (n--) *p++ = *q++;
     return d;
 }
 void *memmove(void *d, const void *s, size_t n) {
     unsigned char *p = d; const unsigned char *q = s;
-    if (p < q) while (n--) *p++ = *q++;
-    else { p += n; q += n; while (n--) *--p = *--q; }
+    if (p == q || n == 0) return d;
+    if (p < q) return memcpy(d, s, n);                 /* forward copy is safe */
+    p += n; q += n;
+    if (n >= 8 && (((uintptr_t)p ^ (uintptr_t)q) & 3) == 0) {   /* backward, word-wise */
+        while ((uintptr_t)p & 3) { *--p = *--q; n--; }
+        uint32_t *pw = (uint32_t *)p; const uint32_t *qw = (const uint32_t *)q;
+        for (; n >= 4; n -= 4) *--pw = *--qw;
+        p = (unsigned char *)pw; q = (const unsigned char *)qw;
+    }
+    while (n--) *--p = *--q;
     return d;
 }
 void *memset(void *d, int c, size_t n) {
     unsigned char *p = d;
+    if (n >= 8) {
+        uint32_t v = (unsigned char)c * 0x01010101u;
+        while ((uintptr_t)p & 3) { *p++ = (unsigned char)c; n--; }
+        uint32_t *pw = (uint32_t *)p;
+        for (; n >= 16; n -= 16) { pw[0] = v; pw[1] = v; pw[2] = v; pw[3] = v; pw += 4; }
+        for (; n >= 4; n -= 4) *pw++ = v;
+        p = (unsigned char *)pw;
+    }
     while (n--) *p++ = (unsigned char)c;
     return d;
 }
