@@ -28,8 +28,14 @@ all: transcode purva
 
 transcode: tctool.c transcode.c transcode.h image.h ../purv.h ../purvhost.h
 	$(CC) $(CFLAGS) tctool.c transcode.c -o $@
-purva: purva.c main.c purva.h transcode.h image.h ../purv.h ../purvhost.h
-	$(CC) $(CFLAGS) purva.c main.c -o $@
+# purva.c (the engine) is built -fcf-protection=none: its computed-goto dispatch's
+# per-handler endbr landing pads are ~4.5% overhead for no real protection (the indirect
+# jumps only ever hit its own fixed label table), and GCC offers no per-function control.
+# Scoped to the engine TU; main.c (the driver) keeps CET. See the sqlite Makefile's note.
+purva-engine.o: purva.c purva.h transcode.h image.h ../purv.h ../purvhost.h
+	$(CC) $(CFLAGS) -fcf-protection=none -c purva.c -o $@
+purva: purva-engine.o main.c purva.h transcode.h image.h ../purv.h ../purvhost.h
+	$(CC) $(CFLAGS) purva-engine.o main.c -o $@
 
 # RV32IM example elfs (local names; don't clobber purvs's rv32imc builds). Linked
 # against purva.ld (separate .text/.rodata) with --emit-relocs.

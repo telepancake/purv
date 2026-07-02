@@ -139,8 +139,16 @@ host-purvs: host.c ../purvs/purvs.c ../purvs/purvs.h hostcalls.h
 # binary is absent, and an out-of-date transcode would silently mis-transcode.
 $(TRANSCODE): FORCE
 	$(MAKE) -C ../purva transcode
-host-purva: host-purva.c ../purva/purva.c ../purva/purva.h ../purva/image.h hostcalls.h
-	$(HOSTCC) $(HOSTFLAGS) host-purva.c ../purva/purva.c -I.. -I../purva -o $@
+# The engine TU is built -fcf-protection=none: purva's dispatch is a computed goto
+# whose indirect jumps only ever land on its own fixed table of internal labels, so
+# CET's endbr landing pad on every one of the 50+ handlers is pure overhead (~4.5% of
+# the hot loop -- one endbr per dispatch) for no real protection. GCC has no per-
+# function control (the optimize attribute rejects it; nocf_check drops only the entry
+# pad, not the label pads), so it's scoped to this TU. The driver keeps CET.
+purva-engine.o: ../purva/purva.c ../purva/purva.h ../purva/transcode.h ../purva/image.h ../purv.h ../purvhost.h
+	$(HOSTCC) $(HOSTFLAGS) -fcf-protection=none -c ../purva/purva.c -o $@
+host-purva: host-purva.c purva-engine.o ../purva/purva.h ../purva/image.h hostcalls.h
+	$(HOSTCC) $(HOSTFLAGS) host-purva.c purva-engine.o -I.. -I../purva -o $@
 
 # Profile-guided host (make host-pgo). Three phases: build instrumented, train on
 # the bench guest, rebuild with the profile so the compiler lays out and allocates
@@ -218,7 +226,7 @@ clean:
 	rm -f rt.o builtins.o vfs.o guest.o bench.o guest.elf guest-bench.elf \
 	      rt-purva.o builtins-purva.o vfs-purva.o bench-purva.o sqlite3-purva.o \
 	      guest-bench-purva.elf guest-bench-purva.img \
-	      host host-purvs host-purva host-pgo bench-native .scale \
+	      host host-purvs host-purva purva-engine.o host-pgo bench-native .scale \
 	      native.out native.err purv.out purv.err purvs.out purvs.err purva.out purva.err
 	rm -rf $(PGODIR)
 distclean: clean
