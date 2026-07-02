@@ -285,8 +285,7 @@ static uint32_t try_fuse_la(const uint8_t *code, uint32_t len, uint32_t off,
 /* Adjacent-pair fusion: collapse two instructions into ONE op when the packed
  * word can replay BOTH exactly. The rule that makes every match sound without
  * liveness analysis: the second instruction's destination must CLOBBER the
- * first's (so the only intermediate value dies inside the op), except LWJALR
- * where the intermediate is the op's own explicit rd. The patterns (and the
+ * first's (so the only intermediate value dies inside the op). The patterns (and the
  * 8/11-bit offset limits) come from measured pair frequency on real C and C++
  * code -- see profile.py and the enum notes in transcode.h. Returns 8 (both
  * instructions consumed) on a match, else 0. */
@@ -343,11 +342,6 @@ static uint32_t try_fuse_pair(const uint8_t *code, uint32_t len, uint32_t off,
             a.imm < 128 && (a.imm & 3) == 0 && b.imm < 256 && (b.imm & 3) == 0) {
             out->op = RISCV_OP_LWSW; out->rd = a.rd; out->rs1 = a.rs1; out->rs2 = b.rs1;
             out->imm = (a.imm >> 2) << 6 | (b.imm >> 2);
-            return 8;
-        }
-        /* lw T,off(a) ; jalr ra,0(T)  ->  LWJALR (the virtual call) */
-        if (b.op == RISCV_OP_JALR && b.rd == 1 && b.rs1 == a.rd && (int32_t)b.imm == 0) {
-            out->op = RISCV_OP_LWJALR; out->rd = a.rd; out->rs1 = a.rs1; out->imm = a.imm;
             return 8;
         }
     }
@@ -441,7 +435,7 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 0x7ffu);
     else if (op == RISCV_OP_MEMOP)                                  /* rd, rs1, rs2, subtype bit0 */
         ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 7u);
-    else if (op == RISCV_OP_LWLW || op == RISCV_OP_LWJALR || op == RISCV_OP_VCALL)
+    else if (op == RISCV_OP_LWLW || op == RISCV_OP_VCALL)   /* rd, rs1, two 8-bit offs */
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffffu);
     else if (op == RISCV_OP_LW_BZ || op == RISCV_OP_LBU_BZ) {       /* word1: load; word2: disp|cond */
         int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;

@@ -24,6 +24,7 @@ OPS = [
     "BEQ", "BNE", "BLT", "BGE", "BLTU", "BGEU", "JAL", "JALR",
     "LUI", "AUIPC", "NOP", "ECALL", "EBREAK", "ILLEGAL",
     "PROLOGUE", "EPILOGUE", "LI_LO", "LI_HI",
+    "SHADD", "LWX", "LWLW", "LW_BZ", "LBU_BZ", "LWSW", "VCALL", "MEMOP",
 ]
 OPS += [f"OP{i}" for i in range(len(OPS), 64)]
 REG_REG = set(range(0, 10)) | set(range(19, 27))       # ADD..SRA, MUL..REMU

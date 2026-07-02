@@ -27,7 +27,6 @@
  *   shadd (fused)                    op[31:26] rd[25:21] rs1[20:16] rs2[15:11] sh[10:6]
  *   lwx (fused)                      op[31:26] rd[25:21] rs1[20:16] rs2[15:11] off[10:0]
  *   lwlw (fused)                     op[31:26] rd[25:21] rs1[20:16] o1[15:8] o2[7:0]
- *   lwjalr (fused)                   op[31:26] rd[25:21] rs1[20:16] off[15:0]
  *   load+beqz/bnez (fused, 2 words)  op[31:26] rd[25:21] rs1[20:16] off[15:0] | disp32 (bit0=cond)
  *   lwsw (fused)                     op[31:26] rd[25:21] rs1[20:16] rs2[15:11] o1w[10:6] o2w[5:0]
  *
@@ -89,7 +88,6 @@ enum {
     RISCV_OP_SHADD,         /* slli T,X,k;  add T,B,T   ->  rd = rs1 + (rs2 << sh5)      */
     RISCV_OP_LWX,           /* add  T,a,b;  lw  T,o(T)  ->  rd = M32[rs1 + rs2 + off11]  */
     RISCV_OP_LWLW,          /* lw T,o1(a);  lw T,o2(T)  ->  rd = M32[M32[rs1+o1_8]+o2_8] */
-    RISCV_OP_LWJALR,        /* lw T,o(a);   jalr ra,0(T) -> virtual call: rd=t, ra=link, jump t */
     RISCV_OP_LW_BZ,         /* lw  T,o(a); beq/bne T,x0 -- TWO op words; word2 = branch disp
                              * (x4, so bits[1:0] are free: bit0 = 1 for BEQZ, 0 for BNEZ)     */
     RISCV_OP_LBU_BZ,        /* lbu T,o(a); beq/bne T,x0 -- same two-word shape               */

@@ -160,7 +160,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_PROLOGUE] = &&h_prologue, [RISCV_OP_EPILOGUE] = &&h_epilogue,
         [RISCV_OP_LI_LO] = &&h_li_lo, [RISCV_OP_LI_HI] = &&h_li_hi,
         [RISCV_OP_SHADD] = &&h_shadd, [RISCV_OP_LWX] = &&h_lwx,
-        [RISCV_OP_LWLW] = &&h_lwlw, [RISCV_OP_LWJALR] = &&h_lwjalr,
+        [RISCV_OP_LWLW] = &&h_lwlw,
         [RISCV_OP_LW_BZ] = &&h_lw_bz, [RISCV_OP_LBU_BZ] = &&h_lbu_bz,
         [RISCV_OP_LWSW] = &&h_lwsw, [RISCV_OP_VCALL] = &&h_vcall,
         [RISCV_OP_MEMOP] = &&h_memop,
@@ -277,8 +277,8 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
               uint8_t *qw_ = mem_w(s, a_, 4);
               if (qw_) st_le(qw_, 4, v_); else s->callback(s, RISCV_MEM_STORE, a_, v_);
               k++; NEXT(); }
-    /* The vtable call: load the vptr, load the slot, call it. LWLW's loads, then
-     * LWJALR's tail. rd ends up caller-saved-clobbered garbage-by-ABI in compiled
+    /* The vtable call: load the vptr, load the slot, call it (a jalr ra tail).
+     * rd ends up caller-saved-clobbered garbage-by-ABI in compiled
      * code, but write it anyway -- replaying the exact effects costs nothing. */
     h_vcall: { uint32_t a_ = s->x[TC_B(w)] + (uint32_t)TC_O1(w);
                const uint8_t *q_ = mem_r(s, a_, 4);
@@ -290,14 +290,6 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
                k += 3;
                if (t >= clen || k >= max) { s->pc = t; return k; }
                p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)]; }
-    h_lwjalr: { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w);
-                const uint8_t *q_ = mem_r(s, a_, 4);
-                uint32_t t = (q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0)) & ~1u;
-                s->x[TC_A(w)] = t;
-                s->x[1] = ((uint32_t)(p - base) << 2) + 4;
-                k += 2;
-                if (t >= clen || k >= max) { s->pc = t; return k; }
-                p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)]; }
     /* Two-word load+branch-zero: word2 is the baked op-relative displacement
      * (x4, like a branch imm), its bit0 the condition (1 = branch on zero).
      * Fall through skips both words. */

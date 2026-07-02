@@ -129,7 +129,6 @@ static inline uint64_t purv_memop(RiscvEmulatorState_t *s, uint32_t f3,
         for (i = 0; i < n; i++) {
             if (x[i] != y[i] || x[i] == 0) { res = (int32_t)x[i] - (int32_t)y[i]; break; }
         }
-        if (f3 == 7 && i == N) res = 0;                          /* strncmp ran out of n */
         s->x[rd] = (uint32_t)res;
         return i < n ? i + 1 : n;
     }

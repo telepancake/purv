@@ -286,7 +286,7 @@ static void apply_pcrel_code_fixups(const PcrelFixup *fx, uint32_t n, const uint
             uint8_t lo_op = TC_OP(ops[at_lo]);
             int imm16_low = (lo_op >= RISCV_OP_ADDI && lo_op <= RISCV_OP_SRAI) ||
                             (lo_op >= RISCV_OP_LB && lo_op <= RISCV_OP_SW) ||
-                            lo_op == RISCV_OP_JALR || lo_op == RISCV_OP_LWJALR ||
+                            lo_op == RISCV_OP_JALR ||
                             lo_op == RISCV_OP_LW_BZ || lo_op == RISCV_OP_LBU_BZ;
             if (!imm16_low) {
                 fprintf(stderr, "transcode: pcrel fixup at 0x%x: lo12 site at 0x%x was fused "
