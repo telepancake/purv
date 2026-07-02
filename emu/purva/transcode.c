@@ -89,8 +89,8 @@ static void decode(const uint8_t *code, uint32_t off, Dec *d) {
     case JALR:  d->op = RISCV_OP_JALR; d->imm = (uint32_t)((int32_t)w >> 20); break;
     case LUI:   d->op = RISCV_OP_LUI;  d->imm = (w >> 12) & 0xfffff; break;
     case AUIPC: d->op = RISCV_OP_AUIPC; d->imm = (w >> 12) & 0xfffff; break;
-    case CUSTOM0:                       /* .insn r 0x0b: the bulk mem ops (transcode.h) */
-        if (f7 == 0 && f3 <= 1) { d->op = RISCV_OP_MEMOP; d->imm = f3; }
+    case CUSTOM0:                       /* .insn r 0x0b: the bulk mem/str ops (../purvmemop.h) */
+        if (f7 == 0) { d->op = RISCV_OP_MEMOP; d->imm = f3; }
         else d->op = RISCV_OP_ILLEGAL;
         break;
     case MISCMEM:
@@ -440,7 +440,7 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
     else if (op == RISCV_OP_LWSW)                                   /* rd, rs1, rs2, o1w|o2w */
         ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 0x7ffu);
     else if (op == RISCV_OP_MEMOP)                                  /* rd, rs1, rs2, subtype bit0 */
-        ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 1u);
+        ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 7u);
     else if (op == RISCV_OP_LWLW || op == RISCV_OP_LWJALR || op == RISCV_OP_VCALL)
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffffu);
     else if (op >= RISCV_OP_LW_BEQZ && op <= RISCV_OP_LBU_BNEZ) {   /* word1: load; word2: disp */

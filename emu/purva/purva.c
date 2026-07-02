@@ -20,6 +20,7 @@
 #endif
 
 #include "purva.h"   /* purv.h + transcode.h (the op vocabulary and field macros) */
+#include "../purvmemop.h"   /* the custom-0 bulk mem/str instruction (RISCV_OP_MEMOP) */
 
 /* Little-endian assemble/scatter of n bytes. n is a compile-time constant at every
  * call site, so GCC folds these to a single (unaligned) load/store of that width. */
@@ -366,37 +367,14 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)];
     }
 
-    /* Bulk memcpy/memset as one guest instruction (transcode.h RISCV_OP_MEMOP;
-     * emitted by rt.c's PURV_CUSTOM_MEMOPS bodies). dst is READ from the rd slot.
-     * When the whole range resolves into the regions it is one host memmove/memset;
-     * otherwise a bytewise fallback routes misses through the callback. Fuel is
-     * 1 + n/4 -- what the word-wise guest loop this replaces would have cost --
-     * charged in full even though the op is atomic (the budget check happens at
-     * the next jump, same overshoot rule as every straight-line run). */
+    /* The bulk mem/str instruction (transcode.h RISCV_OP_MEMOP; purvmemop.h does
+     * the work -- one host memmove/memset/scan over the resolved regions, with
+     * bytewise callback routing on a miss). Its return is the fuel charge: what
+     * the loop the instruction replaced would have cost, charged in full even
+     * though the op is atomic (budget checks happen at the next jump, the same
+     * overshoot rule as every straight-line run). */
     h_memop: {
-        uint32_t n_ = s->x[TC_C(w)], dst_ = s->x[TC_A(w)];
-        if (w & 1) {                                              /* memset */
-            uint32_t c_ = s->x[TC_B(w)];
-            uint8_t *qd_ = mem_w(s, dst_, n_);
-            if (qd_) memset(qd_, (int)c_, n_);
-            else for (uint32_t i_ = 0; i_ < n_; i_++) {
-                uint8_t *qq_ = mem_w(s, dst_ + i_, 1);
-                if (qq_) *qq_ = (uint8_t)c_; else s->callback(s, RISCV_MEM_STORE, dst_ + i_, c_);
-            }
-        } else {                                                  /* memcpy (overlap-safe) */
-            uint32_t src_ = s->x[TC_B(w)];
-            uint8_t *qd_ = mem_w(s, dst_, n_);
-            const uint8_t *qs_ = mem_r(s, src_, n_);
-            if (qd_ && qs_) memmove(qd_, qs_, n_);
-            else for (uint32_t i_ = 0; i_ < n_; i_++) {           /* miss: bytewise, low to high */
-                uint32_t j_ = dst_ > src_ ? n_ - 1 - i_ : i_;     /* (overlap direction) */
-                const uint8_t *q1_ = mem_r(s, src_ + j_, 1);
-                uint32_t v_ = q1_ ? *q1_ : s->callback(s, RISCV_MEM_LOAD, src_ + j_, 0);
-                uint8_t *q2_ = mem_w(s, dst_ + j_, 1);
-                if (q2_) *q2_ = (uint8_t)v_; else s->callback(s, RISCV_MEM_STORE, dst_ + j_, v_);
-            }
-        }
-        k += 1 + (n_ >> 2);
+        k += purv_memop(s, w & 7, TC_A(w), TC_B(w), TC_C(w));
         NEXT();
     }
 

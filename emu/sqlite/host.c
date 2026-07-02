@@ -35,6 +35,7 @@
 #else
 #include "../purv.h"
 #endif
+#include "../purvmemop.h"
 #include "hostcalls.h"
 
 /* ------------------------------------------------------------------ memory */
@@ -186,29 +187,14 @@ void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *st, uint16_t csr) {
  * place and returns whether to stop -- write/malloc/... return 0 and execution
  * continues inside the engine loop; only exit (which sets g_halt) returns 1. */
 static int on_illegal(RiscvEmulatorState_t *st) {
-    /* custom-0 bulk memcpy/memset (.insn r 0x0b -- see ../purva/transcode.h,
-     * RISCV_OP_MEMOP): purva evaluates it as its own opcode; here the ILLEGAL
+    /* custom-0 bulk mem/str instruction (.insn r 0x0b -- ../purvmemop.h has
+     * the whole story): purva evaluates it as its own opcode; here the ILLEGAL
      * hook emulates it, so a PURV_CUSTOM_MEMOPS guest runs on purv/purvs too
-     * (returning 0 resumes execution just past the instruction). dst rides in
-     * the rd slot and is READ; src/c in rs1, n in rs2. */
+     * (returning 0 resumes execution just past the instruction). */
     uint32_t w = st->inst;
-    if ((w & 0x7f) == 0x0b && (w >> 25) == 0 && ((w >> 12) & 7) <= 1) {
-        uint32_t dst = st->x[(w >> 7) & 31], b = st->x[(w >> 15) & 31], n = st->x[(w >> 20) & 31];
-        uint32_t rel = dst - st->writable.base;
-        if (rel <= st->writable.len && n <= st->writable.len - rel) {
-            uint8_t *d = st->writable.ptr + rel;
-            if ((w >> 12) & 1) { memset(d, (int)b, n); return 0; }
-            uint32_t sr = b - st->writable.base;
-            if (sr <= st->writable.len && n <= st->writable.len - sr) {
-                memmove(d, st->writable.ptr + sr, n); return 0;
-            }
-            sr = b - st->readonly.base;
-            if (sr <= st->readonly.len && n <= st->readonly.len - sr) {
-                memcpy(d, st->readonly.ptr + sr, n); return 0;
-            }
-        }
-        fprintf(stderr, "purv-sqlite: memop out of range dst=0x%08x n=%u\n", dst, n);
-        g_halt = 1; g_exit = 1; return 1;
+    if ((w & 0x7f) == 0x0b && (w >> 25) == 0) {
+        purv_memop(st, (w >> 12) & 7, (w >> 7) & 31, (w >> 15) & 31, (w >> 20) & 31);
+        return 0;
     }
     fprintf(stderr, "purv-sqlite: illegal instruction 0x%08x at pc=0x%08x\n",
             st->inst, st->pc);

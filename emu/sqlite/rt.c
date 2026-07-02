@@ -70,6 +70,39 @@ void *memset(void *d, int c, size_t n) {
     __asm__ volatile(".insn r 0x0b, 0x1, 0x0, %0, %1, %2" : "+r"(r) : "r"((long)c), "r"(n) : "memory");
     return r;
 }
+/* The scan/compare group: rd is the first argument in and the RESULT out
+ * (purvmemop.h computes the exact rt.c return value, so a custom-op guest and
+ * a plain-loop guest are indistinguishable to the program). */
+int memcmp(const void *a, const void *b, size_t n) {
+    long r = (long)a;
+    __asm__ volatile(".insn r 0x0b, 0x2, 0x0, %0, %1, %2" : "+r"(r) : "r"(b), "r"(n));
+    return (int)r;
+}
+void *memchr(const void *s, int c, size_t n) {
+    long r = (long)s;
+    __asm__ volatile(".insn r 0x0b, 0x3, 0x0, %0, %1, %2" : "+r"(r) : "r"((long)c), "r"(n));
+    return (void *)r;
+}
+size_t strlen(const char *s) {
+    long r = (long)s;
+    __asm__ volatile(".insn r 0x0b, 0x4, 0x0, %0, %1, %2" : "+r"(r) : "r"(s), "r"(0L));
+    return (size_t)r;
+}
+int strcmp(const char *a, const char *b) {
+    long r = (long)a;
+    __asm__ volatile(".insn r 0x0b, 0x5, 0x0, %0, %1, %2" : "+r"(r) : "r"(b), "r"(0L));
+    return (int)r;
+}
+char *strchr(const char *s, int c) {
+    long r = (long)s;
+    __asm__ volatile(".insn r 0x0b, 0x6, 0x0, %0, %1, %2" : "+r"(r) : "r"((long)c), "r"(0L));
+    return (char *)r;
+}
+int strncmp(const char *a, const char *b, size_t n) {
+    long r = (long)a;
+    __asm__ volatile(".insn r 0x0b, 0x7, 0x0, %0, %1, %2" : "+r"(r) : "r"(b), "r"(n));
+    return (int)r;
+}
 #else
 /* memcpy/memset/memmove are word-wise: on an emulated CPU every instruction is
  * ~a dispatch, so the byte loop pays 4x the accesses AND 4x the loop overhead --
@@ -116,25 +149,37 @@ void *memset(void *d, int c, size_t n) {
     return d;
 }
 #endif /* PURV_CUSTOM_MEMOPS */
+#ifndef PURV_CUSTOM_MEMOPS
 int memcmp(const void *a, const void *b, size_t n) {
     const unsigned char *x = a, *y = b;
     while (n--) { if (*x != *y) return *x - *y; x++; y++; }
     return 0;
 }
+#endif
+
+#ifndef PURV_CUSTOM_MEMOPS
 void *memchr(const void *s, int c, size_t n) {
     const unsigned char *p = s;
     while (n--) { if (*p == (unsigned char)c) return (void *)p; p++; }
     return NULL;
 }
+#endif
+
+#ifndef PURV_CUSTOM_MEMOPS
 size_t strlen(const char *s) { const char *p = s; while (*p) p++; return (size_t)(p - s); }
 int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (unsigned char)*a - (unsigned char)*b;
 }
+#endif
+
+#ifndef PURV_CUSTOM_MEMOPS
 int strncmp(const char *a, const char *b, size_t n) {
     while (n && *a && *a == *b) { a++; b++; n--; }
     return n ? (unsigned char)*a - (unsigned char)*b : 0;
 }
+#endif
+
 char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)) {} return r; }
 char *strncpy(char *d, const char *s, size_t n) {
     char *r = d;
@@ -143,9 +188,12 @@ char *strncpy(char *d, const char *s, size_t n) {
     return r;
 }
 char *strcat(char *d, const char *s) { char *r = d; while (*d) d++; while ((*d++ = *s++)) {} return r; }
+#ifndef PURV_CUSTOM_MEMOPS
 char *strchr(const char *s, int c) {
     for (;; s++) { if (*s == (char)c) return (char *)s; if (!*s) return NULL; }
 }
+#endif
+
 char *strrchr(const char *s, int c) {
     const char *last = NULL;
     for (;; s++) { if (*s == (char)c) last = s; if (!*s) return (char *)last; }
