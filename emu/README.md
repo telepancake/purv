@@ -21,6 +21,9 @@ emu/
   gdbserve.py launcher that brokers a gdb connection and hands purv the fd
   tools/      flatten.py / inline.py / compact.py — the atoom-distilling pipeline (history)
   examples/   fn.c (bare functions), sigtest.S (signature demo), loop.c (gdb reverse-exec)
+  purva/      the AOT pipeline: transcode RV32IM to a free-encoding image + its evaluator
+  sqlite/     freestanding SQLite guest + the reusable hosts and hostcall ABI
+  bench/      the benchmark corpus beyond sqlite: zlib (C), richards + deltablue (C++)
 ```
 
 `purv.h` is the entire public surface: the VM state is a **plain struct** you

@@ -1,0 +1,8 @@
+vendor/
+*.o
+*.elf
+*.img
+*-native
+*.out
+*.err
+.scale
