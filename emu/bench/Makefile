@@ -55,12 +55,14 @@ ALL_BUILT := $(foreach w,$(WORKLOADS),$(w)-guest.elf $(w).img $(w)-native)
 all: $(ALL_BUILT)
 
 # --- fetch the unmodified zlib on first build --------------------------------
-$(ZDIR)/zlib.h:
+# One stamp stands for the whole extracted tree; the zlib compile rules depend
+# on the stamp and name their .c directly, so make never needs a rule for files
+# that only exist after the fetch.
+vendor/.zlib-fetched:
 	mkdir -p vendor
 	curl -fsS -o vendor/zlib.tar.gz $(ZURL)
 	cd vendor && tar xzf zlib.tar.gz && rm -f zlib.tar.gz
-# the .c files appear together with zlib.h (make needs a rule to know that)
-$(ZDIR)/%.c: $(ZDIR)/zlib.h ;
+	touch $@
 
 # --- BENCH_SCALE cache: workload objects rebuild when SCALE changes ----------
 .scale: FORCE
@@ -85,17 +87,17 @@ rt-cxx-purva.o: rt-cxx.cc
 ZOBJS_RV32IMC := $(ZOBJ:%=z-%.o)
 ZOBJS_RV32IM  := $(ZOBJ:%=z-%-purva.o)
 ZOBJS_NATIVE  := $(ZOBJ:%=z-%-native.o)
-z-%.o: $(ZDIR)/%.c $(ZDIR)/zlib.h
-	$(GUEST_C) -march=rv32imc $(ZFLAGS) -c $< -o $@
-z-%-purva.o: $(ZDIR)/%.c $(ZDIR)/zlib.h
-	$(GUEST_C) -march=rv32im $(ZFLAGS) -c $< -o $@
-z-%-native.o: $(ZDIR)/%.c $(ZDIR)/zlib.h
-	$(NATIVECC) -O2 $(ZFLAGS) -c $< -o $@
+z-%.o: vendor/.zlib-fetched
+	$(GUEST_C) -march=rv32imc $(ZFLAGS) -c $(ZDIR)/$*.c -o $@
+z-%-purva.o: vendor/.zlib-fetched
+	$(GUEST_C) -march=rv32im $(ZFLAGS) -c $(ZDIR)/$*.c -o $@
+z-%-native.o: vendor/.zlib-fetched
+	$(NATIVECC) -O2 $(ZFLAGS) -c $(ZDIR)/$*.c -o $@
 
 # --- zbench (C, zlib) ---------------------------------------------------------
-zbench.o: zbench.c $(ZDIR)/zlib.h .scale
+zbench.o: zbench.c vendor/.zlib-fetched .scale
 	$(GUEST_C) -march=rv32imc $(ZFLAGS) -I$(ZDIR) -DPURV_GUEST -DBENCH_SCALE=$(SCALE) -c $< -o $@
-zbench-purva.o: zbench.c $(ZDIR)/zlib.h .scale
+zbench-purva.o: zbench.c vendor/.zlib-fetched .scale
 	$(GUEST_C) -march=rv32im $(ZFLAGS) -I$(ZDIR) -DPURV_GUEST -DBENCH_SCALE=$(SCALE) -c $< -o $@
 zbench-guest.elf: rt.o builtins.o zbench.o $(ZOBJS_RV32IMC)
 	$(RVLD) $^ -o $@
