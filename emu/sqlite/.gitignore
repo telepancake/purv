@@ -25,4 +25,3 @@ cg-*.err
 cg-*.out
 *.prof
 host-purva-prof
-.memops

@@ -71,20 +71,12 @@ $(AMALG):
 	cd vendor && unzip -oq amalg.zip && rm -f amalg.zip
 
 # --- guest objects ----------------------------------------------------------
-# MEMOPS=custom compiles rt.c's memcpy/memset/memmove as ONE custom-0 guest
-# instruction each (rt.c PURV_CUSTOM_MEMOPS; ../purva/transcode.h RISCV_OP_MEMOP)
-# -- purva evaluates it natively, purv/purvs emulate it in the illegal hook.
-# Default `word` keeps the plain word-wise loops (no custom encodings). The
-# .memops stamp forces the rt rebuild when the choice changes.
-MEMOPS  ?= word
-MEMFLAG := $(if $(filter custom,$(MEMOPS)),-DPURV_CUSTOM_MEMOPS)
-.memops: FORCE
-	@[ -f $@ ] && [ "$$(cat $@)" = "$(MEMOPS)" ] || echo "$(MEMOPS)" > $@
-
 # rt.c is compiled -fno-builtin so its mem/str defns aren't turned into calls to
-# themselves.
-rt.o: rt.c hostcalls.h .memops
-	$(GUEST) -fno-builtin $(MEMFLAG) -c $< -o $@
+# themselves. Its mem/str workhorses are single custom-0 instructions
+# (../purvmemop.h): purva runs them as its own opcode, purv/purvs service them
+# from the illegal hook (host.c).
+rt.o: rt.c hostcalls.h
+	$(GUEST) -fno-builtin -c $< -o $@
 builtins.o: builtins.c
 	$(GUEST) -c $< -o $@
 vfs.o: vfs.c $(GHDRS)
@@ -108,8 +100,8 @@ guest-bench.elf: rt.o builtins.o vfs.o bench.o sqlite3.o purv.ld
 	$(RVLD) $(filter %.o,$^) -o $@
 
 # --- purva guest objects (RV32IM) --------------------------------------------
-rt-purva.o: rt.c hostcalls.h .memops
-	$(GUEST_PURVA) -fno-builtin $(MEMFLAG) -c $< -o $@
+rt-purva.o: rt.c hostcalls.h
+	$(GUEST_PURVA) -fno-builtin -c $< -o $@
 builtins-purva.o: builtins.c
 	$(GUEST_PURVA) -c $< -o $@
 vfs-purva.o: vfs.c $(GHDRS)
@@ -242,7 +234,7 @@ clean:
 	rm -f rt.o builtins.o vfs.o guest.o bench.o guest.elf guest-bench.elf \
 	      rt-purva.o builtins-purva.o vfs-purva.o bench-purva.o sqlite3-purva.o \
 	      guest-bench-purva.elf guest-bench-purva.img \
-	      host host-purvs host-purva purva-engine.o host-pgo bench-native .scale .memops \
+	      host host-purvs host-purva purva-engine.o host-pgo bench-native .scale \
 	      native.out native.err purv.out purv.err purvs.out purvs.err purva.out purva.err
 	rm -rf $(PGODIR)
 distclean: clean

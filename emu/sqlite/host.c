@@ -189,7 +189,7 @@ void *RiscvEmulatorGetUnknownCSR(RiscvEmulatorState_t *st, uint16_t csr) {
 static int on_illegal(RiscvEmulatorState_t *st) {
     /* custom-0 bulk mem/str instruction (.insn r 0x0b -- ../purvmemop.h has
      * the whole story): purva evaluates it as its own opcode; here the ILLEGAL
-     * hook emulates it, so a PURV_CUSTOM_MEMOPS guest runs on purv/purvs too
+     * hook emulates it, so the rt.c custom-op guests run on purv/purvs too
      * (returning 0 resumes execution just past the instruction). */
     uint32_t w = st->inst;
     if ((w & 0x7f) == 0x0b && (w >> 25) == 0) {

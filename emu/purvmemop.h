@@ -2,7 +2,7 @@
  * purvmemop.h - the custom-0 bulk memory/string instruction, evaluated once.
  *
  * The guest encoding (.insn r 0x0b, funct3, 0x0, rd, rs1, rs2 -- emitted by
- * rt.c's PURV_CUSTOM_MEMOPS bodies) packs one libc call into one instruction.
+ * the sqlite rt.c bodies) packs one libc call into one instruction.
  * rd is READ as the first argument; the scan/compare subtypes then WRITE the
  * result back into rd (memcpy/memset leave it alone -- it already holds the
  * dst they return). funct3 selects:

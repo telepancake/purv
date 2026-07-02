@@ -48,13 +48,12 @@ __asm__(
 
 /* ------------------------------------------------------------ mem / string */
 
-#ifdef PURV_CUSTOM_MEMOPS
-/* purva-only build: memcpy/memset/memmove are each ONE custom instruction
- * (.insn r in the custom-0 opcode space -- see ../purva/transcode.h
- * RISCV_OP_MEMOP), evaluated as a host-side bulk copy. dst rides in the rd
- * slot (read by the evaluator), src/c in rs1, n in rs2. purv/purvs would trap
- * on it -- that engine lock-in is exactly the trade this option measures
- * against the portable word-wise loops below. */
+/* The mem/str workhorses are each ONE custom instruction (.insn r in the
+ * custom-0 opcode space -- ../purvmemop.h is the whole story: encoding,
+ * semantics, fuel). purva evaluates it as its own opcode; purv/purvs service
+ * it from the ILLEGAL hook and resume. Measured on the sqlite bench, this is
+ * worth ~10% of guest instructions over even word-wise loops -- parse-heavy
+ * code (JSON) lives in these functions. */
 void *memcpy(void *d, const void *s, size_t n) {
     void *r = d;
     __asm__ volatile(".insn r 0x0b, 0x0, 0x0, %0, %1, %2" : "+r"(r) : "r"(s), "r"(n) : "memory");
@@ -103,82 +102,7 @@ int strncmp(const char *a, const char *b, size_t n) {
     __asm__ volatile(".insn r 0x0b, 0x7, 0x0, %0, %1, %2" : "+r"(r) : "r"(b), "r"(n));
     return (int)r;
 }
-#else
-/* memcpy/memset/memmove are word-wise: on an emulated CPU every instruction is
- * ~a dispatch, so the byte loop pays 4x the accesses AND 4x the loop overhead --
- * profile.py showed these three's lbu/sb/addi/bne chains among the hottest
- * pairs in the sqlite bench. Same-alignment inputs (the overwhelming case) copy
- * a word per iteration after a byte head; differing alignment stays bytewise. */
-void *memcpy(void *d, const void *s, size_t n) {
-    unsigned char *p = d; const unsigned char *q = s;
-    if (n >= 8 && (((uintptr_t)p ^ (uintptr_t)q) & 3) == 0) {
-        while ((uintptr_t)p & 3) { *p++ = *q++; n--; }
-        uint32_t *pw = (uint32_t *)p; const uint32_t *qw = (const uint32_t *)q;
-        for (; n >= 16; n -= 16) { pw[0] = qw[0]; pw[1] = qw[1]; pw[2] = qw[2]; pw[3] = qw[3]; pw += 4; qw += 4; }
-        for (; n >= 4; n -= 4) *pw++ = *qw++;
-        p = (unsigned char *)pw; q = (const unsigned char *)qw;
-    }
-    while (n--) *p++ = *q++;
-    return d;
-}
-void *memmove(void *d, const void *s, size_t n) {
-    unsigned char *p = d; const unsigned char *q = s;
-    if (p == q || n == 0) return d;
-    if (p < q) return memcpy(d, s, n);                 /* forward copy is safe */
-    p += n; q += n;
-    if (n >= 8 && (((uintptr_t)p ^ (uintptr_t)q) & 3) == 0) {   /* backward, word-wise */
-        while ((uintptr_t)p & 3) { *--p = *--q; n--; }
-        uint32_t *pw = (uint32_t *)p; const uint32_t *qw = (const uint32_t *)q;
-        for (; n >= 4; n -= 4) *--pw = *--qw;
-        p = (unsigned char *)pw; q = (const unsigned char *)qw;
-    }
-    while (n--) *--p = *--q;
-    return d;
-}
-void *memset(void *d, int c, size_t n) {
-    unsigned char *p = d;
-    if (n >= 8) {
-        uint32_t v = (unsigned char)c * 0x01010101u;
-        while ((uintptr_t)p & 3) { *p++ = (unsigned char)c; n--; }
-        uint32_t *pw = (uint32_t *)p;
-        for (; n >= 16; n -= 16) { pw[0] = v; pw[1] = v; pw[2] = v; pw[3] = v; pw += 4; }
-        for (; n >= 4; n -= 4) *pw++ = v;
-        p = (unsigned char *)pw;
-    }
-    while (n--) *p++ = (unsigned char)c;
-    return d;
-}
-#endif /* PURV_CUSTOM_MEMOPS */
-#ifndef PURV_CUSTOM_MEMOPS
-int memcmp(const void *a, const void *b, size_t n) {
-    const unsigned char *x = a, *y = b;
-    while (n--) { if (*x != *y) return *x - *y; x++; y++; }
-    return 0;
-}
-#endif
 
-#ifndef PURV_CUSTOM_MEMOPS
-void *memchr(const void *s, int c, size_t n) {
-    const unsigned char *p = s;
-    while (n--) { if (*p == (unsigned char)c) return (void *)p; p++; }
-    return NULL;
-}
-#endif
-
-#ifndef PURV_CUSTOM_MEMOPS
-size_t strlen(const char *s) { const char *p = s; while (*p) p++; return (size_t)(p - s); }
-int strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (unsigned char)*a - (unsigned char)*b;
-}
-#endif
-
-#ifndef PURV_CUSTOM_MEMOPS
-int strncmp(const char *a, const char *b, size_t n) {
-    while (n && *a && *a == *b) { a++; b++; n--; }
-    return n ? (unsigned char)*a - (unsigned char)*b : 0;
-}
-#endif
 
 char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)) {} return r; }
 char *strncpy(char *d, const char *s, size_t n) {
@@ -188,11 +112,6 @@ char *strncpy(char *d, const char *s, size_t n) {
     return r;
 }
 char *strcat(char *d, const char *s) { char *r = d; while (*d) d++; while ((*d++ = *s++)) {} return r; }
-#ifndef PURV_CUSTOM_MEMOPS
-char *strchr(const char *s, int c) {
-    for (;; s++) { if (*s == (char)c) return (char *)s; if (!*s) return NULL; }
-}
-#endif
 
 char *strrchr(const char *s, int c) {
     const char *last = NULL;
