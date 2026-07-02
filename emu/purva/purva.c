@@ -15,6 +15,9 @@
  */
 #include <stdint.h>
 #include <string.h>
+#ifdef PURVA_PROFILE
+#include <stdlib.h>
+#endif
 
 #include "purva.h"   /* purv.h + transcode.h (the op vocabulary and field macros) */
 
@@ -99,7 +102,28 @@ epilogue_slow(RiscvEmulatorState_t *s, uint32_t rmask, uint32_t top) {
 
 static const Transcoded *g_prog;
 
-void RiscvEmulatorSetProgram(const Transcoded *prog) { g_prog = prog; }
+#ifdef PURVA_PROFILE
+/* Profiling build (-DPURVA_PROFILE): one execution counter per op-word index,
+ * bumped at every dispatch. The evaluator stays branch-identical; the counters
+ * feed profile.py, which joins them with the decoded image to rank hot ops and
+ * adjacent-pair patterns -- the evidence fusion decisions are made from. The
+ * host dumps purva_prof_counts (n_ops entries) after the run. */
+uint64_t *purva_prof_counts;
+static uint64_t *prof_alloc(uint32_t n) {
+    return (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+}
+#define PROF(p) (purva_prof_counts[(p) - base]++)
+#else
+#define PROF(p) ((void)0)
+#endif
+
+void RiscvEmulatorSetProgram(const Transcoded *prog) {
+    g_prog = prog;
+#ifdef PURVA_PROFILE
+    free(purva_prof_counts);
+    purva_prof_counts = prof_alloc(prog ? prog->n_ops : 0);
+#endif
+}
 
 __attribute__((optimize("no-gcse", "no-crossjumping")))
 uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
@@ -134,6 +158,10 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_ECALL] = &&h_trap, [RISCV_OP_EBREAK] = &&h_trap, [RISCV_OP_ILLEGAL] = &&h_trap,
         [RISCV_OP_PROLOGUE] = &&h_prologue, [RISCV_OP_EPILOGUE] = &&h_epilogue,
         [RISCV_OP_LI_LO] = &&h_li_lo, [RISCV_OP_LI_HI] = &&h_li_hi,
+        [RISCV_OP_SHADD] = &&h_shadd, [RISCV_OP_LWX] = &&h_lwx,
+        [RISCV_OP_LWLW] = &&h_lwlw, [RISCV_OP_LWJALR] = &&h_lwjalr,
+        [RISCV_OP_LW_BEQZ] = &&h_lw_beqz, [RISCV_OP_LW_BNEZ] = &&h_lw_bnez,
+        [RISCV_OP_LBU_BEQZ] = &&h_lbu_beqz, [RISCV_OP_LBU_BNEZ] = &&h_lbu_bnez,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -141,10 +169,10 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t a, b;
 
     /* Straight-line step: one op word forward (the cursor is the pc). */
-    #define NEXT() do { k++; w = *++p; goto *tbl[TC_OP(w)]; } while (0)
+    #define NEXT() do { k++; w = *++p; PROF(p); goto *tbl[TC_OP(w)]; } while (0)
     /* Jump to op index `idx`: count it, budget-check (resume pc = idx<<2), relocate. */
     #define RELOC(idx) do { uint32_t i_ = (idx); k++; \
-        if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; goto *tbl[TC_OP(w)]; } while (0)
+        if (k >= max) { s->pc = i_ << 2; return k; } p = base + i_; w = *p; PROF(p); goto *tbl[TC_OP(w)]; } while (0)
     /* One load, one store. addr = x[rs1] + imm. LOAD(T): T is the loaded value's C
      * type -- sizeof(T) picks the byte width, and the cast to (T) then int32_t does
      * the sign/zero extension the width implies (LB/LH signed, LBU/LHU unsigned, LW
@@ -161,6 +189,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         uint8_t *q_ = mem_w(s, a_, (n)); \
         if (q_) st_le(q_, (n), v_); else s->callback(s, RISCV_MEM_STORE, a_, v_); } while (0)
 
+    PROF(p);
     goto *tbl[TC_OP(w)];
 
     h_add:  s->x[TC_A(w)] = s->x[TC_B(w)] + s->x[TC_C(w)];                          NEXT();
@@ -220,7 +249,46 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
               if (rd) s->x[rd] = ((uint32_t)(p - base) << 2) + 4;
               k++;
               if (t >= clen || k >= max) { s->pc = t; return k; }
-              p = base + (t >> 2); w = *p; goto *tbl[TC_OP(w)]; }
+              p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)]; }
+
+    /* Pair-fused ops (transcode.h): each stands in for TWO instructions, so each
+     * counts k twice -- the fuel stays the instruction count, as the fused
+     * prologue/epilogue already do. The transcoder only emits them where the
+     * intermediate register is clobbered by the pair itself, so one rd write
+     * (guaranteed nonzero) replays both instructions' architectural effects. */
+    h_shadd: s->x[TC_A(w)] = s->x[TC_B(w)] + (s->x[TC_C(w)] << TC_SH(w)); k++; NEXT();
+    h_lwx: { uint32_t a_ = s->x[TC_B(w)] + s->x[TC_C(w)] + (uint32_t)TC_OFF11(w);
+             const uint8_t *q_ = mem_r(s, a_, 4);
+             s->x[TC_A(w)] = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0);
+             k++; NEXT(); }
+    h_lwlw: { uint32_t a_ = s->x[TC_B(w)] + (uint32_t)TC_O1(w);
+              const uint8_t *q_ = mem_r(s, a_, 4);
+              a_ = (q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0)) + (uint32_t)TC_O2(w);
+              q_ = mem_r(s, a_, 4);
+              s->x[TC_A(w)] = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0);
+              k++; NEXT(); }
+    h_lwjalr: { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w);
+                const uint8_t *q_ = mem_r(s, a_, 4);
+                uint32_t t = (q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, a_, 0)) & ~1u;
+                s->x[TC_A(w)] = t;
+                s->x[1] = ((uint32_t)(p - base) << 2) + 4;
+                k += 2;
+                if (t >= clen || k >= max) { s->pc = t; return k; }
+                p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)]; }
+    /* Two-word load+branch-zero: word2 is the baked op-relative displacement
+     * (x4, like a branch imm). Fall through skips both words. */
+    #define LOADBZ(T, cond) do { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w); \
+        const uint8_t *q_ = mem_r(s, a_, sizeof(T)); \
+        uint32_t v_ = (uint32_t)(int32_t)(T)(q_ ? ld_le(q_, sizeof(T)) \
+                                                : s->callback(s, RISCV_MEM_LOAD, a_, 0)); \
+        s->x[TC_A(w)] = v_; k++; \
+        if (v_ cond 0) RELOC((uint32_t)(p - base) + (uint32_t)((int32_t)p[1] >> 2)); \
+        k++; w = *(p += 2); PROF(p); goto *tbl[TC_OP(w)]; } while (0)
+    h_lw_beqz:  LOADBZ(int32_t, ==);
+    h_lw_bnez:  LOADBZ(int32_t, !=);
+    h_lbu_beqz: LOADBZ(uint8_t, ==);
+    h_lbu_bnez: LOADBZ(uint8_t, !=);
+    #undef LOADBZ
 
     h_lui:   s->x[TC_A(w)] = TC_UIMM(w) << 12; NEXT();
     /* Only CODE-address auipc reach here (data auipc are fused to LI at transcode time).
@@ -252,7 +320,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
             #undef SAVE
         } else cnt = prologue_slow(s, rmask, sp0);
         s->x[2] = sp0 - frame;
-        k += cnt + 1; w = *++p; goto *tbl[TC_OP(w)];
+        k += cnt + 1; w = *++p; PROF(p); goto *tbl[TC_OP(w)];
     }
     /* Fused epilogue (transcode.h): restore the callee-saved set from the top of the
      * frame (p-th set register at sp+frame-4-4p), deallocate, and return to ra. The
@@ -272,7 +340,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         s->x[2] = top;
         uint32_t t = s->x[1] & ~1u; k += cnt + 2;
         if (t >= clen || k >= max) { s->pc = t; return k; }
-        p = base + (t >> 2); w = *p; goto *tbl[TC_OP(w)];
+        p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)];
     }
 
     h_trap: {
@@ -284,7 +352,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
                  :                           (s->illegal ? s->illegal(s) : 1);
         if (stop) return k;
         if (k >= max) { s->pc = pc_ + 4; return k; }          /* serviced syscall: resume */
-        w = *++p; goto *tbl[TC_OP(w)];
+        w = *++p; PROF(p); goto *tbl[TC_OP(w)];
     }
     #undef NEXT
     #undef RELOC

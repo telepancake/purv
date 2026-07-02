@@ -150,6 +150,12 @@ purva-engine.o: ../purva/purva.c ../purva/purva.h ../purva/transcode.h ../purva/
 host-purva: host-purva.c purva-engine.o ../purva/purva.h ../purva/image.h hostcalls.h
 	$(HOSTCC) $(HOSTFLAGS) host-purva.c purva-engine.o -I.. -I../purva -o $@
 
+# Profiling host (-DPURVA_PROFILE in BOTH TUs): counts every op-word execution and
+# dumps the counters after the run ($PURVA_PROF_OUT). Feed to ../purva/profile.py
+# together with the .img to rank hot ops and fusable adjacent pairs.
+host-purva-prof: host-purva.c ../purva/purva.c ../purva/purva.h ../purva/image.h hostcalls.h
+	$(HOSTCC) $(HOSTFLAGS) -fcf-protection=none -DPURVA_PROFILE host-purva.c ../purva/purva.c -I.. -I../purva -o $@
+
 # Profile-guided host (make host-pgo). Three phases: build instrumented, train on
 # the bench guest, rebuild with the profile so the compiler lays out and allocates
 # the hot dispatch loop from real execution data instead of static heuristics

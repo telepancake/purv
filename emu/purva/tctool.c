@@ -277,6 +277,23 @@ static void apply_pcrel_code_fixups(const PcrelFixup *fx, uint32_t n, const uint
             fprintf(stderr, "transcode: pcrel fixup at 0x%x: lo12 store at 0x%x got fused\n", fx[i].hi_off, fx[i].lo_off);
             exit(2);
         }
+        /* Patching writes the lo12 into the op's LOW 16 BITS, so the op at at_lo must
+         * be one that keeps its immediate there. A pair fusion (try_fuse_pair) can
+         * turn a load into LWLW/LWX, whose low bits mean something else -- that can't
+         * happen to a genuine lo12 user (its rs1 is the auipc's rd, not a value the
+         * fusible patterns produce), but if it ever did, corrupt loudly, not silently. */
+        {
+            uint8_t lo_op = TC_OP(ops[at_lo]);
+            int imm16_low = (lo_op >= RISCV_OP_ADDI && lo_op <= RISCV_OP_SRAI) ||
+                            (lo_op >= RISCV_OP_LB && lo_op <= RISCV_OP_SW) ||
+                            lo_op == RISCV_OP_JALR || lo_op == RISCV_OP_LWJALR ||
+                            (lo_op >= RISCV_OP_LW_BEQZ && lo_op <= RISCV_OP_LBU_BNEZ);
+            if (!imm16_low) {
+                fprintf(stderr, "transcode: pcrel fixup at 0x%x: lo12 site at 0x%x was fused "
+                        "into op %u (no low-16 imm) -- refusing\n", fx[i].hi_off, fx[i].lo_off, lo_op);
+                exit(2);
+            }
+        }
         int32_t target_pc = (int32_t)(at_sym * 4) + fx[i].addend;   /* an addend is just an offset, same in either pc space */
         int32_t delta = target_pc - (int32_t)(at_hi * 4);
         uint8_t hi_op = TC_OP(ops[at_hi]);

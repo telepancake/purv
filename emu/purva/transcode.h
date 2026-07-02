@@ -24,6 +24,11 @@
  *   li_lo / li_hi    op[31:26] rd[25:21]  imm[20:0]              (21-bit signed value)
  *   nop / ecall / ebreak / illegal   op[31:26]
  *   prologue / epilogue (fused)      op[31:26] regmask[25:13] frame[12:0]
+ *   shadd (fused)                    op[31:26] rd[25:21] rs1[20:16] rs2[15:11] sh[10:6]
+ *   lwx (fused)                      op[31:26] rd[25:21] rs1[20:16] rs2[15:11] off[10:0]
+ *   lwlw (fused)                     op[31:26] rd[25:21] rs1[20:16] o1[15:8] o2[7:0]
+ *   lwjalr (fused)                   op[31:26] rd[25:21] rs1[20:16] off[15:0]
+ *   load+beqz/bnez (fused, 2 words)  op[31:26] rd[25:21] rs1[20:16] off[15:0] | disp32
  *
  * (auipc is its own op -- it computes from the evaluator's live op cursor, so it fits
  * one word; it survives only for CODE addresses, tctool re-encoding its uimm in op space.
@@ -75,6 +80,19 @@ enum {
     RISCV_OP_EPILOGUE,      /* fused callee-saved restores + frame-dealloc + ret (peephole-only) */
     RISCV_OP_LI_LO,         /* rd = sext21(imm)              -- data auipc/`la` near 0 (peephole-only) */
     RISCV_OP_LI_HI,         /* rd = sext21(imm) + RISCV_HALF -- data auipc/`la` near RISCV_HALF (peephole-only) */
+    /* Pair fusions (peephole-only; see try_fuse_pair). Each replays BOTH
+     * instructions' exact effects, so it is only matched when the second one's
+     * register writes coincide with the first's (the intermediate is clobbered)
+     * -- no liveness guessing. All chosen from measured pair frequency on real
+     * C and C++ code (profile.py); each earns its evaluator handler. */
+    RISCV_OP_SHADD,         /* slli T,X,k;  add T,B,T   ->  rd = rs1 + (rs2 << sh5)      */
+    RISCV_OP_LWX,           /* add  T,a,b;  lw  T,o(T)  ->  rd = M32[rs1 + rs2 + off11]  */
+    RISCV_OP_LWLW,          /* lw T,o1(a);  lw T,o2(T)  ->  rd = M32[M32[rs1+o1_8]+o2_8] */
+    RISCV_OP_LWJALR,        /* lw T,o(a);   jalr ra,0(T) -> virtual call: rd=t, ra=link, jump t */
+    RISCV_OP_LW_BEQZ,       /* lw  T,o(a);  beq T,x0    -- TWO op words (word2 = branch disp) */
+    RISCV_OP_LW_BNEZ,       /* lw  T,o(a);  bne T,x0                                          */
+    RISCV_OP_LBU_BEQZ,      /* lbu T,o(a);  beq T,x0                                          */
+    RISCV_OP_LBU_BNEZ,      /* lbu T,o(a);  bne T,x0                                          */
     RISCV_OP_COUNT
 };
 
@@ -136,6 +154,10 @@ enum {
 #define TC_IMM(w)   ((int32_t)(int16_t)(w))                       /* 16-bit signed */
 #define TC_JOFF(w)  ((int32_t)(((w) & 0x1fffffu) << 11) >> 11)    /* 21-bit signed */
 #define TC_UIMM(w)  ((w) & 0xfffffu)                              /* 20-bit upper  */
+#define TC_SH(w)    (((w) >> 6) & 31)                             /* shadd shift   */
+#define TC_OFF11(w) ((int32_t)((w) << 21) >> 21)                  /* lwx 11-bit signed */
+#define TC_O1(w)    ((int32_t)(int8_t)((w) >> 8))                 /* lwlw offsets  */
+#define TC_O2(w)    ((int32_t)(int8_t)(w))
 
 /* A transcoded program: just the op array and how far the code runs. ops[pc>>2] is
  * a SHORTCUT that only holds when nothing has fused -- see the header note above.

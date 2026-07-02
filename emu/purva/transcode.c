@@ -112,10 +112,15 @@ static void decode(const uint8_t *code, uint32_t off, Dec *d) {
 }
 
 /* Output op words for an op: 0 for RISCV_OP_NOP (dropped during translation -- it
- * occupies no op slot), 1 for everything else (a fused prologue/epilogue/la covers
+ * occupies no op slot), 2 for the fused load+branch pairs (word2 is the baked
+ * branch displacement), 1 for everything else (a fused prologue/epilogue/la covers
  * several bytes of original code but still emits exactly one op word; its consumed-
  * byte count is the fuse helper's return value, separate from this). */
-static int op_words(uint8_t op) { return op == RISCV_OP_NOP ? 0 : 1; }
+static int op_words(uint8_t op) {
+    if (op == RISCV_OP_NOP) return 0;
+    if (op >= RISCV_OP_LW_BEQZ && op <= RISCV_OP_LBU_BNEZ) return 2;
+    return 1;
+}
 
 /* ---- target set: addresses that must keep their own op slot ---- */
 
@@ -273,6 +278,67 @@ static uint32_t try_fuse_la(const uint8_t *code, uint32_t len, uint32_t off,
     return 8;
 }
 
+/* Adjacent-pair fusion: collapse two instructions into ONE op when the packed
+ * word can replay BOTH exactly. The rule that makes every match sound without
+ * liveness analysis: the second instruction's destination must CLOBBER the
+ * first's (so the only intermediate value dies inside the op), except LWJALR
+ * where the intermediate is the op's own explicit rd. The patterns (and the
+ * 8/11-bit offset limits) come from measured pair frequency on real C and C++
+ * code -- see profile.py and the enum notes in transcode.h. Returns 8 (both
+ * instructions consumed) on a match, else 0. */
+static uint32_t try_fuse_pair(const uint8_t *code, uint32_t len, uint32_t off,
+                              const Targets *targets, Dec *out) {
+    if (off + 8 > len) return 0;
+    if (targets_has(targets, off + 4)) return 0;   /* second half must not be a jump target */
+    Dec a, b;
+    decode(code, off, &a);
+    decode(code, off + 4, &b);
+
+    /* slli T,X,k ; add T,B,T (either operand order)  ->  SHADD T = B + (X<<k) */
+    if (a.op == RISCV_OP_SLLI && b.op == RISCV_OP_ADD && b.rd == a.rd) {
+        uint32_t other = b.rs1 == a.rd ? b.rs2 : b.rs2 == a.rd ? b.rs1 : 32;
+        if (other < 32 && other != a.rd) {
+            out->op = RISCV_OP_SHADD; out->rd = a.rd; out->rs1 = other;
+            out->rs2 = a.rs1; out->imm = a.imm;
+            return 8;
+        }
+    }
+    /* add T,a,b ; lw T,off(T)  ->  LWX T = M32[a + b + off11] */
+    if (a.op == RISCV_OP_ADD && b.op == RISCV_OP_LW && a.rd != 0 &&
+        b.rd == a.rd && b.rs1 == a.rd &&
+        (int32_t)b.imm >= -1024 && (int32_t)b.imm < 1024) {
+        out->op = RISCV_OP_LWX; out->rd = a.rd; out->rs1 = a.rs1; out->rs2 = a.rs2;
+        out->imm = b.imm;
+        return 8;
+    }
+    if (a.op == RISCV_OP_LW && a.rd != 0) {
+        /* lw T,o1(a) ; lw T,o2(T)  ->  LWLW (the double indirection) */
+        if (b.op == RISCV_OP_LW && b.rd == a.rd && b.rs1 == a.rd &&
+            (int32_t)a.imm >= -128 && (int32_t)a.imm < 128 &&
+            (int32_t)b.imm >= -128 && (int32_t)b.imm < 128) {
+            out->op = RISCV_OP_LWLW; out->rd = a.rd; out->rs1 = a.rs1;
+            out->imm = (a.imm & 0xffu) << 8 | (b.imm & 0xffu);
+            return 8;
+        }
+        /* lw T,off(a) ; jalr ra,0(T)  ->  LWJALR (the virtual call) */
+        if (b.op == RISCV_OP_JALR && b.rd == 1 && b.rs1 == a.rd && (int32_t)b.imm == 0) {
+            out->op = RISCV_OP_LWJALR; out->rd = a.rd; out->rs1 = a.rs1; out->imm = a.imm;
+            return 8;
+        }
+    }
+    /* lw/lbu T,off(a) ; beq/bne T,x0,target  ->  two-word load+branch-zero */
+    if ((a.op == RISCV_OP_LW || a.op == RISCV_OP_LBU) && a.rd != 0 &&
+        (b.op == RISCV_OP_BEQ || b.op == RISCV_OP_BNE) &&
+        ((b.rs1 == a.rd && b.rs2 == 0) || (b.rs2 == a.rd && b.rs1 == 0))) {
+        int ne = b.op == RISCV_OP_BNE;
+        out->op = a.op == RISCV_OP_LW ? (ne ? RISCV_OP_LW_BNEZ  : RISCV_OP_LW_BEQZ)
+                                      : (ne ? RISCV_OP_LBU_BNEZ : RISCV_OP_LBU_BEQZ);
+        out->rd = a.rd; out->rs1 = a.rs1; out->imm = a.imm; out->target = b.target;
+        return 8;
+    }
+    return 0;
+}
+
 /* Decode (or fuse) the unit starting at `off`; returns the byte width consumed and
  * fills *d. Shared by build_map and transcode_ex's emit pass so they make the
  * identical decision -- both are pure functions of (code, len, off, targets). Every op
@@ -287,6 +353,8 @@ static uint32_t step(const uint8_t *code, uint32_t len, uint32_t off,
     fused = try_fuse_epilogue(code, len, off, targets, d);
     if (fused) return fused;
     fused = try_fuse_la(code, len, off, targets, d);
+    if (fused) return fused;
+    fused = try_fuse_pair(code, len, off, targets, d);
     if (fused) return fused;
     decode(code, off, d);
     if (d->op == RISCV_OP_AUIPC) {
@@ -340,7 +408,17 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         ops[at++] = w0 | (d->imm & 0x3ffffffu);
     else if (op == RISCV_OP_LI_LO || op == RISCV_OP_LI_HI)          /* rd | 21-bit imm (JAL shape) */
         ops[at++] = w0 | rd << 21 | (d->imm & 0x1fffffu);
-    else if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
+    else if (op == RISCV_OP_SHADD)                                  /* rd, rs1, rs2, sh[10:6] */
+        ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 31) << 6;
+    else if (op == RISCV_OP_LWX)                                    /* rd, rs1, rs2, off[10:0] */
+        ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->imm & 0x7ffu);
+    else if (op == RISCV_OP_LWLW || op == RISCV_OP_LWJALR)          /* rd, rs1, packed offs / off16 */
+        ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffffu);
+    else if (op >= RISCV_OP_LW_BEQZ && op <= RISCV_OP_LBU_BNEZ) {   /* word1: load; word2: disp */
+        int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;
+        ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffffu);
+        ops[at++] = (uint32_t)(delta * 4);
+    } else if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
         int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;
         ops[at++] = w0 | rs1 << 21 | rs2 << 16 | ((uint32_t)(delta * 4) & 0xffff);
     } else if (op == RISCV_OP_JAL) {

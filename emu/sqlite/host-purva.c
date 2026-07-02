@@ -225,6 +225,21 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (i >= max_insns) { fprintf(stderr, "purva-sqlite: instruction cap reached\n"); g_exit = 3; }
 
+#ifdef PURVA_PROFILE
+    /* Profiling engine build (make host-purva-prof): dump the per-op-index
+     * execution counters (n_ops little-endian uint64s, $PURVA_PROF_OUT or
+     * purva.prof) for ../purva/profile.py to join with the image. */
+    {
+        extern uint64_t *purva_prof_counts;
+        const char *out = getenv("PURVA_PROF_OUT");
+        FILE *pf = fopen(out ? out : "purva.prof", "wb");
+        if (pf) {
+            fwrite(purva_prof_counts, sizeof(uint64_t), prog.n_ops, pf);
+            fclose(pf);
+        }
+    }
+#endif
+
     if (stats) {
         double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         fprintf(stderr, "BENCH wall_ms=%.0f insns=%llu mips=%.1f\n",
