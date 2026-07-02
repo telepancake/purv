@@ -32,9 +32,9 @@ transcode: tctool.c transcode.c transcode.h image.h ../purv.h ../purvhost.h
 # per-handler endbr landing pads are ~4.5% overhead for no real protection (the indirect
 # jumps only ever hit its own fixed label table), and GCC offers no per-function control.
 # Scoped to the engine TU; main.c (the driver) keeps CET. See the sqlite Makefile's note.
-purva-engine.o: purva.c purva.h transcode.h image.h ../purv.h ../purvhost.h
+purva-engine.o: purva.c purva.h transcode.h image.h ../purv.h ../purvhost.h ../purvmemop.h
 	$(CC) $(CFLAGS) -fcf-protection=none -c purva.c -o $@
-purva: purva-engine.o main.c purva.h transcode.h image.h ../purv.h ../purvhost.h
+purva: purva-engine.o main.c purva.h transcode.h image.h ../purv.h ../purvhost.h ../purvmemop.h
 	$(CC) $(CFLAGS) purva-engine.o main.c -o $@
 
 # RV32IM example elfs (local names; don't clobber purvs's rv32imc builds). Linked

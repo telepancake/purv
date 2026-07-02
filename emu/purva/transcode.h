@@ -29,7 +29,6 @@
  *   lwlw (fused)                     op[31:26] rd[25:21] rs1[20:16] o1[15:8] o2[7:0]
  *   lwjalr (fused)                   op[31:26] rd[25:21] rs1[20:16] off[15:0]
  *   load+beqz/bnez (fused, 2 words)  op[31:26] rd[25:21] rs1[20:16] off[15:0] | disp32 (bit0=cond)
- *   pair (fused, 2 words)            op[31:26] r1[25:21] b1[20:16] r2[15:11] b2[10:6] sub[5:4] | off1:16,off2:16
  *   lwsw (fused)                     op[31:26] rd[25:21] rs1[20:16] rs2[15:11] o1w[10:6] o2w[5:0]
  *
  * (auipc is its own op -- it computes from the evaluator's live op cursor, so it fits
@@ -101,12 +100,6 @@ enum {
                              * instruction (the sqlite rt.c bodies). funct3 rides in the low
                              * 3 bits and selects the routine; ../purvmemop.h is the whole
                              * story (encoding, semantics, fuel). */
-    RISCV_OP_PAIR,          /* TWO independent word loads/stores in one dispatch -- the
-                             * dominant leftover adjacency (different bases, so no bulk op
-                             * applies). word1: r1[25:21] b1[20:16] r2[15:11] b2[10:6]
-                             * sub[5:4] (bit1: first is store; bit0: second is store);
-                             * word2: off1[31:16] | off2[15:0] (both signed 16-bit).
-                             * Executed strictly in order, so r1==b2 etc. replay exactly. */
     RISCV_OP_COUNT
 };
 

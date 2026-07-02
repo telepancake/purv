@@ -122,7 +122,7 @@ static void decode(const uint8_t *code, uint32_t off, Dec *d) {
  * byte count is the fuse helper's return value, separate from this). */
 static int op_words(uint8_t op) {
     if (op == RISCV_OP_NOP) return 0;
-    if (op == RISCV_OP_LW_BZ || op == RISCV_OP_LBU_BZ || op == RISCV_OP_PAIR) return 2;
+    if (op == RISCV_OP_LW_BZ || op == RISCV_OP_LBU_BZ) return 2;
     return 1;
 }
 
@@ -361,23 +361,6 @@ static uint32_t try_fuse_pair(const uint8_t *code, uint32_t len, uint32_t off,
         out->rs2 = b.op == RISCV_OP_BEQ;                  /* the condition bit */
         return 8;
     }
-    /* Any remaining adjacent pair of word loads/stores -> PAIR: two independent
-     * accesses in one dispatch (the specific single-word fusions above are all
-     * tried first -- this is the generic catch-all for different-base pairs,
-     * the dominant leftover adjacency on OO code). Strictly in-order replay,
-     * so register overlap between the halves needs no checks at all; only
-     * loads into x0 are excluded (they'd need the load's own discard). */
-    if ((a.op == RISCV_OP_LW || a.op == RISCV_OP_SW) &&
-        (b.op == RISCV_OP_LW || b.op == RISCV_OP_SW) &&
-        (a.op != RISCV_OP_LW || a.rd != 0) && (b.op != RISCV_OP_LW || b.rd != 0)) {
-        out->op = RISCV_OP_PAIR;
-        out->rd  = a.op == RISCV_OP_SW ? a.rs2 : a.rd;    /* r1 (value/dest)   */
-        out->rs1 = a.rs1;                                 /* b1 (base)         */
-        out->rs2 = b.op == RISCV_OP_SW ? b.rs2 : b.rd;    /* r2                */
-        out->target = b.rs1 << 2 | (a.op == RISCV_OP_SW) << 1 | (b.op == RISCV_OP_SW);
-        out->imm = (a.imm & 0xffffu) << 16 | (b.imm & 0xffffu);
-        return 8;
-    }
     return 0;
 }
 
@@ -464,9 +447,6 @@ static uint32_t emit(uint32_t *ops, uint32_t at, const Dec *d, const uint32_t *m
         int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;
         ops[at++] = w0 | rd << 21 | rs1 << 16 | (d->imm & 0xffffu);
         ops[at++] = (uint32_t)(delta * 4) | (rs2 & 1u);
-    } else if (op == RISCV_OP_PAIR) {                               /* word1: regs+sub; word2: offs */
-        ops[at++] = w0 | rd << 21 | rs1 << 16 | rs2 << 11 | (d->target & 0x7fu) << 4;
-        ops[at++] = d->imm;
     } else if (op >= RISCV_OP_BEQ && op <= RISCV_OP_BGEU) {
         int32_t delta = (int32_t)target_word(map, len, d->target, at) - (int32_t)at;
         ops[at++] = w0 | rs1 << 21 | rs2 << 16 | ((uint32_t)(delta * 4) & 0xffff);

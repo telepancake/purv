@@ -134,12 +134,12 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     uint32_t pc = s->pc;
     if (pc >= clen) return 0;                                  /* resume pc outside code */
 
-    /* All 64 values the 6-bit op field (w>>26) can select are populated -- the op set
-     * now fills the table exactly (RISCV_OP_COUNT == 64), so there is no unused
-     * encoding left to trap-fill and no `goto *NULL` is reachable. (A jalr/ret landing
-     * on a data word now dispatches to SOME real handler rather than trapping; the
-     * next fetch outside the code window still ends the run.) */
+    /* All 64 values the 6-bit op field (w>>26) can select are populated: the real ops
+     * below, then every unused encoding [RISCV_OP_COUNT, 63] filled with h_trap. So a
+     * garbage op -- e.g. a jalr/ret landing on a data word -- dispatches to h_trap ->
+     * illegal rather than running off the table into a wild `goto *NULL`. */
     static const void *const tbl[64] = {
+        [RISCV_OP_COUNT ... 63] = &&h_trap,
         [RISCV_OP_ADD] = &&h_add, [RISCV_OP_SLL] = &&h_sll, [RISCV_OP_SLT] = &&h_slt,
         [RISCV_OP_SLTU] = &&h_sltu, [RISCV_OP_XOR] = &&h_xor, [RISCV_OP_SRL] = &&h_srl,
         [RISCV_OP_OR] = &&h_or, [RISCV_OP_AND] = &&h_and, [RISCV_OP_SUB] = &&h_sub, [RISCV_OP_SRA] = &&h_sra,
@@ -163,7 +163,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_LWLW] = &&h_lwlw, [RISCV_OP_LWJALR] = &&h_lwjalr,
         [RISCV_OP_LW_BZ] = &&h_lw_bz, [RISCV_OP_LBU_BZ] = &&h_lbu_bz,
         [RISCV_OP_LWSW] = &&h_lwsw, [RISCV_OP_VCALL] = &&h_vcall,
-        [RISCV_OP_MEMOP] = &&h_memop, [RISCV_OP_PAIR] = &&h_pair,
+        [RISCV_OP_MEMOP] = &&h_memop,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -312,22 +312,7 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
     h_lbu_bz: LOADBZ(uint8_t);
     #undef LOADBZ
 
-    /* PAIR: two independent word loads/stores in one dispatch (transcode.h).
-     * Strictly in-order -- the second half sees the first's register write. */
-    h_pair: {
-        uint32_t offs = p[1], sub = (w >> 4) & 3;
-        uint32_t r_ = TC_A(w), b_ = TC_B(w), ad_ = s->x[b_] + (uint32_t)(int32_t)(int16_t)(offs >> 16);
-        if (sub & 2) { uint8_t *q_ = mem_w(s, ad_, 4);
-                       if (q_) st_le(q_, 4, s->x[r_]); else s->callback(s, RISCV_MEM_STORE, ad_, s->x[r_]); }
-        else         { const uint8_t *q_ = mem_r(s, ad_, 4);
-                       s->x[r_] = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, ad_, 0); }
-        r_ = TC_C(w); b_ = (w >> 6) & 31; ad_ = s->x[b_] + (uint32_t)(int32_t)(int16_t)offs;
-        if (sub & 1) { uint8_t *q_ = mem_w(s, ad_, 4);
-                       if (q_) st_le(q_, 4, s->x[r_]); else s->callback(s, RISCV_MEM_STORE, ad_, s->x[r_]); }
-        else         { const uint8_t *q_ = mem_r(s, ad_, 4);
-                       s->x[r_] = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, ad_, 0); }
-        k += 2; w = *(p += 2); PROF(p); goto *tbl[TC_OP(w)];
-    }
+
 
     h_lui:   s->x[TC_A(w)] = TC_UIMM(w) << 12; NEXT();
     /* Only CODE-address auipc reach here (data auipc are fused to LI at transcode time).

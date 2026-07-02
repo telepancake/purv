@@ -121,7 +121,7 @@ guest-bench-purva.img: guest-bench-purva.elf $(TRANSCODE)
 	$(TRANSCODE) guest-bench-purva.elf $@
 
 # --- host (depends only on the purv engine) ---------------------------------
-host: host.c ../purv.c ../purv.h hostcalls.h
+host: host.c ../purv.c ../purv.h ../purvmemop.h hostcalls.h
 	$(HOSTCC) $(HOSTFLAGS) host.c ../purv.c -I.. -o $@
 
 # Same host, built against purvs (the monadic decode-ahead + threaded-eval
@@ -130,7 +130,7 @@ host: host.c ../purv.c ../purv.h hostcalls.h
 # only swaps the engine header; the host code is otherwise the plain (non-tagged)
 # path. host.c stays a separate TU from the engine (no -flto) so purvs's
 # RiscvEmulatorLoop is profiled as its own function.
-host-purvs: host.c ../purvs/purvs.c ../purvs/purvs.h hostcalls.h
+host-purvs: host.c ../purvs/purvs.c ../purvs/purvs.h ../purvmemop.h hostcalls.h
 	$(HOSTCC) $(HOSTFLAGS) -DPURV_PURVS host.c ../purvs/purvs.c -I.. -I../purvs -o $@
 
 # purva (the AOT-transcoded engine): host-purva loads a purva IMAGE directly (no
@@ -147,7 +147,7 @@ $(TRANSCODE): FORCE
 # the hot loop -- one endbr per dispatch) for no real protection. GCC has no per-
 # function control (the optimize attribute rejects it; nocf_check drops only the entry
 # pad, not the label pads), so it's scoped to this TU. The driver keeps CET.
-purva-engine.o: ../purva/purva.c ../purva/purva.h ../purva/transcode.h ../purva/image.h ../purv.h ../purvhost.h
+purva-engine.o: ../purva/purva.c ../purva/purva.h ../purva/transcode.h ../purva/image.h ../purv.h ../purvhost.h ../purvmemop.h
 	$(HOSTCC) $(HOSTFLAGS) -fcf-protection=none -c ../purva/purva.c -o $@
 host-purva: host-purva.c purva-engine.o ../purva/purva.h ../purva/image.h hostcalls.h
 	$(HOSTCC) $(HOSTFLAGS) host-purva.c purva-engine.o -I.. -I../purva -o $@
@@ -155,7 +155,7 @@ host-purva: host-purva.c purva-engine.o ../purva/purva.h ../purva/image.h hostca
 # Profiling host (-DPURVA_PROFILE in BOTH TUs): counts every op-word execution and
 # dumps the counters after the run ($PURVA_PROF_OUT). Feed to ../purva/profile.py
 # together with the .img to rank hot ops and fusable adjacent pairs.
-host-purva-prof: host-purva.c ../purva/purva.c ../purva/purva.h ../purva/image.h hostcalls.h
+host-purva-prof: host-purva.c ../purva/purva.c ../purva/purva.h ../purva/image.h ../purvmemop.h hostcalls.h
 	$(HOSTCC) $(HOSTFLAGS) -fcf-protection=none -DPURVA_PROFILE host-purva.c ../purva/purva.c -I.. -I../purva -o $@
 
 # Profile-guided host (make host-pgo). Three phases: build instrumented, train on
