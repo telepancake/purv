@@ -161,10 +161,9 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
         [RISCV_OP_LI_LO] = &&h_li_lo, [RISCV_OP_LI_HI] = &&h_li_hi,
         [RISCV_OP_SHADD] = &&h_shadd, [RISCV_OP_LWX] = &&h_lwx,
         [RISCV_OP_LWLW] = &&h_lwlw, [RISCV_OP_LWJALR] = &&h_lwjalr,
-        [RISCV_OP_LW_BEQZ] = &&h_lw_beqz, [RISCV_OP_LW_BNEZ] = &&h_lw_bnez,
-        [RISCV_OP_LBU_BEQZ] = &&h_lbu_beqz, [RISCV_OP_LBU_BNEZ] = &&h_lbu_bnez,
+        [RISCV_OP_LW_BZ] = &&h_lw_bz, [RISCV_OP_LBU_BZ] = &&h_lbu_bz,
         [RISCV_OP_LWSW] = &&h_lwsw, [RISCV_OP_VCALL] = &&h_vcall,
-        [RISCV_OP_MEMOP] = &&h_memop,
+        [RISCV_OP_MEMOP] = &&h_memop, [RISCV_OP_PAIR] = &&h_pair,
     };
     uint32_t *p = base + (pc >> 2);
     uint32_t w = *p;
@@ -300,19 +299,35 @@ uint64_t RiscvEmulatorLoop(RiscvEmulatorState_t *s, uint64_t max) {
                 if (t >= clen || k >= max) { s->pc = t; return k; }
                 p = base + (t >> 2); w = *p; PROF(p); goto *tbl[TC_OP(w)]; }
     /* Two-word load+branch-zero: word2 is the baked op-relative displacement
-     * (x4, like a branch imm). Fall through skips both words. */
-    #define LOADBZ(T, cond) do { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w); \
+     * (x4, like a branch imm), its bit0 the condition (1 = branch on zero).
+     * Fall through skips both words. */
+    #define LOADBZ(T) do { uint32_t a_ = s->x[TC_B(w)] + TC_IMM(w); \
         const uint8_t *q_ = mem_r(s, a_, sizeof(T)); \
         uint32_t v_ = (uint32_t)(int32_t)(T)(q_ ? ld_le(q_, sizeof(T)) \
                                                 : s->callback(s, RISCV_MEM_LOAD, a_, 0)); \
         s->x[TC_A(w)] = v_; k++; \
-        if (v_ cond 0) RELOC((uint32_t)(p - base) + (uint32_t)((int32_t)p[1] >> 2)); \
+        if ((v_ == 0) == (p[1] & 1)) RELOC((uint32_t)(p - base) + ((int32_t)p[1] >> 2)); \
         k++; w = *(p += 2); PROF(p); goto *tbl[TC_OP(w)]; } while (0)
-    h_lw_beqz:  LOADBZ(int32_t, ==);
-    h_lw_bnez:  LOADBZ(int32_t, !=);
-    h_lbu_beqz: LOADBZ(uint8_t, ==);
-    h_lbu_bnez: LOADBZ(uint8_t, !=);
+    h_lw_bz:  LOADBZ(int32_t);
+    h_lbu_bz: LOADBZ(uint8_t);
     #undef LOADBZ
+
+    /* PAIR: two independent word loads/stores in one dispatch (transcode.h).
+     * Strictly in-order -- the second half sees the first's register write. */
+    h_pair: {
+        uint32_t offs = p[1], sub = (w >> 4) & 3;
+        uint32_t r_ = TC_A(w), b_ = TC_B(w), ad_ = s->x[b_] + (uint32_t)(int32_t)(int16_t)(offs >> 16);
+        if (sub & 2) { uint8_t *q_ = mem_w(s, ad_, 4);
+                       if (q_) st_le(q_, 4, s->x[r_]); else s->callback(s, RISCV_MEM_STORE, ad_, s->x[r_]); }
+        else         { const uint8_t *q_ = mem_r(s, ad_, 4);
+                       s->x[r_] = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, ad_, 0); }
+        r_ = TC_C(w); b_ = (w >> 6) & 31; ad_ = s->x[b_] + (uint32_t)(int32_t)(int16_t)offs;
+        if (sub & 1) { uint8_t *q_ = mem_w(s, ad_, 4);
+                       if (q_) st_le(q_, 4, s->x[r_]); else s->callback(s, RISCV_MEM_STORE, ad_, s->x[r_]); }
+        else         { const uint8_t *q_ = mem_r(s, ad_, 4);
+                       s->x[r_] = q_ ? ld_le(q_, 4) : s->callback(s, RISCV_MEM_LOAD, ad_, 0); }
+        k += 2; w = *(p += 2); PROF(p); goto *tbl[TC_OP(w)];
+    }
 
     h_lui:   s->x[TC_A(w)] = TC_UIMM(w) << 12; NEXT();
     /* Only CODE-address auipc reach here (data auipc are fused to LI at transcode time).

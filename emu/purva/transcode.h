@@ -28,7 +28,8 @@
  *   lwx (fused)                      op[31:26] rd[25:21] rs1[20:16] rs2[15:11] off[10:0]
  *   lwlw (fused)                     op[31:26] rd[25:21] rs1[20:16] o1[15:8] o2[7:0]
  *   lwjalr (fused)                   op[31:26] rd[25:21] rs1[20:16] off[15:0]
- *   load+beqz/bnez (fused, 2 words)  op[31:26] rd[25:21] rs1[20:16] off[15:0] | disp32
+ *   load+beqz/bnez (fused, 2 words)  op[31:26] rd[25:21] rs1[20:16] off[15:0] | disp32 (bit0=cond)
+ *   pair (fused, 2 words)            op[31:26] r1[25:21] b1[20:16] r2[15:11] b2[10:6] sub[5:4] | off1:16,off2:16
  *   lwsw (fused)                     op[31:26] rd[25:21] rs1[20:16] rs2[15:11] o1w[10:6] o2w[5:0]
  *
  * (auipc is its own op -- it computes from the evaluator's live op cursor, so it fits
@@ -90,18 +91,22 @@ enum {
     RISCV_OP_LWX,           /* add  T,a,b;  lw  T,o(T)  ->  rd = M32[rs1 + rs2 + off11]  */
     RISCV_OP_LWLW,          /* lw T,o1(a);  lw T,o2(T)  ->  rd = M32[M32[rs1+o1_8]+o2_8] */
     RISCV_OP_LWJALR,        /* lw T,o(a);   jalr ra,0(T) -> virtual call: rd=t, ra=link, jump t */
-    RISCV_OP_LW_BEQZ,       /* lw  T,o(a);  beq T,x0    -- TWO op words (word2 = branch disp) */
-    RISCV_OP_LW_BNEZ,       /* lw  T,o(a);  bne T,x0                                          */
-    RISCV_OP_LBU_BEQZ,      /* lbu T,o(a);  beq T,x0                                          */
-    RISCV_OP_LBU_BNEZ,      /* lbu T,o(a);  bne T,x0                                          */
+    RISCV_OP_LW_BZ,         /* lw  T,o(a); beq/bne T,x0 -- TWO op words; word2 = branch disp
+                             * (x4, so bits[1:0] are free: bit0 = 1 for BEQZ, 0 for BNEZ)     */
+    RISCV_OP_LBU_BZ,        /* lbu T,o(a); beq/bne T,x0 -- same two-word shape               */
     RISCV_OP_LWSW,          /* lw T,o1(a); sw T,o2(b) -> the word copy; o1/o2 word-scaled     */
     RISCV_OP_VCALL,         /* lw T,o1(a); lw T,o2(T); jalr ra,0(T) -> the vtable call
                              * (LWLW field layout; link register implied ra). THREE insns.    */
     RISCV_OP_MEMOP,         /* guest custom-0 (.insn r 0x0b): one mem/str libc call as ONE
                              * instruction (the sqlite rt.c bodies). funct3 rides in the low
                              * 3 bits and selects the routine; ../purvmemop.h is the whole
-                             * story (encoding, semantics, fuel). This takes the LAST opcode
-                             * slot: the dispatch table is now full. */
+                             * story (encoding, semantics, fuel). */
+    RISCV_OP_PAIR,          /* TWO independent word loads/stores in one dispatch -- the
+                             * dominant leftover adjacency (different bases, so no bulk op
+                             * applies). word1: r1[25:21] b1[20:16] r2[15:11] b2[10:6]
+                             * sub[5:4] (bit1: first is store; bit0: second is store);
+                             * word2: off1[31:16] | off2[15:0] (both signed 16-bit).
+                             * Executed strictly in order, so r1==b2 etc. replay exactly. */
     RISCV_OP_COUNT
 };
 
