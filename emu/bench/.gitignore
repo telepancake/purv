@@ -6,3 +6,4 @@ vendor/
 *.out
 *.err
 .scale
+*.prof
